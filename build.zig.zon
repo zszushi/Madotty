@@ -15,7 +15,7 @@
 
         .vulkan_headers = .{
             .url = "https://codeload.github.com/KhronosGroup/Vulkan-Headers/tar.gz/refs/tags/v1.3.296",
-            .hash = "N-V-__8AANZErwH8FRRaqLabtE0MmFySzqoWgGcn1-AKo1Bh",
+            .hash = "N-V-__8AANZErwHY3v8T8uMWB-sHccsxarx3U_eUJK7z7bZT",
             .lazy = true,
         },
 
