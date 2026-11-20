@@ -1,8 +1,8 @@
-<img src="docs/madotty.png" width="96" height="96" alt="">
-
-# Madotty
-
-[日本語](README.ja.md)
+<p align="center">
+  <img src="docs/madotty.png" width="192" height="192" alt="">
+</p>
+<h1 align="center">Madotty</h1>
+<p align="center"><strong>English</strong> · <a href="README.ja.md">日本語</a></p>
 
 Madotty is a terminal emulator for Windows. It’s a personal project based on [shiweis/ghostty-windows](https://github.com/shiweis/ghostty-windows), a Windows port of [Ghostty](https://github.com/ghostty-org/ghostty).
 

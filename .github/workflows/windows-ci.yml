@@ -1,20 +1,13 @@
-# Lightweight CI for the Windows port, runnable on this fork.
-#
-# The inherited upstream `test.yml` is gated to `ghostty-org/ghostty` and
-# targets paid Namespace runners, so none of it runs here. This workflow
-# uses free GitHub-hosted runners (standard runners are free with
-# unlimited minutes on public repositories) to give every push and pull
-# request a real Windows build + test and a format check.
-name: Windows CI
+name: Madotty Windows CI
 
 on:
-  # Run after merges land on main...
+  public:
   push:
     branches: [main]
-  # ...and on every pull request targeting the repo.
-  pull_request: {}
-  # Allow manual runs from the Actions tab (once this file is on main).
-  workflow_dispatch: {}
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 # Only keep the latest run per ref; cancel superseded in-progress runs.
 concurrency:
@@ -23,6 +16,7 @@ concurrency:
 
 jobs:
   windows:
+    if: github.event.repository.private == false
     name: Build & Test (Windows)
     runs-on: windows-latest
     timeout-minutes: 60
@@ -121,6 +115,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Cache maintenance integration tests failed' }
 
   fmt:
+    if: github.event.repository.private == false
     name: zig fmt
     runs-on: ubuntu-latest
     timeout-minutes: 10

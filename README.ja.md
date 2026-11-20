@@ -1,8 +1,8 @@
-<img src="docs/madotty.png" width="96" height="96" alt="">
-
-# Madotty
-
-[English](README.md)
+<p align="center">
+  <img src="docs/madotty.png" width="192" height="192" alt="">
+</p>
+<h1 align="center">Madotty</h1>
+<p align="center"><a href="README.md">English</a> · <strong>日本語</strong></p>
 
 Madotty は、[Ghostty](https://github.com/ghostty-org/ghostty) の Windows 移植版 [shiweis/ghostty-windows](https://github.com/shiweis/ghostty-windows) をベースにした、個人開発のターミナルです。
 
