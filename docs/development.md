@@ -203,6 +203,14 @@ recent and referenced artifacts are retained even above the threshold. Prefer
 a consistent Zig version and optimization mode and use `-Dtest-filter` for
 focused tests to limit compiled variants.
 
+### Tagged Windows releases
+
+Use an annotated `win-vX.Y.Z` tag on the intended commit, after updating
+`build.zig.zon`, the Windows version resource, and the changelog. Pushing
+that tag to Madotty triggers the release workflow. It builds the x64
+ReleaseFast binaries and WinUI settings, verifies the installer and portable
+package, and attaches both downloads and their SHA-256 checksums to the release.
+
 ### Release build
 
 ```bash

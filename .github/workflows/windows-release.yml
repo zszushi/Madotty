@@ -1,0 +1,67 @@
+name: Madotty Windows release
+on:
+  push:
+    tags: ['win-v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-2025
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check release version
+        run: |
+          $v = [regex]::Match((Get-Content build.zig.zon -Raw), '(?m)^\s*\.version = "(\d+\.\d+\.\d+)"').Groups[1].Value
+          if (!$v -or $env:GITHUB_REF_NAME -cne "win-v$v") { throw "Tag must match build.zig.zon ($v)" }
+          "MADOTTY_VERSION=$v" >> $env:GITHUB_ENV
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: 0.17.0
+      - name: Install release tools
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP dxc.zip
+          Invoke-WebRequest https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip -OutFile $zip
+          if ((Get-FileHash $zip).Hash -ne 'ad31b1fc8443175d204f77a611fdb3ef2ec42759bdc2f1167368de24a4a7e7f1') { throw 'DXC checksum mismatch' }
+          $dxc = Join-Path $env:RUNNER_TEMP dxc
+          Expand-Archive $zip $dxc
+          "DXC_DIR=$dxc" >> $env:GITHUB_ENV
+          "DOTNET_ROLL_FORWARD=Major" >> $env:GITHUB_ENV
+          $env:DOTNET_ROLL_FORWARD = 'Major'
+          $tools = Join-Path $env:RUNNER_TEMP wix-tools
+          dotnet tool install wix --version 5.0.2 --tool-path $tools
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          "$tools" >> $env:GITHUB_PATH
+          & "$tools/wix.exe" extension add -g WixToolset.UI.wixext/5.0.2
+      - name: Build terminal and settings
+        run: |
+          ./dist/windows/build.ps1 install -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize=fast -Drenderer=opengl -Demit-windows-d3d12=true -Demit-windows-vulkan=true "-Ddxc=$env:DXC_DIR/bin/x64/dxc.exe"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Copy-Item "$env:DXC_DIR/bin/x64/dxcompiler.dll","$env:DXC_DIR/bin/x64/dxil.dll" zig-out/bin -Force
+          ./dist/windows/build-settings.ps1 -BuildDir zig-out
+      - name: Package and verify
+        run: |
+          ./dist/windows/package-portable.ps1 -BuildDir zig-out -DxcDir $env:DXC_DIR -ExpectedVersion $env:MADOTTY_VERSION -RequireFast -OutputDir release
+          ./dist/windows/build-installer.ps1 -BuildDir zig-out -DxcDir $env:DXC_DIR -OutputDir release
+          $msi = Get-Item "release/Madotty-windows-x64-$env:MADOTTY_VERSION.msi"
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File test/win32/test_installer.ps1 -MsiPath $msi.FullName
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Get-ChildItem release -File | Get-FileHash | ForEach-Object { "$($_.Hash.ToLowerInvariant())  $(Split-Path -Leaf $_.Path)" } | Set-Content release/SHA256SUMS.txt -Encoding ascii
+      - name: Publish verified downloads
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $files = @(Get-ChildItem release -File | ForEach-Object FullName)
+          gh release create $env:GITHUB_REF_NAME @files --verify-tag --title "Madotty $env:MADOTTY_VERSION" --notes "Windows x64. Choose the MSI for installation or the ZIP for a portable copy. The installer is unsigned. SHA-256 checksums are included."

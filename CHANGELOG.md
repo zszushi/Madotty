@@ -3,7 +3,14 @@
 All notable changes to the Ghostty Windows fork. Each release line includes
 the underlying upstream commit when known.
 
-## Unreleased
+## Madotty 1.4.1
+
+First Madotty release for Windows x64, based on the Ghostty 1.4.0 core.
+Includes Japanese and English settings, tab-to-pane dragging, selectable
+renderers, and Windows system emoji. Downloads include an unsigned per-user
+MSI, a portable ZIP, and SHA-256 checksums.
+
+## Windows port development history
 
 Release target: `win-v1.4.0`, based on upstream Ghostty `v1.4.0` (`83fb95624`,
 released 2026-10-27), with the native Win32 runtime and the Windows fixes below.
