@@ -1751,11 +1751,11 @@ fn exportTerminalIo(self: *App, target: apprt.Target, contents: []const u8) bool
     var dialog: w32.OPENFILENAMEW = std.mem.zeroes(w32.OPENFILENAMEW);
     dialog.lStructSize = @sizeOf(w32.OPENFILENAMEW);
     dialog.hwndOwner = owner;
-    dialog.lpstrFilter = filter;
+    dialog.lpstrFilter = filter.ptr;
     dialog.nFilterIndex = 1;
     dialog.lpstrFile = &file_buf;
     dialog.nMaxFile = file_buf.len;
-    dialog.lpstrTitle = lang.wide("Export Terminal IO Events");
+    dialog.lpstrTitle = lang.wide("Export Terminal IO Events").ptr;
     dialog.lpstrDefExt = std.unicode.utf8ToUtf16LeStringLiteral("txt");
     dialog.Flags = w32.OFN_EXPLORER |
         w32.OFN_NOCHANGEDIR |
