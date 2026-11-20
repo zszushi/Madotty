@@ -79,7 +79,17 @@ foreach ($name in @('Madotty.Settings.exe', 'Madotty.Settings.dll', 'Madotty.Set
 
 # Use the dependencies of the published app to select matching license versions.
 $deps = Get-Content -LiteralPath $payload['settings\Madotty.Settings.deps.json'] -Raw | ConvertFrom-Json
-foreach ($dependency in $deps.libraries.PSObject.Properties.Name) {
+$dependencies = @($deps.libraries.PSObject.Properties.Name)
+# Some SDK versions omit native-only packages from the published deps.json.
+# Read their resolved versions from the same settings build's restore graph.
+$assetsPath = Join-Path $BuildDir 'settings-obj\obj\Madotty.Settings\project.assets.json'
+if (Test-Path -LiteralPath $assetsPath) {
+    $assets = Get-Content -LiteralPath $assetsPath -Raw | ConvertFrom-Json
+    $dependencies += @($assets.libraries.PSObject.Properties.Name | Where-Object {
+        $_ -match '^Microsoft\.WindowsAppSDK(?:\.Runtime)?/'
+    })
+}
+foreach ($dependency in ($dependencies | Sort-Object -Unique)) {
     $package, $packageVersion = ($dependency -replace '^runtimepack\.', '').Split('/')
     if ($package -eq 'Madotty.Settings') { continue }
     $packagePath = Join-Path $NuGetPackages (Join-Path $package.ToLowerInvariant() $packageVersion)
