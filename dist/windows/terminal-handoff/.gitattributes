@@ -1,0 +1,2 @@
+# Upstream files in the patch use different line endings.
+openconsole-stage1.patch -text

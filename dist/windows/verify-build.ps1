@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$BuildDir,
     [string]$ExpectedVersion = '',
-    [switch]$Portable
+    [switch]$Portable,
+    [switch]$RequireFast
 )
 
 # Validate the payload that will actually ship. Capture CLI output through pipes
@@ -9,7 +10,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $BuildDir = (Get-Item -LiteralPath $BuildDir).FullName
 $binaryDir = if ($Portable) { $BuildDir } else { Join-Path $BuildDir 'bin' }
-$binaries = @('ghostty.exe', 'conpty.dll', 'OpenConsole.exe')
+$binaries = @('ghostty.exe', 'ghostty.com', 'conpty.dll', 'OpenConsole.exe')
 foreach ($name in $binaries) {
     if (-not (Test-Path -LiteralPath (Join-Path $binaryDir $name) -PathType Leaf)) {
         throw "Incomplete Windows payload: missing $name"
@@ -43,7 +44,7 @@ try {
         Copy-Item -LiteralPath (Join-Path $binaryDir $name) -Destination (Join-Path $versionDir $name)
     }
     $start = New-Object System.Diagnostics.ProcessStartInfo
-    $start.FileName = Join-Path $versionDir 'ghostty.exe'
+    $start.FileName = Join-Path $versionDir 'ghostty.com'
     $start.Arguments = '--version'
     $start.WorkingDirectory = $versionDir
     $start.UseShellExecute = $false
@@ -61,6 +62,9 @@ try {
         throw 'ghostty --version timed out.'
     }
     if ($child.ExitCode -ne 0) { throw "ghostty --version failed: $($stderr.Result)" }
+    if ($RequireFast -and $stdout.Result -notmatch '(?m)^\s*- build mode\s*:\s*\.fast\s*$') {
+        throw 'Release packages require fast optimization in the supplied executable.'
+    }
     $match = [regex]::Match($stdout.Result, '(?m)^Ghostty ([^\r\n]+)\r?$')
     if (-not $match.Success) { throw 'ghostty --version did not report a version.' }
     $version = $match.Groups[1].Value
@@ -71,7 +75,7 @@ try {
     }
 
     $numeric = '{0}.{1}.{2}.0' -f $semantic.Groups[1].Value, $semantic.Groups[2].Value, $semantic.Groups[3].Value
-    $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($start.FileName)
+    $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $versionDir 'ghostty.exe'))
     $fileNumeric = '{0}.{1}.{2}.{3}' -f $info.FileMajorPart, $info.FileMinorPart, $info.FileBuildPart, $info.FilePrivatePart
     $productNumeric = '{0}.{1}.{2}.{3}' -f $info.ProductMajorPart, $info.ProductMinorPart, $info.ProductBuildPart, $info.ProductPrivatePart
     if ($info.FileVersion -cne $numeric -or $info.ProductVersion -cne $numeric -or

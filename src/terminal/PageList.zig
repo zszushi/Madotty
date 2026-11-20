@@ -1753,6 +1753,30 @@ const ReflowCursor = struct {
 
         var x: usize = 0;
         while (x < cols_len) {
+            const cell = &cells[x];
+            const sized_width = cell.sizedWidth() orelse 0;
+            if (sized_width > self.page.size.cols or
+                (cell.wide == .spacer_head and cell.sized != 0))
+            {
+                // Source padding belongs to the old wrapping point. A span
+                // wider than the new screen is discarded with all its tails.
+                const end = x + @max(1, sized_width);
+                if (row_has_pins) for (list.tracked_pins.keys()) |p| {
+                    if (p.node != row.node or p.y != src_y or p.x < x or p.x >= end) continue;
+                    p.node = self.node;
+                    p.x = self.x;
+                    p.y = self.y;
+                };
+                x = end;
+                continue;
+            }
+
+            if (!self.pending_wrap and sized_width > self.page.size.cols - self.x) {
+                while (!self.pending_wrap) : (self.cursorForward()) {
+                    self.page_cell.* = .{ .wide = .spacer_head, .sized = 1 };
+                }
+            }
+
             if (self.pending_wrap) {
                 self.page_row.wrap = true;
                 try self.cursorScrollOrNewPage(list, cap);
@@ -1795,9 +1819,19 @@ const ReflowCursor = struct {
                 }
             }
 
+            if (sized_width > 1) {
+                // Complete the span geometry before cloning managed memory
+                // for the head. Capacity growth can clone this row midway
+                // through handling a grapheme, style, or hyperlink.
+                const destination: [*]pagepkg.Cell = @ptrCast(self.page_cell);
+                for (1..sized_width) |offset| {
+                    destination[offset] = .{ .wide = .spacer_tail, .sized = @intCast(offset) };
+                }
+            }
+
             if (self.writeCell(
                 list,
-                &cells[x],
+                cell,
                 src_page,
             )) |result| switch (result) {
                 // Wrote the cell, move to the next.
@@ -1934,6 +1968,7 @@ const ReflowCursor = struct {
         "style_id",
         "wide",
         "hyperlink",
+        "sized",
     }, bulk_group_len);
 
     /// Masked compare helper for detecting the Kitty virtual
@@ -1951,6 +1986,7 @@ const ReflowCursor = struct {
     fn bulkRunLength(cells: []const pagepkg.Cell) usize {
         if (cells.len == 0) return 0;
         const first = cells[0];
+        if (first.sized != 0) return 0;
 
         // A run may start on a bulk-copyable narrow cell or on a wide pair.
         const pair_start = first.content_tag == .codepoint and
@@ -2820,12 +2856,19 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
                 while (it.next()) |chunk| {
                     const page = chunk.node.page();
                     defer page.assertIntegrity();
+                    page.pauseIntegrityChecks(true);
+                    defer page.pauseIntegrityChecks(false);
                     const rows = page.rows.ptr(page.memory);
                     for (0..page.size.rows) |i| {
                         const row = &rows[i];
-                        // If the cut splits a wide char, clear its head too.
-                        const cells = row.cells.ptr(page.memory);
-                        const start = if (cells[cols - 1].wide == .wide) cols - 1 else cols;
+                        // Clear a whole glyph or OSC 66 span if the cut splits it.
+                        const cells = page.getCells(row);
+                        const start = if (pagepkg.Cell.sizedSpan(cells, cols)) |span|
+                            span.start
+                        else if (cells[cols - 1].wide == .wide)
+                            cols - 1
+                        else
+                            cols;
                         page.clearCells(row, start, self.cols);
                     }
 
@@ -15619,6 +15662,76 @@ test "PageList resize (no reflow) less cols clears graphemes" {
     while (it.next()) |chunk| {
         try testing.expectEqual(@as(usize, 0), chunk.node.page().graphemeCount());
     }
+}
+
+test "PageList reflows an OSC 66 span, preserving graphemes and its tracked tail" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 8, .rows = 4, .max_size = 0 });
+    defer s.deinit();
+
+    const page = s.pages.first.?.page();
+    const row = page.getRow(0);
+    const cells = page.getCells(row);
+    for ("ABC", cells[0..3]) |cp, *cell| cell.* = .init(cp);
+    cells[3] = .init('D');
+    cells[3].wide = .wide;
+    cells[3].sized = 4;
+    for (1..4) |offset| cells[3 + offset] = .{ .wide = .spacer_tail, .sized = @intCast(offset) };
+    cells[7] = .init('Z');
+    try page.appendGrapheme(row, &cells[3], 'E');
+
+    const tail = try s.trackPin(s.pin(.{ .screen = .{ .x = 5, .y = 0 } }).?);
+    defer s.untrackPin(tail);
+
+    try s.resize(.{ .cols = 5 });
+    const wrapped = s.pages.first.?.page();
+    try wrapped.verifyIntegrity(testing.allocator);
+    const prefix = wrapped.getCells(wrapped.getRow(0));
+    try testing.expectEqual(pagepkg.Cell.Wide.spacer_head, prefix[3].wide);
+    try testing.expectEqual(@as(u3, 1), prefix[4].sized);
+    const next = wrapped.getCells(wrapped.getRow(1));
+    try testing.expectEqual(@as(u21, 'D'), next[0].codepoint());
+    try testing.expectEqual(@as(?u3, 4), next[0].sizedWidth());
+    try testing.expectEqualSlices(u21, &.{'E'}, wrapped.lookupGrapheme(&next[0]).?);
+    try testing.expectEqual(point.Point{ .screen = .{ .x = 2, .y = 1 } }, s.pointFromPin(.screen, tail.*).?);
+    try testing.expectEqual(@as(u21, 'Z'), next[4].codepoint());
+
+    try s.resize(.{ .cols = 8 });
+    const unwrapped = s.pages.first.?.page();
+    try unwrapped.verifyIntegrity(testing.allocator);
+    const flat = unwrapped.getCells(unwrapped.getRow(0));
+    try testing.expectEqual(@as(u21, 'D'), flat[3].codepoint());
+    try testing.expectEqual(@as(u21, 'Z'), flat[7].codepoint());
+
+    try s.resize(.{ .cols = 3 });
+    const small = s.pages.first.?.page();
+    try small.verifyIntegrity(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), small.graphemeCount());
+    try testing.expectEqual(@as(u21, 'Z'), small.getRowAndCell(0, 1).cell.codepoint());
+}
+
+test "PageList crops a partially visible OSC 66 span without reflow" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 8, .rows = 4, .max_size = 0 });
+    defer s.deinit();
+
+    const page = s.pages.first.?.page();
+    const row = page.getRow(0);
+    const cells = page.getCells(row);
+    cells[1] = .init('A');
+    cells[2] = .init('B');
+    cells[2].wide = .wide;
+    cells[2].sized = 4;
+    for (1..4) |offset| cells[2 + offset] = .{ .wide = .spacer_tail, .sized = @intCast(offset) };
+    try page.appendGrapheme(row, &cells[2], 'C');
+    try page.verifyIntegrity(testing.allocator);
+
+    try s.resize(.{ .cols = 4, .reflow = false });
+    try page.verifyIntegrity(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), page.graphemeCount());
+    try testing.expectEqual(@as(u21, 'A'), cells[1].codepoint());
+    try testing.expect(cells[2].isZero());
+    try testing.expect(cells[3].isZero());
 }
 
 test "PageList resize (no reflow) more cols" {

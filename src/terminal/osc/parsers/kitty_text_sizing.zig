@@ -35,11 +35,26 @@ pub const OSC = struct {
     halign: HAlign = .left,
     text: [:0]const u8,
 
-    /// We don't currently support encoding this to C in any way.
-    pub const C = void;
+    pub const C = extern struct {
+        text: lib.String,
+        width: u8,
+        scale: u8,
+        numerator: u8,
+        denominator: u8,
+        valign: VAlign,
+        halign: HAlign,
+    };
 
-    pub fn cval(_: OSC) C {
-        return {};
+    pub fn cval(self: OSC) C {
+        return .{
+            .text = .init(self.text),
+            .width = self.width,
+            .scale = self.scale,
+            .numerator = self.numerator,
+            .denominator = self.denominator,
+            .valign = self.valign,
+            .halign = self.halign,
+        };
     }
 
     fn update(self: *OSC, key: u8, value: []const u8) error{

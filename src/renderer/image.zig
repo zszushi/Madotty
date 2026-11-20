@@ -117,6 +117,7 @@ pub const State = struct {
         self: *State,
         api: *GraphicsAPI,
         pipeline: GraphicsAPI.Pipeline,
+        uniforms: @FieldType(GraphicsAPI.RenderPass.Step, "uniforms"),
         pass: *GraphicsAPI.RenderPass,
         placement_type: DrawPlacements,
     ) void {
@@ -180,6 +181,7 @@ pub const State = struct {
 
             pass.step(.{
                 .pipeline = pipeline,
+                .uniforms = uniforms,
                 .buffers = &.{buf.buffer},
                 .textures = &.{texture},
                 .draw = .{

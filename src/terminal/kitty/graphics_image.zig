@@ -747,8 +747,10 @@ pub const Image = struct {
         /// them.
         implicit_id: bool = false,
 
+        sixel: bool = false,
+
         /// Number of placements referencing this image.
-        placement_count: u30 = 0,
+        placement_count: u29 = 0,
     } = .{},
 
     /// Unique, monotonically increasing stamp assigned each time an

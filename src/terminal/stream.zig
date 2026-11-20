@@ -109,7 +109,7 @@ pub const Action = union(Key) {
     kitty_keyboard_set_not: KittyKeyboardFlags,
     dcs_hook: Parser.Action.DCS,
     dcs_put: u8,
-    dcs_unhook,
+    dcs_unhook: DcsEnd,
     apc_start,
     apc_end: ApcEnd,
     apc_put: u8,
@@ -138,6 +138,12 @@ pub const Action = union(Key) {
     xt_checksum_extension: XtChecksumExtension,
     program_status: ProgramStatus,
     soft_reset,
+    sixel_query: SixelQuery,
+    kitty_pointer: KittyPointer,
+    kitty_notification: osc.Command.KittyDesktopNotification,
+    kitty_text_sizing: osc.Command.KittyTextSizing,
+    iterm_report_cell_size: osc.Terminator,
+    iterm_inline_image: osc.ITermInlineImage,
 
     pub const Key = lib.Enum(
         lib.target,
@@ -246,6 +252,12 @@ pub const Action = union(Key) {
             "xt_checksum_extension",
             "program_status",
             "soft_reset",
+            "sixel_query",
+            "kitty_pointer",
+            "kitty_notification",
+            "kitty_text_sizing",
+            "iterm_report_cell_size",
+            "iterm_inline_image",
         },
     );
 
@@ -332,6 +344,15 @@ pub const Action = union(Key) {
         /// APC was cancelled or aborted, in which case its contents
         /// should be discarded.
         terminated: bool,
+    };
+
+    pub const DcsEnd = extern struct {
+        terminated: bool,
+    };
+
+    pub const SixelQuery = extern struct {
+        item: u16,
+        action: u16,
     };
 
     pub const InvokeCharset = lib.Struct(lib.target, struct {
@@ -429,6 +450,16 @@ pub const Action = union(Key) {
 
         pub fn cval(self: ReportPwd) ReportPwd.C {
             return .init(self.url);
+        }
+    };
+
+    pub const KittyPointer = struct {
+        payload: []const u8,
+
+        pub const C = lib.String;
+
+        pub fn cval(self: KittyPointer) KittyPointer.C {
+            return .init(self.payload);
         }
     };
 
@@ -547,6 +578,7 @@ pub fn Stream(comptime H: type) type {
         parser: Parser,
         utf8decoder: UTF8Decoder,
         continuation: ?continuationpkg.Tracker,
+        sixel_string: continuationpkg.SixelString = .inactive,
 
         pub const Options = struct {
             /// The handler initial value, must be set.
@@ -657,7 +689,7 @@ pub fn Stream(comptime H: type) type {
             // ended inside a UTF-8 codepoint instead, because the ground
             // check above covers both state machines.
             tracker.append(
-                if (self.parser.state != .ground) .vt else .utf8,
+                if (self.sixel_string == .escape) .vt_sixel_end else if (self.parser.state != .ground) .vt else .utf8,
                 input,
             );
         }
@@ -935,6 +967,14 @@ pub fn Stream(comptime H: type) type {
                 offset += self.consumeUntilGround(input[offset..], until, u);
                 if (comptime until) if (self.untilReached(u, input.ptr + offset)) return offset;
                 if (offset >= input.len) return input.len;
+                // Cell-oriented output often separates escape sequences by
+                // a single ASCII glyph. It is already a complete codepoint.
+                if (input.len - offset >= 2 and input[offset + 1] == 0x1B and
+                    input[offset] >= ' ' and input[offset] <= '~')
+                {
+                    self.handler.vt(.print_slice, .{ .cps = &.{input[offset]} });
+                    offset += 1;
+                }
             }
             return offset;
         }
@@ -1375,9 +1415,17 @@ pub fn Stream(comptime H: type) type {
             assert(self.parser.state != .ground);
 
             // Fast path for CSI entry.
-            if (self.parser.state == .escape and c == '[') {
-                self.parser.state = .csi_entry;
-                return;
+            if (self.parser.state == .escape) {
+                // An ESC may be followed by ST or by a new escape command.
+                // Commit a Sixel bitmap only after seeing the full ST.
+                if (self.sixel_string == .escape) {
+                    self.sixel_string = .inactive;
+                    self.handler.vt(.dcs_unhook, .{ .terminated = c == '\\' });
+                }
+                if (c == '[') {
+                    self.parser.state = .csi_entry;
+                    return;
+                }
             }
 
             // The fast paths below dispatch actions directly rather than
@@ -1485,9 +1533,19 @@ pub fn Stream(comptime H: type) type {
                     .csi_dispatch => |csi_action| self.csiDispatch(csi_action),
                     .esc_dispatch => |esc| self.escDispatch(esc),
                     .osc_dispatch => |cmd| self.oscDispatch(cmd),
-                    .dcs_hook => |dcs| self.handler.vt(.dcs_hook, dcs),
+                    .dcs_hook => |dcs| {
+                        self.sixel_string = if (dcs.isSixel()) .active else .inactive;
+                        self.handler.vt(.dcs_hook, dcs);
+                    },
                     .dcs_put => |code| self.handler.vt(.dcs_put, code),
-                    .dcs_unhook => self.handler.vt(.dcs_unhook, {}),
+                    .dcs_unhook => {
+                        if (self.sixel_string == .active and c == std.ascii.control_code.esc) {
+                            self.sixel_string = .escape;
+                        } else {
+                            self.sixel_string = .inactive;
+                            self.handler.vt(.dcs_unhook, .{ .terminated = c == std.ascii.control_code.esc or c == 0x9C });
+                        }
+                    },
                     .apc_start => self.handler.vt(.apc_start, {}),
                     .apc_put => |code| self.handler.vt(.apc_put, code),
                     .apc_end => self.handler.vt(.apc_end, .{
@@ -1934,6 +1992,9 @@ pub fn Stream(comptime H: type) type {
                         },
                     }),
 
+                    1 => if (input.intermediates[0] == '?' and input.params.len >= 2 and input.params.len <= 3)
+                        self.handler.vt(.sixel_query, .{ .item = input.params[0], .action = input.params[1] }),
+
                     else => log.warn(
                         "ignoring unimplemented CSI S with intermediates: {s}",
                         .{input.intermediates},
@@ -2224,8 +2285,9 @@ pub fn Stream(comptime H: type) type {
                                 .params = input.params,
                                 .params_sep = input.params_sep,
                             };
-                            while (p.next()) |attr| {
-                                // log.info("SGR attribute: {}", .{attr});
+                            if (comptime @hasDecl(T, "setAttributes") and !@hasDecl(T, "vtRaw")) {
+                                self.handler.setAttributes(&p);
+                            } else while (p.next()) |attr| {
                                 self.handler.vt(.set_attribute, attr);
                             }
                         },
@@ -2901,13 +2963,11 @@ pub fn Stream(comptime H: type) type {
                         return;
                     }
 
-                    const shape = MouseShape.fromString(v.value) orelse {
-                        @branchHint(.unlikely);
-                        log.warn("unknown cursor shape: {s}", .{v.value});
-                        return;
-                    };
-
-                    self.handler.vt(.mouse_shape, shape);
+                    switch (v.value[0]) {
+                        '=', '>', '<', '?' => self.handler.vt(.kitty_pointer, .{ .payload = v.value }),
+                        else => if (MouseShape.fromString(v.value)) |shape|
+                            self.handler.vt(.mouse_shape, shape),
+                    }
                 },
 
                 .color_operation => |v| {
@@ -2929,6 +2989,11 @@ pub fn Stream(comptime H: type) type {
                         .body = v.body,
                     });
                 },
+
+                .kitty_desktop_notification => |v| self.handler.vt(.kitty_notification, v),
+                .kitty_text_sizing => |v| self.handler.vt(.kitty_text_sizing, v),
+                .iterm_report_cell_size => |v| self.handler.vt(.iterm_report_cell_size, v),
+                .iterm_inline_image => |v| self.handler.vt(.iterm_inline_image, v),
 
                 .hyperlink_start => |v| {
                     @branchHint(.likely);
@@ -2973,8 +3038,6 @@ pub fn Stream(comptime H: type) type {
                 .conemu_xterm_emulation,
                 .conemu_output_environment_variable,
                 .conemu_run_process,
-                .kitty_text_sizing,
-                .kitty_desktop_notification,
                 .hierarchical_context,
                 => {
                     log.debug("unimplemented OSC callback: {}", .{cmd});
@@ -3655,6 +3718,33 @@ test "stream: print" {
     var s: Stream(H) = .init(.{ .handler = .{} });
     s.next('x');
     try testing.expectEqual(@as(u21, 'x'), s.handler.c.?);
+}
+
+test "stream: isolated printable glyphs between escape sequences across chunk boundaries" {
+    const H = struct {
+        chars: [16]u32 = undefined,
+        len: usize = 0,
+
+        fn append(self: *@This(), cp: u32) void {
+            self.chars[self.len] = cp;
+            self.len += 1;
+        }
+
+        pub fn vt(self: *@This(), comptime action: Action.Tag, value: Action.Value(action)) void {
+            switch (action) {
+                .print => self.append(value.cp),
+                .print_slice => for (value.cps) |cp| self.append(cp),
+                else => {},
+            }
+        }
+    };
+    const input = "\x1b[31m \x1b[32m~\x1b[33m\r\x1b[34m日\x1b[0mAB";
+    for (0..input.len + 1) |split| {
+        var stream: Stream(H) = .init(.{ .handler = .{} });
+        stream.nextSlice(input[0..split]);
+        stream.nextSlice(input[split..]);
+        try testing.expectEqualSlices(u32, &.{ ' ', '~', '日', 'A', 'B' }, stream.handler.chars[0..stream.handler.len]);
+    }
 }
 
 test "simd: print invalid utf-8" {
@@ -5733,6 +5823,49 @@ test "stream: nextSliceUntil ground tracks only the consumed prefix" {
     try testing.expectEqualStrings("\x1b[123", pending_writer.buffered());
 }
 
+test "OSC 1337 stream routes report, multipart data and interrupted packets" {
+    const Handler = struct {
+        report: ?osc.Terminator = null,
+        starts: usize = 0,
+        parts: usize = 0,
+        ends: usize = 0,
+        cancels: usize = 0,
+
+        pub fn deinit(_: *@This()) void {}
+
+        pub fn vt(self: *@This(), comptime action: Action.Tag, value: Action.Value(action)) void {
+            switch (action) {
+                .iterm_report_cell_size => self.report = value,
+                .iterm_inline_image => switch (value) {
+                    .file => unreachable,
+                    .multipart_file => |options| {
+                        assert(options.do_not_move_cursor);
+                        self.starts += 1;
+                    },
+                    .file_part => |data| {
+                        assert(std.mem.eql(u8, data, "YQ=="));
+                        self.parts += 1;
+                    },
+                    .file_end => self.ends += 1,
+                    .cancel => self.cancels += 1,
+                },
+                else => {},
+            }
+        }
+    };
+
+    var stream: Stream(Handler) = .init(.{ .handler = .{}, .allocator = testing.allocator });
+    defer stream.deinit();
+    stream.nextSlice("\x1b]1337;ReportCellSize\x07\x1b]1337;MultipartFile=inline=1;doNotMoveCursor=1\x1b\\");
+    stream.nextSlice("\x1b]1337;FilePart=YQ==\x07\x1b]1337;FileEnd\x1b\\");
+    stream.nextSlice("\x1b]1337;FilePart=YQ==\x18\x1b]1337;MultipartFile=inline=0\x07");
+    try testing.expectEqual(osc.Terminator.bel, stream.handler.report.?);
+    try testing.expectEqual(@as(usize, 1), stream.handler.starts);
+    try testing.expectEqual(@as(usize, 1), stream.handler.parts);
+    try testing.expectEqual(@as(usize, 1), stream.handler.ends);
+    try testing.expectEqual(@as(usize, 2), stream.handler.cancels);
+}
+
 /// A test handler for boundary stops: records APC lifecycle, content,
 /// how many codepoints were printed, and the DCS and OSC actions that
 /// a string of those kinds produces.
@@ -6286,7 +6419,7 @@ const dcs_entries = [_]struct { input: []const u8, state: Parser.State }{
     .{ .input = "\x1bP", .state = .dcs_entry },
     .{ .input = "\x1bP1", .state = .dcs_param },
     .{ .input = "\x1bP ", .state = .dcs_intermediate },
-    .{ .input = "\x1bP1q", .state = .dcs_passthrough },
+    .{ .input = "\x1bP1p", .state = .dcs_passthrough },
     .{ .input = "\x1bP:", .state = .dcs_ignore },
 };
 

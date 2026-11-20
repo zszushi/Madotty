@@ -4,6 +4,7 @@ pub const Thread = @This();
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_config = @import("../build_config.zig");
 const global = @import("../global.zig");
 const xev = global.xev;
 const crash = @import("../crash/main.zig");
@@ -326,14 +327,9 @@ fn drainMailbox(self: *Thread) !void {
                 // Visibility affects our QoS class
                 self.setQosClass();
 
-                // If we became visible then we immediately rebuild cells
-                // (renderCallback skips updateFrame while invisible) and
-                // draw. Going through renderCallback also reschedules
-                // any Kitty graphics animation wakeup that lapsed
-                // while we were invisible.
-                if (v) _ = renderCallback(self, undefined, undefined, {});
-
-                // Notify the renderer so it can update any state.
+                // The wakeup callback renders once after draining the
+                // mailbox, using the final visibility and size. It also
+                // rearms any animation that lapsed while we were hidden.
                 self.renderer.setVisible(v);
 
                 // Note that we're explicitly today not stopping any
@@ -480,6 +476,11 @@ fn drawFrame(self: *Thread, now: bool) void {
     // when we're forced to via `now`.
     if (!now and self.renderer.hasVsync()) return;
 
+    if (comptime build_config.renderer == .vulkan) {
+        self.renderer.api.requestDraw();
+        return;
+    }
+
     {
         var errored = false;
         self.renderer.drawFrame(false) catch |err| {
@@ -493,7 +494,7 @@ fn drawFrame(self: *Thread, now: bool) void {
         // recreate it. The health atomic is safe to read here because
         // GL frame completion is synchronous: it was set on this thread
         // during the drawFrame above.
-        if (comptime @hasDecl(apprt.Surface, "recreateGLContext")) {
+        if (comptime build_config.renderer == .opengl and @hasDecl(apprt.Surface, "recreateGLContext")) {
             if (errored or self.renderer.health.load(.seq_cst) == .unhealthy) {
                 self.unhealthy_frames +|= 1;
                 if (self.unhealthy_frames >= UNHEALTHY_FRAMES_BEFORE_RECOVERY and

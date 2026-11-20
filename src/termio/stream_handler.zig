@@ -85,6 +85,8 @@ pub const StreamHandler = struct {
     /// transaction, if any.
     kitty_clipboard_write: ?*terminal.kitty.clipboard.WriteState = null,
 
+    kitty_notifications: terminal.kitty.notification.State = .{},
+
     /// This is set to true when a message was written to the termio
     /// mailbox. This can be used by callers to determine if they need
     /// to wake up the termio thread.
@@ -93,6 +95,9 @@ pub const StreamHandler = struct {
     /// This is set to true when we've seen a title escape sequence. We use
     /// this to determine if we need to default the window title.
     seen_title: bool = false,
+    /// The Win32 backend seeds terminal.pwd from the process launch directory.
+    /// Only a directory reported by the shell belongs in a tab title.
+    seen_reported_pwd: bool = false,
 
     pub const Stream = terminal.Stream(StreamHandler);
 
@@ -102,6 +107,7 @@ pub const StreamHandler = struct {
     pub fn deinit(self: *StreamHandler) void {
         self.apc.deinit();
         self.dcs.deinit();
+        self.kitty_notifications.deinit(self.alloc);
         self.kittyClipboardWriteAbort();
         self.kitty_clipboard_grants.deinit(self.alloc);
         if (comptime tmux_enabled) tmux: {
@@ -184,6 +190,11 @@ pub const StreamHandler = struct {
             );
         };
         _ = self.renderer_mailbox.push(msg, .{ .forever = {} });
+    }
+
+    pub fn setAttributes(self: *StreamHandler, parser: *terminal.sgr.Parser) void {
+        self.terminal.screens.active.setAttributes(parser) catch |err|
+            log.warn("error setting attributes: {}", .{err});
     }
 
     pub fn vt(
@@ -345,14 +356,17 @@ pub const StreamHandler = struct {
             .window_title => try self.windowTitle(value.title),
             .report_pwd => try self.reportPwd(value.url),
             .show_desktop_notification => try self.showDesktopNotification(value.title, value.body),
+            .kitty_notification => try self.kittyNotification(value),
+            .kitty_text_sizing => try self.terminal.printSized(value.text, value.width),
+            .iterm_report_cell_size => try self.itermReportCellSize(value),
+            .iterm_inline_image => try self.terminal.itermInlineImage(value),
             .progress_report => self.progressReport(value),
             .start_hyperlink => try self.startHyperlink(value.uri, value.id),
             .clipboard_contents => try self.clipboardContents(value.kind, value.data),
             .semantic_prompt => try self.semanticPrompt(value),
-            .mouse_shape => try self.setMouseShape(value),
-            .mouse_shape_reset => try self.setMouseShape(
-                if (self.terminal.flags.mouse_event != .none) .default else .text,
-            ),
+            .mouse_shape => self.setPointerShape(value),
+            .mouse_shape_reset => self.setPointerShape(null),
+            .kitty_pointer => try self.kittyPointer(value.payload),
             .configure_charset => self.configureCharset(value.slot, value.charset),
             .set_attribute => {
                 @branchHint(.likely);
@@ -374,7 +388,12 @@ pub const StreamHandler = struct {
             },
             .dcs_hook => try self.dcsHook(value),
             .dcs_put => try self.dcsPut(value),
-            .dcs_unhook => try self.dcsUnhook(),
+            .dcs_unhook => try self.dcsUnhook(value.terminated),
+            .sixel_query => {
+                var buf: [64]u8 = undefined;
+                if (try terminal.sixel_display.query(self.terminal, value, &buf)) |response|
+                    self.messageWriter(try termio.Message.writeReq(self.alloc, response));
+            },
             .apc_start => self.apc.start(),
             .apc_end => try self.apcEnd(value.terminated),
             .apc_put => self.apc.feed(self.alloc, value),
@@ -403,8 +422,8 @@ pub const StreamHandler = struct {
         try self.dcsCommand(&cmd);
     }
 
-    pub inline fn dcsUnhook(self: *StreamHandler) !void {
-        var cmd = self.dcs.unhook() orelse return;
+    pub inline fn dcsUnhook(self: *StreamHandler, terminated: bool) !void {
+        var cmd = self.dcs.end(terminated) orelse return;
         defer cmd.deinit();
         try self.dcsCommand(&cmd);
     }
@@ -503,6 +522,8 @@ pub const StreamHandler = struct {
                 );
                 self.messageWriter(msg);
             },
+
+            .sixel => |*image| try terminal.sixel_display.display(self.terminal, image),
         }
     }
 
@@ -702,16 +723,15 @@ pub const StreamHandler = struct {
                 self.terminal.scrolling_region.right = self.terminal.cols - 1;
             },
 
-            .alt_screen_legacy => {
-                try self.terminal.switchScreenMode(.@"47", enabled);
-            },
-
-            .alt_screen => {
-                try self.terminal.switchScreenMode(.@"1047", enabled);
-            },
-
-            .alt_screen_save_cursor_clear_enter => {
-                try self.terminal.switchScreenMode(.@"1049", enabled);
+            .alt_screen_legacy, .alt_screen, .alt_screen_save_cursor_clear_enter => {
+                const previous = self.terminal.mouse_shape;
+                try self.terminal.switchScreenMode(switch (mode) {
+                    .alt_screen_legacy => .@"47",
+                    .alt_screen => .@"1047",
+                    .alt_screen_save_cursor_clear_enter => .@"1049",
+                    else => unreachable,
+                }, enabled);
+                self.publishMouseShape(previous);
             },
 
             // Mode 1048 is xterm's conditional save cursor depending
@@ -770,41 +790,15 @@ pub const StreamHandler = struct {
                 .focused = self.terminal.flags.focused,
             }),
 
-            .mouse_event_x10 => {
-                if (enabled) {
-                    self.terminal.flags.mouse_event = .x10;
-                    try self.setMouseShape(.default);
-                } else {
-                    self.terminal.flags.mouse_event = .none;
-                    try self.setMouseShape(.text);
-                }
-            },
-            .mouse_event_normal => {
-                if (enabled) {
-                    self.terminal.flags.mouse_event = .normal;
-                    try self.setMouseShape(.default);
-                } else {
-                    self.terminal.flags.mouse_event = .none;
-                    try self.setMouseShape(.text);
-                }
-            },
-            .mouse_event_button => {
-                if (enabled) {
-                    self.terminal.flags.mouse_event = .button;
-                    try self.setMouseShape(.default);
-                } else {
-                    self.terminal.flags.mouse_event = .none;
-                    try self.setMouseShape(.text);
-                }
-            },
-            .mouse_event_any => {
-                if (enabled) {
-                    self.terminal.flags.mouse_event = .any;
-                    try self.setMouseShape(.default);
-                } else {
-                    self.terminal.flags.mouse_event = .none;
-                    try self.setMouseShape(.text);
-                }
+            .mouse_event_x10, .mouse_event_normal, .mouse_event_button, .mouse_event_any => {
+                self.terminal.flags.mouse_event = if (!enabled) .none else switch (mode) {
+                    .mouse_event_x10 => .x10,
+                    .mouse_event_normal => .normal,
+                    .mouse_event_button => .button,
+                    .mouse_event_any => .any,
+                    else => unreachable,
+                };
+                self.refreshMouseShape();
             },
 
             .mouse_format_utf8 => self.terminal.flags.mouse_format = if (enabled) .utf8 else .x10,
@@ -835,7 +829,9 @@ pub const StreamHandler = struct {
                 // 62 = Level 2 conformance
                 // 22 = Color text
                 // 52 = Clipboard access
-                .write_stable = if (self.clipboard_write != .deny)
+                .write_stable = if (terminal.sixel_display.enabled(self.terminal))
+                    (if (self.clipboard_write != .deny) "\x1B[?62;4;22;52c" else "\x1B[?62;4;22c")
+                else if (self.clipboard_write != .deny)
                     "\x1B[?62;22;52c"
                 else
                     "\x1B[?62;22c",
@@ -936,8 +932,10 @@ pub const StreamHandler = struct {
     pub fn fullReset(
         self: *StreamHandler,
     ) !void {
+        const previous = self.terminal.mouse_shape;
         self.terminal.fullReset();
-        try self.setMouseShape(.text);
+        self.publishMouseShape(previous);
+        self.kitty_notifications.deinit(self.alloc);
 
         // Full reset clears Kitty clipboard session grants.
         self.kitty_clipboard_grants.deinit(self.alloc);
@@ -1017,7 +1015,8 @@ pub const StreamHandler = struct {
         if (title.len == 0) {
             // If we have a pwd then we set the title as the pwd else
             // we just set it to blank.
-            if (self.terminal.getPwd()) |pwd| pwd: {
+            const title_pwd = if (build_config.app_runtime != .win32 or self.seen_reported_pwd) self.terminal.getPwd() else null;
+            if (title_pwd) |pwd| pwd: {
                 if (pwd.len >= buf.len) break :pwd;
                 @memcpy(buf[0..pwd.len], pwd);
                 buf[pwd.len] = 0;
@@ -1032,16 +1031,45 @@ pub const StreamHandler = struct {
         self.surfaceMessageWriter(.{ .set_title = buf });
     }
 
-    inline fn setMouseShape(
-        self: *StreamHandler,
-        shape: terminal.MouseShape,
-    ) !void {
-        // Avoid changing the shape if it is already set to avoid excess
-        // cross-thread messaging.
-        if (self.terminal.mouse_shape == shape) return;
+    const pointer_capabilities: terminal.kitty.pointer.Capabilities = .{
+        .supported = if (@hasDecl(apprt.Surface, "supportsMouseShape"))
+            apprt.Surface.supportsMouseShape
+        else
+            null,
+    };
 
-        self.terminal.mouse_shape = shape;
-        self.surfaceMessageWriter(.{ .set_mouse_shape = shape });
+    fn setPointerShape(self: *StreamHandler, shape: ?terminal.MouseShape) void {
+        if (shape) |value| if (pointer_capabilities.supported) |supported| {
+            if (!supported(value)) return;
+        };
+        self.terminal.kitty_pointer.setShape(self.terminal.screens.active_key == .alternate, shape);
+        self.refreshMouseShape();
+    }
+
+    fn kittyPointer(self: *StreamHandler, payload: []const u8) !void {
+        const alternate = self.terminal.screens.active_key == .alternate;
+        const pointer = &self.terminal.kitty_pointer;
+        const request = terminal.kitty.pointer.parse(payload);
+        if (request == .query) {
+            var response: std.Io.Writer.Allocating = .init(self.alloc);
+            defer response.deinit();
+            try pointer.writeResponse(alternate, request.query, pointer_capabilities, &response.writer);
+            self.messageWriter(try termio.Message.writeReq(self.alloc, response.written()));
+            return;
+        }
+        pointer.apply(alternate, request, pointer_capabilities);
+        self.refreshMouseShape();
+    }
+
+    fn refreshMouseShape(self: *StreamHandler) void {
+        const previous = self.terminal.mouse_shape;
+        self.terminal.mouse_shape = self.terminal.effectiveMouseShape();
+        self.publishMouseShape(previous);
+    }
+
+    fn publishMouseShape(self: *StreamHandler, previous: terminal.MouseShape) void {
+        const current = self.terminal.mouse_shape;
+        if (previous != current) self.surfaceMessageWriter(.{ .set_mouse_shape = current });
     }
 
     fn clipboardContents(self: *StreamHandler, kind: u8, data: []const u8) !void {
@@ -1526,6 +1554,7 @@ pub const StreamHandler = struct {
         if (url.len == 0) {
             // Blank value can never fail because no allocs happen.
             self.terminal.setPwd("") catch unreachable;
+            self.seen_reported_pwd = false;
 
             // If we haven't seen a title, we're using the pwd as our title.
             // Set it to blank which will reset our title behavior.
@@ -1539,7 +1568,7 @@ pub const StreamHandler = struct {
             return;
         }
 
-        if (builtin.target.os.tag == .windows) {
+        if (builtin.target.os.tag == .windows and build_config.app_runtime != .win32) {
             log.warn("reportPwd unimplemented on windows", .{});
             return;
         }
@@ -1563,7 +1592,11 @@ pub const StreamHandler = struct {
         }
 
         var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-        const host = std.Io.net.HostName.fromUri(uri, &host_buffer) catch |err| switch (err) {
+        // file:///C:/... omits the authority on a local drive URI.
+        var local_uri = uri;
+        if (build_config.app_runtime == .win32 and std.mem.startsWith(u8, url, "file:///"))
+            local_uri.host = .{ .raw = "localhost" };
+        const host = std.Io.net.HostName.fromUri(local_uri, &host_buffer) catch |err| switch (err) {
             error.UriMissingHost => {
                 log.warn("OSC 7 uri must contain a hostname: {}", .{err});
                 return;
@@ -1596,10 +1629,15 @@ pub const StreamHandler = struct {
         var stack_alloc_buf: [1024]u8 = undefined;
         var stack_alloc: std.heap.BufferFirstAllocator = .init(&stack_alloc_buf, arena_alloc.allocator());
         defer arena_alloc.deinit();
-        const path = try uri.path.toRawMaybeAlloc(stack_alloc.allocator());
+        const raw_path = try uri.path.toRawMaybeAlloc(stack_alloc.allocator());
+        const path = if (build_config.app_runtime == .win32)
+            (try windowsReportedPwd(stack_alloc.allocator(), raw_path)) orelse return
+        else
+            raw_path;
 
         log.debug("terminal pwd: {s}", .{path});
         try self.terminal.setPwd(path);
+        self.seen_reported_pwd = true;
 
         // Report it to the surface. If creating our write request fails
         // then we just ignore it.
@@ -1614,6 +1652,24 @@ pub const StreamHandler = struct {
             try self.windowTitle(path);
             self.seen_title = false;
         }
+    }
+
+    fn windowsReportedPwd(alloc: Allocator, raw: []const u8) !?[]const u8 {
+        if (raw.len < 4 or raw[0] != '/' or !std.ascii.isAlphabetic(raw[1]) or
+            raw[2] != ':' or raw[3] != '/') return null;
+        for (raw) |c| if (std.ascii.isControl(c)) return null;
+        const path = try alloc.dupe(u8, raw[1..]);
+        std.mem.replaceScalar(u8, path, '/', '\\');
+        return path;
+    }
+
+    test "tab bar title only accepts local drive paths from a Windows OSC 7 URI" {
+        const a = std.testing.allocator;
+        const local = (try windowsReportedPwd(a, "/C:/work files/project")).?;
+        defer a.free(local);
+        try std.testing.expectEqualStrings("C:\\work files\\project", local);
+        for ([_][]const u8{ "", "/C:relative", "//server/share", "/C:/bad\x00path" }) |invalid|
+            try std.testing.expectEqual(null, try windowsReportedPwd(a, invalid));
     }
 
     fn colorOperation(
@@ -1846,6 +1902,35 @@ pub const StreamHandler = struct {
         self.surfaceMessageWriter(.{
             .desktop_notification = .init(title, body),
         });
+    }
+
+    fn kittyNotification(self: *StreamHandler, request: terminal.osc.Command.KittyDesktopNotification) !void {
+        const result = try self.kitty_notifications.handle(self.alloc, request, .{
+            .focused = self.terminal.flags.focused,
+            .visible = self.terminal.flags.visible,
+        });
+        defer result.deinit(self.alloc);
+        switch (result) {
+            .ignored => {},
+            .reply => |reply| self.messageWriter(try termio.Message.writeReq(self.alloc, reply)),
+            .notification => |notice| try self.showDesktopNotification(notice.title, notice.body),
+        }
+    }
+
+    fn itermReportCellSize(self: *StreamHandler, terminator: terminal.osc.Terminator) !void {
+        const t = self.terminal;
+        var buf: [192]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try terminal.size_report.encodeITermCellSize(
+            &writer,
+            t.width_px / t.cols,
+            t.height_px / t.rows,
+            t.pixels_per_point,
+            terminator,
+        );
+        if (writer.buffered().len != 0) {
+            self.messageWriter(try termio.Message.writeReq(self.alloc, writer.buffered()));
+        }
     }
 
     /// Send a report to the pty.

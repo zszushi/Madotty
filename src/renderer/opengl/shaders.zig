@@ -198,8 +198,7 @@ pub const Uniforms = extern struct {
     bools: Bools align(4),
 
     const Bools = packed struct(u32) {
-        /// Whether the cursor is 2 cells wide.
-        cursor_wide: bool,
+        _padding_low: u1 = 0,
 
         /// Indicates that colors provided to the shader are already in
         /// the P3 color space, so they don't need to be converted from
@@ -218,7 +217,9 @@ pub const Uniforms = extern struct {
         /// (thickness) to gamma-incorrect blending.
         use_linear_correction: bool = false,
 
-        _padding: u28 = 0,
+        /// Number of grid cells occupied by the cursor, in bits 4–6.
+        cursor_width: u3 = 1,
+        _padding: u25 = 0,
     };
 
     const PaddingExtend = packed struct(u32) {

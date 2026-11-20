@@ -1,0 +1,55 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="Madotty" Manufacturer="Madotty" Version="$(Version)"
+           UpgradeCode="9CDC2A25-32B0-4389-AEA6-40F7FADE85B4" Scope="perUser">
+    <MajorUpgrade Schedule="afterInstallInitialize" AllowSameVersionUpgrades="$(AllowSameVersion)"
+                  DowngradeErrorMessage="A newer version of Madotty is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <?ifdef HandoffIncluded ?>
+    <SetProperty Id="MadottyWindowsPowerShell" Value="[System64Folder]WindowsPowerShell\v1.0\powershell.exe"
+                 Before="UnregisterMadottyHandoff" Sequence="execute" />
+    <CustomAction Id="UnregisterMadottyHandoff" Property="MadottyWindowsPowerShell" Execute="deferred"
+                  Impersonate="yes" Return="check"
+                  ExeCommand="-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]unregister-handoff.ps1&quot;" />
+    <InstallExecuteSequence>
+      <Custom Action="UnregisterMadottyHandoff" Before="RemoveFiles" Condition='REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE' />
+    </InstallExecuteSequence>
+    <?endif?>
+    <Icon Id="MadottyIcon" SourceFile="$(IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="MadottyIcon" />
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUIDialogBmp" Value="$(ArtworkDir)\dialog.bmp" />
+    <WixVariable Id="WixUIBannerBmp" Value="$(ArtworkDir)\banner.bmp" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(LicenseRtf)" />
+    <Property Id="ACCEPTLICENSE" Secure="yes" />
+    <Launch Condition="Installed OR UILevel = 5 OR ACCEPTLICENSE = 1"
+            Message="Read the license in the interactive installer. For unattended installation, set ACCEPTLICENSE=1 after accepting the terms." />
+    <Property Id="MADOTTYINSTALLLOCATION" Secure="yes">
+      <RegistrySearch Id="MadottyInstallLocation" Root="HKCU" Key="Software\Madotty\Installer"
+                      Name="InstallLocation" Type="raw" />
+    </Property>
+    <SetProperty Id="INSTALLFOLDER" Value="[MADOTTYINSTALLLOCATION]" Before="CostFinalize"
+                 Sequence="both" Condition="MADOTTYINSTALLLOCATION AND NOT INSTALLFOLDER" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="MadottyPrograms" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Madotty" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="MadottyShortcut" Guid="108D5D0B-1BA5-412F-9A8B-5B7FCF30AA67">
+        <Shortcut Id="MadottyStartMenu" Name="Madotty" Description="Madotty terminal emulator"
+                  Target="[INSTALLFOLDER]ghostty.exe" Icon="MadottyIcon" />
+        <RegistryValue Root="HKCU" Key="Software\Madotty\Installer" Name="StartMenu"
+                       Type="integer" Value="1" KeyPath="yes" />
+        <RegistryValue Root="HKCU" Key="Software\Madotty\Installer" Name="InstallLocation"
+                       Type="string" Value="[INSTALLFOLDER]" />
+      </Component>
+    </StandardDirectory>
+
+    <Feature Id="Madotty" Title="Madotty" Level="1">
+      <ComponentGroupRef Id="MadottyPayload" />
+      <ComponentRef Id="MadottyShortcut" />
+    </Feature>
+  </Package>
+</Wix>

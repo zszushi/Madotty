@@ -1,4 +1,7 @@
-param([string]$BuildDir = (Join-Path $PSScriptRoot '..\..\zig-out'))
+param(
+    [string]$BuildDir = (Join-Path $PSScriptRoot '..\..\zig-out'),
+    [string]$PortableZip
+)
 
 # No GUI or global input: exercise payload and executable/PE version validation.
 $ErrorActionPreference = 'Stop'
@@ -10,7 +13,7 @@ $testRoot = Join-Path $env:TEMP ('ghostty-package-test-' + [guid]::NewGuid().ToS
 try {
     New-Item -ItemType Directory -Path $testRoot | Out-Null
     $files = @(
-        'bin\ghostty.exe', 'bin\conpty.dll', 'bin\OpenConsole.exe',
+        'bin\ghostty.exe', 'bin\ghostty.com', 'bin\conpty.dll', 'bin\OpenConsole.exe',
         'share\terminfo\ghostty.terminfo', 'share\licenses\conpty\LICENSE.txt',
         'share\ghostty\shell-integration\powershell\ghostty-shell-integration.ps1'
     )
@@ -56,6 +59,39 @@ try {
     [System.IO.File]::WriteAllText((Join-Path $testRoot 'LICENSE'), 'fixture license')
     if ((& $verify -BuildDir $testRoot -Portable -ExpectedVersion $version) -cne $version) {
         throw 'Portable layout failed verification.'
+    }
+    if ($PortableZip) {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $expanded = Join-Path $testRoot 'extracted'
+        [IO.Compression.ZipFile]::ExtractToDirectory((Get-Item -LiteralPath $PortableZip).FullName, $expanded)
+        $portable = Join-Path $expanded 'ghostty'
+        & $verify -BuildDir $portable -Portable -ExpectedVersion $version | Out-Null
+        $fromPrefix = @('ghostty.exe', 'ghostty.com', 'ghostty-d3d12.exe', 'ghostty-vulkan.exe',
+            'OpenConsole.exe', 'conpty.dll', 'dxcompiler.dll', 'dxil.dll')
+        $proxy = 'Madotty.TerminalHandoffProxy.dll'
+        if (Test-Path -LiteralPath (Join-Path $BuildDir "bin\$proxy")) { $fromPrefix += $proxy }
+        $settings = Get-Item -LiteralPath (Join-Path $BuildDir 'bin\settings')
+        foreach ($file in (Get-ChildItem -LiteralPath $settings.FullName -File -Recurse)) {
+            if ($file.Extension -ne '.pdb') {
+                $fromPrefix += 'settings\' + $file.FullName.Substring($settings.FullName.Length + 1)
+            }
+        }
+        foreach ($path in $fromPrefix) {
+            if ((Get-FileHash -LiteralPath (Join-Path $portable $path)).Hash -ne
+                (Get-FileHash -LiteralPath (Join-Path $BuildDir "bin\$path")).Hash) {
+                throw "Packaged file differs from the build: $path"
+            }
+        }
+        foreach ($license in @('dxc\LICENSE-MS.txt', 'dxc\LICENCE-MIT.txt', 'dxc\LICENSE-LLVM.txt',
+                'Microsoft.WindowsAppSDK.Runtime\license.txt', 'Microsoft.NETCore.App.Runtime.win-x64\LICENSE.TXT')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $portable "share\licenses\$license") -PathType Leaf)) {
+                throw "Packaged license is missing: $license"
+            }
+        }
+        if (Get-ChildItem -LiteralPath $portable -Recurse -File |
+            Where-Object { $_.Extension -eq '.pdb' -or $_.Name -in @('ghostty-test.exe', 'madotty-vulkan-smoke.exe') }) {
+            throw 'The portable ZIP contains test binaries or debug symbols.'
+        }
     }
     Write-Output "PowerShell $($PSVersionTable.PSVersion) package validation checks passed ($version)."
 } finally {

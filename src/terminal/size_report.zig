@@ -1,5 +1,6 @@
 const std = @import("std");
 const lib = @import("lib.zig");
+const osc = @import("osc.zig");
 const CellCountInt = @import("size.zig").CellCountInt;
 
 /// Output formats for terminal size reports written to the PTY.
@@ -37,6 +38,27 @@ fn widthPixels(s: Size) u64 {
 
 fn heightPixels(s: Size) u64 {
     return @as(u64, s.rows) * @as(u64, s.cell_height);
+}
+
+/// OSC 1337 reports logical cell dimensions followed by the backing scale.
+pub fn encodeITermCellSize(
+    writer: *std.Io.Writer,
+    width: u32,
+    height: u32,
+    pixels_per_point: f32,
+    terminator: osc.Terminator,
+) std.Io.Writer.Error!void {
+    if (width == 0 or height == 0) return;
+    const scale: f64 = if (std.math.isFinite(pixels_per_point) and pixels_per_point > 0)
+        pixels_per_point
+    else
+        1;
+    try writer.print("\x1b]1337;ReportCellSize={d:.4};{d:.4};{d:.4}{s}", .{
+        @as(f64, @floatFromInt(height)) / scale,
+        @as(f64, @floatFromInt(width)) / scale,
+        scale,
+        terminator.string(),
+    });
 }
 
 /// Encode a terminal size report sequence.
@@ -123,6 +145,13 @@ test "encode csi 16 t" {
     try encode(&writer, .csi_16_t, testSize());
 
     try std.testing.expectEqualStrings("\x1b[6;18;9t", writer.buffered());
+}
+
+test "OSC 1337 cell size reports logical dimensions and scale" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try encodeITermCellSize(&writer, 11, 23, 1.25, .bel);
+    try std.testing.expectEqualStrings("\x1b]1337;ReportCellSize=18.4000;8.8000;1.2500\x07", writer.buffered());
 }
 
 test "encode csi 18 t" {

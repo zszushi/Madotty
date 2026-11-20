@@ -38,8 +38,9 @@ function prompt {
         [Console]::Write("$Script:__ghostty_escape]133;D;$exitCode`a")
     }
 
-    # OSC 133;A — fresh line / new prompt.
-    [Console]::Write("$Script:__ghostty_escape]133;A`a")
+    # PowerShell does not regenerate the complete prompt on a ConPTY resize.
+    # Keep the prompt and any rows written before the command-start marker.
+    [Console]::Write("$Script:__ghostty_escape]133;A;redraw=0`a")
 
     # setupFeatures emits the configured blink state with the cursor feature.
     # Retain the bare name for manually configured older integrations.
@@ -54,8 +55,10 @@ function prompt {
     # Windows filesystem path cannot. Keep those bytes out of OSC payloads so
     # navigating to such a location cannot inject terminal commands.
     $cwd = (Get-Location).Path -replace '\\', '/' -replace '\p{Cc}', ''
+    # Keep percent escapes and URI delimiters in filenames literal when decoded.
+    $cwd = $cwd.Replace('%', '%25').Replace('#', '%23').Replace('?', '%3F').Replace(' ', '%20')
     # File URI: file://hostname/path
-    $hostname = [System.Net.Dns]::GetHostName() -replace '\p{Cc}', ''
+    $hostname = [Environment]::MachineName -replace '\p{Cc}', ''
     [Console]::Write("$Script:__ghostty_escape]7;file://$hostname/$cwd`a")
 
     # OSC 2 — window title (current directory).

@@ -44,16 +44,20 @@ $installRoot = Join-Path $testRoot 'installed builds'
 $desktopDir = Join-Path $testRoot 'Desktop'
 $shortcutPath = Join-Path $desktopDir 'Ghostty Dev.lnk'
 $exePath = Join-Path $buildDir 'bin\ghostty.exe'
+$rendererPath = Join-Path $buildDir 'bin\ghostty-d3d12.exe'
+$cliPath = Join-Path $buildDir 'bin\ghostty.com'
 $dllPath = Join-Path $buildDir 'bin\conpty.dll'
 $hostPath = Join-Path $buildDir 'bin\OpenConsole.exe'
 $licensePath = Join-Path $buildDir 'share\licenses\conpty\LICENSE.txt'
 $sentinelPath = Join-Path $buildDir 'share\terminfo\ghostty.terminfo'
 $themesPath = Join-Path $buildDir 'share\ghostty\themes'
 $integrationPath = Join-Path $buildDir 'share\ghostty\shell-integration'
+$settingsPath = Join-Path $buildDir 'bin\settings'
 $shell = $null
 $heldExe = $null
 try {
     Write-Fixture $exePath 'dummy development executable one'
+    Write-Fixture $cliPath 'dummy console entry point'
     Write-Fixture $dllPath 'dummy console library one'
     Write-Fixture $hostPath 'dummy matching console host'
     Write-Fixture $licensePath 'dummy console license'
@@ -74,6 +78,8 @@ try {
     Assert-True ((Split-Path -Leaf $firstTarget) -eq 'ghostty.exe') 'shortcut targets the deployed executable'
     Assert-True ((Split-Path -Parent $firstBuild) -eq (Join-Path $installRoot 'builds')) 'deployment uses a local versioned build directory'
     Assert-True (-not $firstTarget.StartsWith('\\')) 'shortcut target is a local Windows path'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $firstBuild 'ghostty-d3d12.exe'))) 'a single-renderer build installs without a D3D12 executable'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $firstBuild 'settings'))) 'a Zig-only build installs without a settings companion'
     $shortcut = $shell.CreateShortcut($shortcutPath)
     try {
         Assert-True ($shortcut.WorkingDirectory -eq [Environment]::GetFolderPath('UserProfile')) 'shortcut starts shells in the user home directory'
@@ -82,6 +88,7 @@ try {
     }
     foreach ($relativePath in @(
         'ghostty.exe',
+        'ghostty.com',
         'conpty.dll',
         'OpenConsole.exe',
         'share\licenses\conpty\LICENSE.txt',
@@ -92,7 +99,7 @@ try {
         'share\ghostty\shell-integration\bash\ghostty.bash',
         'share\ghostty\shell-integration\zsh\.zshenv'
     )) {
-        $sourcePath = if ($relativePath -in @('ghostty.exe', 'conpty.dll', 'OpenConsole.exe')) {
+        $sourcePath = if ($relativePath -in @('ghostty.exe', 'ghostty.com', 'conpty.dll', 'OpenConsole.exe')) {
             Join-Path $buildDir ('bin\' + $relativePath)
         } else { Join-Path $buildDir $relativePath }
         $deployedPath = Join-Path $firstBuild $relativePath
@@ -152,6 +159,86 @@ try {
         try { Assert-RejectedPayload ('missing ' + (Split-Path -Leaf $resourceDirectory) + ' directory') }
         finally { Move-Item -LiteralPath $savedDirectory -Destination $resourceDirectory }
     }
+
+    Write-Fixture (Join-Path $settingsPath 'Madotty.Settings.exe') 'dummy settings executable'
+    Assert-RejectedPayload 'partial settings companion'
+    $settingsFiles = @('Madotty.Settings.exe', 'Madotty.Settings.dll', 'Madotty.Settings.deps.json',
+        'Madotty.Settings.runtimeconfig.json', 'coreclr.dll', 'Microsoft.UI.Xaml.dll', 'resources.pri',
+        'ja-JP\Microsoft.UI.Xaml.dll.mui')
+    foreach ($file in $settingsFiles) {
+        if ($file -ne 'resources.pri') { Write-Fixture (Join-Path $settingsPath $file) "fixture $file" }
+    }
+    Assert-RejectedPayload 'missing settings resource index'
+    Write-Fixture (Join-Path $settingsPath 'resources.pri') 'fixture resources.pri'
+    Invoke-Install
+    $settingsTarget = Get-ShortcutTarget
+    $deployedSettings = Join-Path (Split-Path -Parent $settingsTarget) 'settings'
+    Assert-True ($settingsTarget -ne $newTarget) 'adding settings creates a new deployment'
+    foreach ($file in $settingsFiles) {
+        $fixtureHash = (Get-FileHash -LiteralPath (Join-Path $settingsPath $file) -Algorithm SHA256).Hash
+        $installedHash = (Get-FileHash -LiteralPath (Join-Path $deployedSettings $file) -Algorithm SHA256).Hash
+        Assert-True ($fixtureHash -eq $installedHash) "settings deployment includes $file"
+    }
+
+    $nestedResource = 'ja-JP\Microsoft.UI.Xaml.dll.mui'
+    Write-Fixture (Join-Path $settingsPath $nestedResource) 'updated settings resource'
+    Invoke-Install
+    $newTarget = Get-ShortcutTarget
+    Assert-True ($settingsTarget -ne $newTarget) 'a settings resource change creates a new deployment'
+    Assert-True ([System.IO.File]::ReadAllText((Join-Path $deployedSettings $nestedResource)) -eq "fixture $nestedResource") 'settings resource change preserves the previous deployment'
+
+    Write-Fixture (Join-Path $buildDir 'bin\dxcompiler.dll') 'fixture DXC compiler'
+    Assert-RejectedPayload 'missing DXIL validator'
+    Write-Fixture (Join-Path $buildDir 'bin\dxil.dll') 'fixture DXIL validator'
+    Invoke-Install
+    $compilerTarget = Get-ShortcutTarget
+    Assert-True ($compilerTarget -ne $newTarget) 'adding DXC creates a new deployment'
+    foreach ($file in @('dxcompiler.dll', 'dxil.dll')) {
+        $fixtureHash = (Get-FileHash -LiteralPath (Join-Path $buildDir ('bin\' + $file))).Hash
+        $installedHash = (Get-FileHash -LiteralPath (Join-Path (Split-Path -Parent $compilerTarget) $file)).Hash
+        Assert-True ($fixtureHash -eq $installedHash) "deployment includes $file"
+    }
+
+    $newTarget = $compilerTarget
+    [void][IO.Directory]::CreateDirectory($rendererPath)
+    Assert-RejectedPayload 'directory in place of D3D12 executable'
+    Remove-Item -LiteralPath $rendererPath
+    Write-Fixture $rendererPath ''
+    Assert-RejectedPayload 'empty D3D12 executable'
+
+    Write-Fixture $rendererPath 'first D3D12 renderer executable'
+    Invoke-Install
+    $pairedTarget = Get-ShortcutTarget
+    $pairedBuild = Split-Path -Parent $pairedTarget
+    $pairedRenderer = Join-Path $pairedBuild 'ghostty-d3d12.exe'
+    Assert-True ($pairedTarget -ne $compilerTarget) 'adding D3D12 creates a new deployment'
+    Assert-True ((Split-Path -Leaf $pairedTarget) -eq 'ghostty.exe') 'the paired shortcut still starts the primary executable'
+    Assert-True ([IO.File]::ReadAllText($pairedRenderer) -eq 'first D3D12 renderer executable') 'the D3D12 executable is deployed beside the primary executable'
+    Assert-True ([IO.File]::Exists((Join-Path $pairedBuild 'settings\Madotty.Settings.exe'))) 'the paired build includes the shared settings companion'
+    Assert-True ([IO.File]::Exists((Join-Path $pairedBuild 'dxcompiler.dll'))) 'the paired build includes the shared DXC runtime'
+
+    Write-Fixture $rendererPath 'second D3D12 renderer executable'
+    Invoke-Install
+    $updatedPair = Get-ShortcutTarget
+    Assert-True ($updatedPair -ne $pairedTarget) 'a D3D12-only change creates a new deployment'
+    Assert-True ([IO.File]::ReadAllText((Join-Path (Split-Path -Parent $updatedPair) 'ghostty-d3d12.exe')) -eq 'second D3D12 renderer executable') 'the new deployment includes the updated D3D12 executable'
+    Assert-True ([IO.File]::ReadAllText($pairedRenderer) -eq 'first D3D12 renderer executable') 'a D3D12 update preserves the previous paired deployment'
+
+    $vulkanPath = Join-Path $buildDir 'bin\ghostty-vulkan.exe'
+    Write-Fixture $vulkanPath 'Vulkan renderer executable'
+    Invoke-Install
+    $vulkanTarget = Get-ShortcutTarget
+    $vulkanBuild = Split-Path -Parent $vulkanTarget
+    Assert-True ($vulkanTarget -ne $updatedPair) 'adding Vulkan creates a new deployment'
+    Assert-True ((Split-Path -Leaf $vulkanTarget) -eq 'ghostty.exe') 'the shortcut still starts the primary executable'
+    Assert-True ([IO.File]::ReadAllText((Join-Path $vulkanBuild 'ghostty-vulkan.exe')) -eq 'Vulkan renderer executable') 'the deployment includes the Vulkan executable'
+    Assert-True ([IO.File]::Exists((Join-Path $vulkanBuild 'ghostty-d3d12.exe'))) 'the deployment also includes DirectX 12'
+    Remove-Item -LiteralPath $vulkanPath
+
+    Remove-Item -LiteralPath $rendererPath
+    Invoke-Install
+    Assert-True ((Get-ShortcutTarget) -eq $compilerTarget) 'removing the optional D3D12 executable reuses the single-renderer deployment'
+
     Write-Output "PowerShell $($PSVersionTable.PSVersion) development install checks passed"
 } finally {
     if ($null -ne $heldExe) { $heldExe.Dispose() }

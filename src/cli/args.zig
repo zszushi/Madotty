@@ -1314,8 +1314,7 @@ test "parseIntoField: tagged union missing tag" {
 /// iterates through an underlying iterator and increments a counter
 /// to track the current CLI arg index.
 ///
-/// This also ignores any argument that starts with `+`. It assumes that
-/// actions were parsed out before this iterator was created.
+/// Arguments starting with `+` are CLI actions until `-e` begins a command.
 pub fn ArgsIterator(comptime Iterator: type) type {
     return struct {
         const Self = @This();
@@ -1327,6 +1326,7 @@ pub fn ArgsIterator(comptime Iterator: type) type {
         /// The 0 value is used to indicate that we haven't read any
         /// values yet.
         index: usize = 0,
+        executing_command: bool = false,
 
         pub fn deinit(self: *Self) void {
             if (@hasDecl(Iterator, "deinit")) {
@@ -1335,15 +1335,14 @@ pub fn ArgsIterator(comptime Iterator: type) type {
         }
 
         pub fn next(self: *Self) ?[]const u8 {
-            const value = self.iterator.next() orelse return null;
-            self.index += 1;
-
-            // We ignore any argument that starts with "+". This is used
-            // to indicate actions and are expected to be parsed out before
-            // this iterator is created.
-            if (value.len > 0 and value[0] == '+') return self.next();
-
-            return value;
+            while (self.iterator.next()) |value| {
+                self.index += 1;
+                if (self.executing_command) return value;
+                if (value.len > 0 and value[0] == '+') continue;
+                self.executing_command = std.mem.eql(u8, value, "-e");
+                return value;
+            }
+            return null;
         }
 
         /// Returns a location for a diagnostic message.
@@ -1364,12 +1363,22 @@ pub fn argsIterator(
     return .{ .iterator = iter };
 }
 
+/// Windows COM launches a local server with a single embedding argument.
+/// Match the whole invocation so command arguments after `-e` stay literal.
+pub fn isConsoleEmbedding(alloc: Allocator, args: std.process.Args) !bool {
+    var iter = try argsIterator(alloc, args);
+    defer iter.deinit();
+    const arg = iter.next() orelse return false;
+    return (std.ascii.eqlIgnoreCase(arg, "-Embedding") or std.ascii.eqlIgnoreCase(arg, "/Embedding")) and
+        iter.next() == null;
+}
+
 test "ArgsIterator" {
     const testing = std.testing;
 
     const child = try std.process.Args.IteratorGeneral(.{}).init(
         testing.allocator,
-        "--what +list-things --a=42",
+        "--what +list-things --a=42 -e program \"\" +version",
     );
     const Iter = ArgsIterator(@TypeOf(child));
     var iter: Iter = .{ .iterator = child };
@@ -1377,6 +1386,10 @@ test "ArgsIterator" {
 
     try testing.expectEqualStrings("--what", iter.next().?);
     try testing.expectEqualStrings("--a=42", iter.next().?);
+    try testing.expectEqualStrings("-e", iter.next().?);
+    try testing.expectEqualStrings("program", iter.next().?);
+    try testing.expectEqualStrings("", iter.next().?);
+    try testing.expectEqualStrings("+version", iter.next().?);
     try testing.expectEqual(@as(?[]const u8, null), iter.next());
     try testing.expectEqual(@as(?[]const u8, null), iter.next());
 }

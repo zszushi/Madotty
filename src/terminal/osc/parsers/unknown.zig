@@ -29,7 +29,7 @@ test "OSC unknown: prefix state names are the bytes consumed" {
     inline for (@typeInfo(Parser.State).@"enum".field_names, @typeInfo(Parser.State).@"enum".field_values) |field, field_value| {
         const state: Parser.State = @fromBackingInt(field_value);
         switch (state) {
-            .start, .invalid, .unknown, .unknown_truncated => {},
+            .start, .invalid, .unknown, .unknown_truncated, .iterm2_image_discard => {},
             else => {
                 var p: Parser = .init(null);
                 defer p.deinit();

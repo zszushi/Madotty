@@ -26,7 +26,7 @@ layout(binding = 1, std140) uniform Globals {
 };
 
 // Bools
-const uint CURSOR_WIDE = 1u;
+const uint CURSOR_WIDTH_SHIFT = 4u;
 const uint USE_DISPLAY_P3 = 2u;
 const uint USE_LINEAR_BLENDING = 4u;
 const uint USE_LINEAR_CORRECTION = 8u;

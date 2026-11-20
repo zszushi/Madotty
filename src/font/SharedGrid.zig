@@ -502,11 +502,11 @@ const GlyphKey = packed struct(u64) {
     glyph: u32,
     index: Collection.Index,
     opts: packed struct(u16) {
-        cell_width: u2,
+        cell_width: u3,
         thicken: bool,
         thicken_strength: u8,
         constraint_width: u2,
-        _padding: u3 = 0,
+        _padding: u2 = 0,
     },
 
     const Context = struct {

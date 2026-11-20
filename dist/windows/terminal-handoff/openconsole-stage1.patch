@@ -1,0 +1,27 @@
+diff --git a/dep/vcpkg-overlay-triplets/x64-windows-static.cmake b/dep/vcpkg-overlay-triplets/x64-windows-static.cmake
+index 2e4b4dc..8bca766 100644
+--- a/dep/vcpkg-overlay-triplets/x64-windows-static.cmake
++++ b/dep/vcpkg-overlay-triplets/x64-windows-static.cmake
+@@ -5,4 +5,8 @@ set(VCPKG_LIBRARY_LINKAGE static)
+ 
+ # ...but with explicit platform toolset, so that future toolsets
+ # aren't automatically picked up (it defaults to the latest one).
+-set(VCPKG_PLATFORM_TOOLSET v145)
++if(DEFINED ENV{MADOTTY_OPENCONSOLE_TOOLSET})
++    set(VCPKG_PLATFORM_TOOLSET "$ENV{MADOTTY_OPENCONSOLE_TOOLSET}")
++else()
++    set(VCPKG_PLATFORM_TOOLSET v145)
++endif()
+diff --git a/src/host/exe/CConsoleHandoff.h b/src/host/exe/CConsoleHandoff.h
+index 69d4676..dea7502 100644
+--- a/src/host/exe/CConsoleHandoff.h
++++ b/src/host/exe/CConsoleHandoff.h
+@@ -19,7 +19,7 @@ Author(s):
+ #include "IConsoleHandoff.h"
+ 
+ #if defined(WT_BRANDING_RELEASE)
+-#define __CLSID_CConsoleHandoff "2EACA947-7F5F-4CFA-BA87-8F7FBEEFBE69"
++#define __CLSID_CConsoleHandoff "DA74EFEB-11F3-4B6A-8944-E5021D6E02FF"
+ #elif defined(WT_BRANDING_PREVIEW)
+ #define __CLSID_CConsoleHandoff "06EC847C-C0A5-46B8-92CB-7C92F6E35CD5"
+ #elif defined(WT_BRANDING_CANARY)

@@ -351,6 +351,7 @@ pub const Page = struct {
         InvalidSpacerTailLocation,
         InvalidSpacerHeadLocation,
         UnwrappedSpacerHead,
+        InvalidSizedSpan,
     };
 
     /// Temporarily pause integrity checks. This is useful when you are
@@ -515,6 +516,11 @@ pub const Page = struct {
                     }
                 }
 
+                if (cell.sized != 0) {
+                    if (!Cell.validSizedMarker(cells, x, row.wrap)) return IntegrityError.InvalidSizedSpan;
+                    continue;
+                }
+
                 switch (cell.wide) {
                     .narrow => {},
                     .wide => {},
@@ -532,7 +538,7 @@ pub const Page = struct {
 
                         // Spacer tails must follow a wide char
                         const prev = cells[x - 1];
-                        if (prev.wide != .wide) {
+                        if (prev.wide != .wide or prev.sized != 0) {
                             log.warn(
                                 "page integrity violation y={} x={} spacer tail not following wide",
                                 .{ y, x },
@@ -542,8 +548,7 @@ pub const Page = struct {
                     },
 
                     .spacer_head => {
-                        // Spacer heads must be at the end
-                        if (x != self.size.cols - 1) {
+                        if (x != cells.len - 1) {
                             log.warn(
                                 "page integrity violation y={} x={} spacer head not at end",
                                 .{ y, x },
@@ -924,8 +929,16 @@ pub const Page = struct {
         } else {
             // We have managed memory, so we have to do a slower copy to
             // get all of that right.
-            for (cells, other_cells) |*dst_cell, *src_cell| {
+            for (cells, other_cells, 0..) |*dst_cell, *src_cell, x| {
                 dst_cell.* = src_cell.*;
+
+                // Keep an OSC 66 span structurally complete if managed
+                // memory cloning runs out of capacity and must be retried.
+                if (src_cell.sizedWidth()) |width| {
+                    for (1..@min(width, cells.len - x)) |offset| {
+                        cells[x + offset] = .{ .wide = .spacer_tail, .sized = @intCast(offset) };
+                    }
+                }
 
                 // Reset any managed memory markers on the cell so that we don't
                 // hit an integrity check if we have to return an error because
@@ -1044,13 +1057,20 @@ pub const Page = struct {
             }
         }
 
-        // If we are growing columns, then we need to ensure spacer heads
-        // are cleared.
-        if (self.size.cols > other.size.cols) {
-            const last = &cells[other.size.cols - 1];
-            if (last.wide == .spacer_head) {
-                last.wide = .narrow;
+        // If we are growing columns, the old wrap padding is no longer at
+        // the end of the row. Clear the whole sized spacer suffix.
+        if (self.size.cols > other.size.cols and x_end == other.size.cols) {
+            var end = other.size.cols;
+            while (end > x_start) {
+                const cell = &dst_row.cells.ptr(self.memory)[end - 1];
+                if (cell.wide != .spacer_head) break;
+                if (cell.sized == 0) {
+                    cell.wide = .narrow;
+                    break;
+                }
+                end -= 1;
             }
+            if (end < other.size.cols) self.clearCells(dst_row, end, other.size.cols);
         }
     }
 
@@ -2199,10 +2219,8 @@ pub const Cell = packed struct(u64) {
     /// is always the default style so no lookup is required.
     style_id: StyleId = 0,
 
-    /// The wide property of this cell, for wide characters. Characters in
-    /// a terminal grid can only be 1 or 2 cells wide. A wide character
-    /// is always next to a spacer. This is used to determine both the width
-    /// and spacer properties of a cell.
+    /// Width and spacer role. Normal characters occupy one or two cells.
+    /// OSC 66 spans reuse these roles with their width or offset in `sized`.
     wide: Wide = .narrow,
 
     /// Whether this was written with the protection flag set.
@@ -2218,7 +2236,11 @@ pub const Cell = packed struct(u64) {
     /// boundary points for content.
     semantic_content: SemanticContent = .output,
 
-    _padding: u16 = 0,
+    /// OSC 66 head width or tail offset, with 0 reserved for normal cells.
+    /// On a spacer head, 1 marks padding before a wrapped OSC 66 span.
+    sized: u3 = 0,
+
+    _padding: u13 = 0,
 
     pub const ContentTag = enum(u2) {
         /// A single codepoint, could be zero to be empty cell.
@@ -2312,6 +2334,7 @@ pub const Cell = packed struct(u64) {
         .style_id = .{ .type_name = "GhosttyStyleId" },
         .wide = .{ .type_name = "GhosttyCellWide" },
         .semantic_content = .{ .type_name = "GhosttyCellSemanticContent" },
+        .sized = .{ .omit = true },
         ._padding = .{ .omit = true },
     } });
 
@@ -2373,8 +2396,61 @@ pub const Cell = packed struct(u64) {
         };
     }
 
+    /// The width of an explicit OSC 66 head, including a one-cell head.
+    pub inline fn sizedWidth(self: Cell) ?u3 {
+        if (self.sized == 0) return null;
+        return switch (self.wide) {
+            .narrow, .wide => self.sized,
+            .spacer_head, .spacer_tail => null,
+        };
+    }
+
+    /// Distance from an OSC 66 tail cell to its head.
+    pub inline fn sizedTailOffset(self: Cell) ?u3 {
+        if (self.sized == 0 or self.wide != .spacer_tail) return null;
+        return self.sized;
+    }
+
+    pub const SizedSpan = struct {
+        start: usize,
+        end: usize,
+    };
+
+    /// Return the half-open range of the OSC 66 span containing column x.
+    /// Check geometry so callers can use this while repairing edited rows.
+    pub fn sizedSpan(cells: []const Cell, x: usize) ?SizedSpan {
+        if (x >= cells.len) return null;
+        const offset = cells[x].sizedTailOffset() orelse 0;
+        if (offset > x) return null;
+        const start = x - offset;
+        const width = cells[start].sizedWidth() orelse return null;
+        if (offset >= width or width > cells.len - start) return null;
+        return .{ .start = start, .end = start + width };
+    }
+
+    /// Validate one nonstandard width marker as part of a complete row scan.
+    pub fn validSizedMarker(cells: []const Cell, x: usize, wrapped: bool) bool {
+        const cell = cells[x];
+        if (cell.sized == 0) return false;
+        return switch (cell.wide) {
+            .narrow, .wide => head: {
+                const width = cell.sized;
+                if ((width == 1) != (cell.wide == .narrow) or !cell.hasText() or width > cells.len - x) break :head false;
+                for (1..width) |offset| {
+                    if (cells[x + offset].sizedTailOffset() != @as(u3, @intCast(offset))) break :head false;
+                }
+                break :head true;
+            },
+            .spacer_tail => !cell.hasText() and sizedSpan(cells, x) != null,
+            // Multiple sized padding cells may form a suffix before a wrap.
+            .spacer_head => wrapped and cells.len - x < 7 and cell.sized == 1 and !cell.hasText() and
+                (x + 1 == cells.len or (cells[x + 1].wide == .spacer_head and cells[x + 1].sized == 1)),
+        };
+    }
+
     /// The width in grid cells that this cell takes up.
-    pub inline fn gridWidth(self: Cell) u2 {
+    pub inline fn gridWidth(self: Cell) u3 {
+        if (self.sizedWidth()) |width| return width;
         return switch (self.wide) {
             .narrow, .spacer_head, .spacer_tail => 1,
             .wide => 2,
@@ -2392,7 +2468,7 @@ pub const Cell = packed struct(u64) {
             // The "narrow" requirement is because wide spacers are meaningful.
             .codepoint,
             .codepoint_grapheme,
-            => !self.hasText() and self.wide == .narrow,
+            => !self.hasText() and self.wide == .narrow and self.sized == 0,
 
             .bg_color_palette,
             .bg_color_rgb,

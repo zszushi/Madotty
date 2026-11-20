@@ -313,6 +313,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
     // Setup our terminal size in pixels for certain requests.
     term.width_px = term.cols * opts.size.cell.width;
     term.height_px = term.rows * opts.size.cell.height;
+    term.pixels_per_point = opts.size.pixels_per_point;
 
     // Setup our backend.
     var backend = opts.backend;
@@ -336,10 +337,12 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .xt_checksum_report = opts.config.xt_checksum_report,
     };
 
-    const thread_enter_state = try ThreadEnterState.create(
-        alloc,
-        opts.full_config,
-    );
+    // Configured input belongs to commands launched here. An attached client
+    // already has its own input and environment from the original launcher.
+    const thread_enter_state = if (backend.exec.hasAttachment()) attached: {
+        try backend.exec.prepareAttachment();
+        break :attached null;
+    } else try ThreadEnterState.create(alloc, opts.full_config);
 
     self.* = .{
         .alloc = alloc,
@@ -535,7 +538,7 @@ pub fn resize(
     td: *ThreadData,
     size: renderer.Size,
 ) !void {
-    self.size = size;
+    const old_size = self.size;
     const grid_size = size.grid();
 
     // Enter the critical area that we want to keep small
@@ -543,6 +546,7 @@ pub fn resize(
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
 
+        self.size = size;
         // POSIX can immediately wake the shell with SIGWINCH. Serialize its
         // redraw against the new terminal dimensions. ConPTY is different:
         // ResizePseudoConsole synchronously produces output, and its pipe
@@ -565,9 +569,10 @@ pub fn resize(
                 },
             },
         );
+        self.terminal.pixels_per_point = size.pixels_per_point;
 
         // If we have size reporting enabled we need to send a report.
-        if (self.terminal.modes.get(.in_band_size_reports)) {
+        if (self.terminal.modes.get(.in_band_size_reports) and sizeReportChanged(old_size, size)) {
             try self.sizeReportLocked(td, .mode_2048);
         }
     }
@@ -587,10 +592,29 @@ pub fn resize(
     self.renderer_wakeup.notify() catch {};
 }
 
+fn sizeReportChanged(old: renderer.Size, new: renderer.Size) bool {
+    return !std.meta.eql(old.cell, new.cell) or !std.meta.eql(old.grid(), new.grid());
+}
+
+test "in-band resize ignores config refresh with unchanged reported geometry" {
+    const initial: renderer.Size = .{ .screen = .{ .width = 2548, .height = 1408 }, .cell = .{ .width = 14, .height = 32 }, .padding = .{} };
+    var size = initial;
+    try std.testing.expect(!sizeReportChanged(initial, size));
+    size.screen.width += 1;
+    try std.testing.expect(!sizeReportChanged(initial, size));
+    size.screen.width += 14;
+    try std.testing.expect(sizeReportChanged(initial, size));
+    size = initial;
+    size.cell.height -= 1;
+    try std.testing.expect(sizeReportChanged(initial, size));
+}
+
 /// Make a size report.
 pub fn sizeReport(self: *Termio, td: *ThreadData, style: termio.Message.SizeReport) !void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
+    // A queued enable notification may outlive the requesting program.
+    if (style == .mode_2048 and !self.terminal.modes.get(.in_band_size_reports)) return;
     try self.sizeReportLocked(td, style);
 }
 

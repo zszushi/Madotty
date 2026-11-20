@@ -22,6 +22,7 @@ const csi = @import("csi.zig");
 const hyperlink = @import("hyperlink.zig");
 const glyph = @import("apc/glyph.zig");
 const kitty = @import("kitty.zig");
+const iterm2_image = @import("iterm2_image.zig");
 const osc = @import("osc.zig");
 const point = @import("point.zig");
 const sgr = @import("sgr.zig");
@@ -63,6 +64,7 @@ cols: size.CellCountInt,
 /// The size of the screen in pixels. This is used for pty events and images
 width_px: u32 = 0,
 height_px: u32 = 0,
+pixels_per_point: f32 = 1,
 
 /// The current scrolling region.
 scrolling_region: ScrollingRegion,
@@ -92,6 +94,7 @@ default_xt_checksum: xt_checksum.Flags = .{},
 
 /// The most recently set mouse shape for the terminal.
 mouse_shape: mouse.Shape = .text,
+kitty_pointer: kitty.pointer.State = .{},
 
 /// Per-session Glyph Protocol registrations.
 glyph_glossary: glyph.Glossary = .empty,
@@ -101,6 +104,10 @@ glyph_glossary: glyph.Glossary = .empty,
 /// so a terminal that never runs a drag and drop aware program pays
 /// nothing for it. Non-null means a client currently accepts drops.
 kitty_dnd: ?*kitty.dnd.State = null,
+
+/// The in-flight iTerm2 multipart image, if any.
+iterm_image: if (build_options.kitty_graphics) iterm2_image.State else void =
+    if (build_options.kitty_graphics) .{} else {},
 
 /// These are just a packed set of flags we may set on the terminal.
 flags: packed struct {
@@ -393,6 +400,7 @@ pub fn init(
 }
 
 pub fn deinit(self: *Terminal, alloc: Allocator) void {
+    if (comptime build_options.kitty_graphics) self.iterm_image.deinit(alloc);
     self.tabstops.deinit(alloc);
     self.screens.deinit(alloc);
     self.colors.palette.deinit(alloc);
@@ -563,6 +571,80 @@ pub fn printString(self: *Terminal, str: []const u8) !void {
             else => try self.print(cp),
         }
     }
+}
+
+/// Print one OSC 66 span with an explicit horizontal cell width.
+pub fn printSized(self: *Terminal, text: []const u8, width: u3) !void {
+    if (self.status_display != .main or text.len == 0) return;
+    if (width == 0) return self.printString(text);
+    if (width > self.cols) return;
+
+    const view = try std.unicode.Utf8View.init(text);
+    var iter = view.iterator();
+    const first = iter.nextCodepoint().?;
+    var suffix: [pagepkg.grapheme_max_len]u21 = undefined;
+    var len: usize = 0;
+    while (len < suffix.len) : (len += 1) {
+        suffix[len] = iter.nextCodepoint() orelse break;
+    }
+
+    const screen = self.screens.active;
+    const cursor = &screen.cursor;
+    const wraparound = self.modes.get(.wraparound);
+    const margin_limit = self.scrolling_region.right + 1;
+    var limit = if (cursor.x < margin_limit) margin_limit else self.cols;
+    if ((wraparound and cursor.pending_wrap) or width > limit - cursor.x) {
+        if (wraparound) {
+            if (width > margin_limit - self.scrolling_region.left) return;
+            if (!cursor.pending_wrap and limit == self.cols) {
+                const padding = cursor.page_pin.cells(.all)[cursor.x..];
+                const blank = for (padding) |cell| {
+                    if (@as(u64, @bitCast(cell)) != 0) break false;
+                } else true;
+                if (blank) {
+                    cursor.page_row.wrap = true;
+                    for (padding) |*cell| cell.* = .{ .wide = .spacer_head, .sized = 1 };
+                    screen.cursorMarkDirty();
+                }
+            }
+            screen.cursorHorizontalAbsolute(limit - 1);
+            try self.printWrap();
+            limit = margin_limit;
+        } else {
+            if (cursor.x >= self.scrolling_region.left and cursor.x < margin_limit and
+                width > limit - self.scrolling_region.left) return;
+            screen.cursorHorizontalAbsolute(limit - width);
+        }
+    }
+    cursor.pending_wrap = false;
+
+    if (self.modes.get(.insert)) self.insertBlanks(width);
+    screen.cursorMarkDirty();
+    const start = cursor.x;
+
+    // Prepare the cells as independent narrow cells first. Updating a style,
+    // hyperlink or grapheme can grow the page and requires a consistent grid.
+    self.writeCell(first, .narrow);
+    if (len > 0) try screen.setGraphemes(cursor.page_cell, suffix[0..len]);
+    for (1..width) |_| {
+        screen.cursorRight(1);
+        self.writeCell(0, .narrow);
+    }
+
+    const cells = cursor.page_pin.cells(.all)[start..][0..width];
+    cells[0].sized = width;
+    if (width > 1) cells[0].wide = .wide;
+    for (cells[1..], 1..) |*cell, offset| {
+        cell.wide = .spacer_tail;
+        cell.sized = @intCast(offset);
+    }
+    self.previous_char = if (len == 0) first else suffix[len - 1];
+    if (cursor.x == limit - 1) {
+        cursor.pending_wrap = true;
+    } else {
+        screen.cursorRight(1);
+    }
+    screen.assertIntegrity();
 }
 
 /// Print the previous printed character a repeated amount of times.
@@ -743,7 +825,7 @@ fn printSliceFast(
         // previous row — so the second cursorCellLeft is in bounds.)
         const immediate = screen.cursorCellLeft(1);
         const prev: *Cell = switch (immediate.wide) {
-            .spacer_tail => screen.cursorCellLeft(2),
+            .spacer_tail => screen.cursorCellLeft(1 + @as(size.CellCountInt, immediate.sizedTailOffset() orelse 1)),
             else => immediate,
         };
 
@@ -923,6 +1005,7 @@ fn printSliceFill(
         "style_id",
         "wide",
         "hyperlink",
+        "sized",
     }, 4);
 
     // The bit offset of the codepoint content within a Cell, used to
@@ -1202,16 +1285,18 @@ fn printSliceFill(
                 continue :fill;
             }
 
-            // General path for cells that failed the masked check:
-            // style-only mismatches are handled inline; anything that
-            // needs cleanup (wide chars and their spacers, grapheme
-            // data, hyperlinks) falls back to print().
+            // An aligned wide glyph can replace another wide glyph without
+            // touching neighboring cells: both boundaries stay in place.
+            // Offset pairs and cells with side-table data need scalar cleanup.
             const general_count: usize = cells_per_cp;
             for (0..general_count) |offset| {
                 const cell = &cells[k + offset];
-                if (cell.wide != .narrow or
-                    cell.hasGrapheme() or
-                    cell.hyperlink) break :fill;
+                if (cell.sized != 0 or cell.hasGrapheme() or cell.hyperlink) break :fill;
+                if (cell.wide != .narrow) {
+                    if (comptime width == .narrow) break :fill;
+                    const expected: Cell.Wide = if (offset == 0) .wide else .spacer_tail;
+                    if (cell.wide != expected) break :fill;
+                }
             }
             for (0..general_count) |offset| {
                 const cell = &cells[k + offset];
@@ -1344,9 +1429,12 @@ pub fn print(self: *Terminal, c: u21) !void {
             const immediate = self.screens.active.cursorCellLeft(left);
             break :prev switch (immediate.wide) {
                 else => .{ .cell = immediate, .left = left },
-                .spacer_tail => .{
-                    .cell = self.screens.active.cursorCellLeft(left + 1),
-                    .left = left + 1,
+                .spacer_tail => tail: {
+                    const head = left + (immediate.sizedTailOffset() orelse 1);
+                    break :tail .{
+                        .cell = self.screens.active.cursorCellLeft(head),
+                        .left = head,
+                    };
                 },
             };
         };
@@ -1383,6 +1471,7 @@ pub fn print(self: *Terminal, c: u21) !void {
             switch (unicode.graphemeWidthEffect(previous_codepoint, c)) {
                 .ignore => return,
                 .wide => wide: {
+                    if (prev.cell.sizedWidth() != null) break :wide;
                     if (prev.cell.wide == .wide) break :wide;
 
                     // Move our cursor back to the previous. We'll move
@@ -1462,6 +1551,7 @@ pub fn print(self: *Terminal, c: u21) !void {
                 },
 
                 .narrow => narrow: {
+                    if (prev.cell.sizedWidth() != null) break :narrow;
                     // Prev cell is no longer wide
                     if (prev.cell.wide != .wide) break :narrow;
                     prev.cell.wide = .narrow;
@@ -1539,7 +1629,7 @@ pub fn print(self: *Terminal, c: u21) !void {
         const prev = prev: {
             const immediate = self.screens.active.cursorCellLeft(left);
             if (immediate.wide != .spacer_tail) break :prev immediate;
-            break :prev self.screens.active.cursorCellLeft(left + 1);
+            break :prev self.screens.active.cursorCellLeft(left + (immediate.sizedTailOffset() orelse 1));
         };
 
         // If our previous cell has no text, just ignore the zero-width character
@@ -1684,6 +1774,11 @@ fn writeCell(
     // TODO: spacers should use a bgcolor only cell
 
     const cell = self.screens.active.cursor.page_cell;
+    if (cell.sized != 0) {
+        @branchHint(.unlikely);
+        const cursor = &self.screens.active.cursor;
+        self.screens.active.clearCells(cursor.page_pin.node.page(), cursor.page_row, cell[0..1]);
+    }
 
     // If the wide property of this cell is the same, then we don't
     // need to do the special handling here because the structure will
@@ -1710,8 +1805,7 @@ fn writeCell(
                 // at the end of that row. Clear it so the previous row
                 // doesn't keep a stale spacer_head.
                 if (self.screens.active.cursor.y > 0 and self.screens.active.cursor.x <= 1) {
-                    const head_cell = self.screens.active.cursorCellEndOfPrev();
-                    if (head_cell.wide == .spacer_head) head_cell.wide = .narrow;
+                    self.clearPreviousWrapPadding();
                 }
             },
 
@@ -1735,8 +1829,7 @@ fn writeCell(
                 // at the end of that row. Clear it so the previous row
                 // doesn't keep a stale spacer_head.
                 if (self.screens.active.cursor.y > 0 and self.screens.active.cursor.x <= 1) {
-                    const head_cell = self.screens.active.cursorCellEndOfPrev();
-                    if (head_cell.wide == .spacer_head) head_cell.wide = .narrow;
+                    self.clearPreviousWrapPadding();
                 }
             },
 
@@ -1818,6 +1911,14 @@ fn writeCell(
         page.clearHyperlink(cell);
         page.updateRowHyperlinkFlag(self.screens.active.cursor.page_row);
     }
+}
+
+fn clearPreviousWrapPadding(self: *Terminal) void {
+    const prev = self.screens.active.cursor.page_pin.up(1) orelse return;
+    const cells = prev.cells(.all);
+    const last = &cells[cells.len - 1];
+    if (last.wide != .spacer_head) return;
+    if (last.sized != 0) Screen.clearSizedWrapPadding(cells) else last.wide = .narrow;
 }
 
 fn printWrap(self: *Terminal) !void {
@@ -2981,7 +3082,11 @@ fn rowWillBeShifted(
     page: *Page,
     row: *Row,
 ) void {
-    const cells = row.cells.ptr(page.memory.ptr);
+    const cells = page.getCells(row);
+    const screen = self.screens.active;
+    Screen.clearSizedWrapPadding(cells);
+    screen.splitSizedBoundary(page, row, cells, self.scrolling_region.left);
+    screen.splitSizedBoundary(page, row, cells, self.scrolling_region.right + 1);
 
     // If our scrolling region includes the rightmost column then we
     // need to turn any spacer heads in to normal empty cells, since
@@ -3018,7 +3123,7 @@ fn rowWillBeShifted(
         left_cell.wide = .narrow;
     }
 
-    if (right_cell.wide == .wide) {
+    if (right_cell.wide == .wide and right_cell.sized == 0) {
         const tail_cell: *Cell = &cells[self.scrolling_region.right + 1];
         if (right_cell.hasGrapheme()) {
             page.clearGrapheme(right_cell);
@@ -3430,6 +3535,12 @@ pub fn insertBlanks(self: *Terminal, count: usize) void {
     // left is just the cursor position but as a multi-pointer
     const left: [*]Cell = @ptrCast(self.screens.active.cursor.page_cell);
     var page = self.screens.active.cursor.page_pin.node.page();
+    const screen = self.screens.active;
+    const row = screen.cursor.page_row;
+    const cells = page.getCells(row);
+    Screen.clearSizedWrapPadding(cells);
+    screen.splitSizedBoundary(page, row, cells, screen.cursor.x);
+    screen.splitSizedBoundary(page, row, cells, self.scrolling_region.right + 1);
 
     // If our X is a wide spacer tail then we need to erase the
     // previous cell too so we don't split a multi-cell character.
@@ -3446,7 +3557,7 @@ pub fn insertBlanks(self: *Terminal, count: usize) void {
     // shift or the clear. Clean up both halves up front.
     {
         const right_cell: *Cell = @ptrCast(left + (rem - 1));
-        if (right_cell.wide == .wide) self.screens.active.clearCells(
+        if (right_cell.wide == .wide and right_cell.sized == 0) self.screens.active.clearCells(
             page,
             self.screens.active.cursor.page_row,
             @as([*]Cell, @ptrCast(right_cell))[0..2],
@@ -3461,6 +3572,7 @@ pub fn insertBlanks(self: *Terminal, count: usize) void {
     // "scroll_amount" is the number of such cols.
     const scroll_amount = rem - adjusted_count;
     if (scroll_amount > 0) {
+        screen.splitSizedBoundary(page, row, cells, screen.cursor.x + scroll_amount);
         page.pauseIntegrityChecks(true);
         defer page.pauseIntegrityChecks(false);
 
@@ -3469,7 +3581,7 @@ pub fn insertBlanks(self: *Terminal, count: usize) void {
         // If our last cell we're shifting is wide, then we need to clear
         // it to be empty so we don't split the multi-cell char.
         const end: *Cell = @ptrCast(x);
-        if (end.wide == .wide) {
+        if (end.wide == .wide and end.sized == 0) {
             const end_multi: [*]Cell = @ptrCast(end);
             assert(end_multi[1].wide == .spacer_tail);
             self.screens.active.clearCells(
@@ -3520,6 +3632,7 @@ pub fn deleteChars(self: *Terminal, count_req: usize) void {
     // We can only insert blanks up to our remaining cols
     const count = @min(count_req, rem);
 
+    Screen.clearSizedWrapPadding(page.getCells(self.screens.active.cursor.page_row));
     self.screens.active.splitCellBoundary(self.screens.active.cursor.x);
     self.screens.active.splitCellBoundary(self.screens.active.cursor.x + count);
     self.screens.active.splitCellBoundary(self.scrolling_region.right + 1);
@@ -3938,11 +4051,19 @@ pub fn setKittyGraphicsSizeLimit(
     limit: usize,
 ) void {
     if (comptime !build_options.kitty_graphics) return;
+    if (limit < self.screens.active.kitty_images.total_limit) {
+        self.iterm_image.deinit(alloc);
+    }
     var it = self.screens.all.iterator();
     while (it.next()) |entry| {
         const screen: *Screen = entry.value.*;
         screen.kitty_images.setLimit(self.io(), alloc, screen, limit);
     }
+}
+
+pub fn itermInlineImage(self: *Terminal, packet: osc.ITermInlineImage) !void {
+    if (comptime !build_options.kitty_graphics) return;
+    try self.iterm_image.handle(self, packet, self.width_px / self.cols, self.height_px / self.rows);
 }
 
 /// Set the allowed medium types for Kitty graphics image loading
@@ -4055,6 +4176,12 @@ pub fn printAttributes(self: *Terminal, buf: []u8) ![]const u8 {
         else
             try writer.print(";4{}", .{idx}),
         .rgb => |rgb| try writer.print(";48:2::{[r]}:{[g]}:{[b]}", rgb),
+    }
+
+    switch (pen.underline_color) {
+        .none => {},
+        .palette => |idx| try writer.print(";58:5:{}", .{idx}),
+        .rgb => |rgb| try writer.print(";58:2::{[r]}:{[g]}:{[b]}", rgb),
     }
 
     return writer.buffered();
@@ -4981,6 +5108,7 @@ pub fn switchScreen(self: *Terminal, key: ScreenSet.Key) !?*Screen {
 
     // Finalize the switch
     self.screens.switchTo(key);
+    self.mouse_shape = self.effectiveMouseShape();
 
     return old;
 }
@@ -5122,7 +5250,16 @@ pub fn resetMouseReporting(self: *Terminal) void {
     self.flags.mouse_event = .none;
     self.flags.mouse_format = .x10;
     self.flags.mouse_shift_capture = .null;
+    self.kitty_pointer = .{};
     self.mouse_shape = .text;
+}
+
+pub fn effectiveMouseShape(self: *const Terminal) mouse.Shape {
+    return self.kitty_pointer.effective(
+        self.screens.active_key == .alternate,
+        self.flags.mouse_event != .none,
+        .{},
+    );
 }
 
 /// Full reset.
@@ -5131,6 +5268,7 @@ pub fn resetMouseReporting(self: *Terminal) void {
 /// this will reuse the existing memory. In the latter case, memory may
 /// be wasted (since its unused) but it isn't leaked.
 pub fn fullReset(self: *Terminal) void {
+    if (comptime build_options.kitty_graphics) self.iterm_image.deinit(self.gpa());
     // Ensure we're back on primary screen
     self.screens.switchTo(.primary);
 
@@ -5139,6 +5277,8 @@ pub fn fullReset(self: *Terminal) void {
 
     // Reset primary screen
     self.screens.active.reset();
+    self.kitty_pointer = .{};
+    self.mouse_shape = .text;
 
     // Reset our basic state
     self.flags = .{
@@ -14967,6 +15107,28 @@ test "Terminal: printSlice charset batched fill" {
         }
         try t.screens.active.cursor.page_pin.node.page().verifyIntegrity(alloc);
     }
+}
+
+test "Terminal: printSlice batches aligned wide glyph repaints" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(alloc);
+    const original = [_]u32{ '日', '本', '語', '界' };
+    const replacement = [_]u32{ '界', '語', '本', '日' };
+    for (original) |cp| try t.print(@intCast(cp));
+    t.setCursorPos(1, 1);
+    try t.setAttribute(.{ .bold = {} });
+    try testing.expectEqual(replacement.len, try t.printSliceFast(&replacement, false, true));
+    try testing.expect(t.screens.active.cursor.pending_wrap);
+    const content = try t.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
+    defer alloc.free(content);
+    try testing.expectEqualStrings("界語本日", content);
+    try t.screens.active.cursor.page_pin.node.page().verifyIntegrity(alloc);
+
+    // A repaint starting on the previous glyph's tail must still let the
+    // scalar writer clear its head and any adjacent wrap padding.
+    t.setCursorPos(1, 2);
+    try testing.expectEqual(@as(usize, 0), try t.printSliceFast(&replacement, false, true));
 }
 
 test "Terminal: printSlice charset matches scalar printing" {

@@ -45,7 +45,7 @@ Common native app gaps also block parity:
 Keep platform-specific work distinct from common app behavior. Upstream
 undo/redo is macOS-only, while CLI window-control IPC and the on-screen
 keyboard action are GTK-specific. Windows session undo/redo, live tab
-thumbnails, and installer formats remain explicit roadmap work; their absence
+thumbnails, and MSIX distribution remain explicit roadmap work; their absence
 must not be presented as a regression introduced by the 1.4 merge.
 
 ## Phase 1 Tab overview
@@ -76,9 +76,10 @@ Status: planned.
 
 ## Phase 3 Installers
 
-Status: planned.
+The per-user x64 MSI is available as a [local preview](README.md#windows-installer-preview).
+MSIX distribution and production signing remain planned.
 
-- Add MSI and MSIX packaging alongside the portable ZIP.
+- Add MSIX packaging alongside the portable ZIP and MSI preview.
 - Keep the executable and resource tree together; verify configuration paths
   and launching PowerShell, cmd.exe, and WSL from an installed app.
 - Test clean installation, upgrade, repair where supported, and uninstall

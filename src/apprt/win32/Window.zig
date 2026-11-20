@@ -4,25 +4,48 @@
 const Window = @This();
 
 const std = @import("std");
+const lang = @import("UiLanguage.zig");
+const build_config = @import("../../build_config.zig");
 const Allocator = std.mem.Allocator;
 const apprt = @import("../../apprt.zig");
 const Config = @import("../../config.zig").Config;
+const Binding = @import("../../input.zig").Binding;
 
 const App = @import("App.zig");
 const Surface = @import("Surface.zig");
 const TabOverview = @import("TabOverview.zig");
+const Icons = @import("Icons.zig");
+const UiFont = @import("UiFont.zig");
+const Profiles = @import("Profiles.zig");
+const Progress = @import("Progress.zig");
+const Settings = @import("Settings.zig");
+const global = @import("../../global.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const w32 = @import("win32.zig");
 
 const log = std.log.scoped(.win32);
 
+test {
+    _ = Progress;
+    _ = UiFont;
+}
+
 /// Maximum number of tabs per window.
 const MAX_TABS: usize = 64;
 const WM_TOGGLE_TAB_OVERVIEW = w32.WM_APP + 5;
 const WM_REFRESH_TAB_OVERVIEW = w32.WM_APP + 6;
+const WM_REFRESH_PROGRESS = w32.WM_APP + 8;
+const WM_CAPTURECHANGED = 0x0215;
+const WM_CANCELMODE = 0x001F;
+const SC_SETTINGS = 0x1FD0;
+const TabButton = enum { new_tab, environment };
+extern "user32" fn GetCapture() callconv(.winapi) ?w32.HWND;
+extern "user32" fn GetSysColorBrush(i32) callconv(.winapi) ?w32.HBRUSH;
+const TAB_HOVER_TIMER: usize = 0x5448;
 
 /// The parent App.
 app: *App,
+process_elevated: bool = false,
 
 /// The top-level window handle.
 hwnd: ?w32.HWND = null,
@@ -39,8 +62,14 @@ tab_active_surface: [64]*Surface = undefined,
 /// Index of the currently active (visible) tab.
 active_tab: usize = 0,
 
-/// Whether the tab bar is visible (shown when >1 tab).
+/// Whether this window is configured to show the tab bar.
 tab_bar_visible: bool = false,
+
+/// Combine progress across live panes without tying it to the active tab.
+progress: Progress = .{},
+taskbar_progress: ?Progress = Progress{},
+taskbar_ready: bool = false,
+progress_refresh_pending: bool = false,
 
 /// DPI scale factor (DPI / 96.0).
 scale: f32 = 1.0,
@@ -51,8 +80,7 @@ scale: f32 = 1.0,
 /// stack garbage.
 tab_rects: [64]w32.RECT = std.mem.zeroes([64]w32.RECT),
 
-/// Hit-test rectangle for the "+" (new tab) button.
-new_tab_rect: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+tab_buttons: [2]w32.RECT = std.mem.zeroes([2]w32.RECT),
 
 /// Index of the tab currently being hovered (-1 = none).
 hover_tab: isize = -1,
@@ -60,15 +88,24 @@ hover_tab: isize = -1,
 /// Whether the close button on the hovered tab is being hovered.
 hover_close: bool = false,
 
-/// Whether the "+" (new tab) button is being hovered.
-hover_new_tab: bool = false,
+hover_button: ?TabButton = null,
 
 /// Tab drag state: which tab is being dragged (-1 = none).
 drag_tab: isize = -1,
-/// Starting X position of the drag.
-drag_start_x: i16 = 0,
+drag_previous_tab: usize = 0,
+/// Client coordinates of the original press.
+drag_start: w32.POINT = .{ .x = 0, .y = 0 },
 /// Whether the drag has exceeded the threshold and is active.
 drag_active: bool = false,
+drag_on_strip: bool = false,
+drag_x: i32 = 0,
+drag_anchor: i32 = 0,
+drop_slot: ?usize = null,
+drag_label: ?w32.HWND = null,
+drag_hover_tab: ?usize = null,
+split_preview: ?w32.HWND = null,
+preview_owner: ?w32.HWND = null,
+preview_rect: ?w32.RECT = null,
 
 /// Inline tab rename: Edit control HWND, font, and target tab index.
 rename_edit: ?w32.HWND = null,
@@ -76,11 +113,7 @@ rename_font: ?*anyopaque = null,
 rename_tab: usize = 0,
 rename_window: bool = false,
 
-/// UTF-16 title buffers for each tab (for painting the tab bar).
-tab_titles: [64][256]u16 = undefined,
-
-/// Length of each tab title in UTF-16 code units.
-tab_title_lens: [64]u16 = undefined,
+tab_titles: [64]TabTitle = @splat(.{}),
 
 /// Explicit top-level window title override. Null follows the active tab.
 window_title_override_len: ?u16 = null,
@@ -95,7 +128,8 @@ saved_style: u32 = 0,
 /// Saved window rect for restoring from fullscreen.
 saved_rect: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
 
-/// Font used for painting the tab bar (Segoe UI).
+ui_font: UiFont = .{},
+/// Font shared by the tab bar and the resize overlay.
 tab_font: ?*anyopaque = null,
 
 /// Whether WM_MOUSELEAVE tracking is active for the tab bar.
@@ -103,6 +137,10 @@ tracking_mouse: bool = false,
 
 /// Whether this window is a quick terminal (borderless popup, no tabs).
 is_quick_terminal: bool = false,
+
+/// Temporary override from toggle_background_opacity, shared by every pane.
+force_opaque: bool = false,
+system_backdrop_active: bool = false,
 
 /// Split divider drag state.
 dragging_split: bool = false,
@@ -135,6 +173,7 @@ resize_seen_first: bool = false,
 
 pub const InitOptions = struct {
     is_quick_terminal: bool = false,
+    position: ?w32.POINT = null,
     /// If true, start fully opaque regardless of `background-opacity`. Set
     /// when `new_window` inherits from a parent window the user had
     /// toggled to opaque via `toggle_background_opacity`.
@@ -158,7 +197,7 @@ pub fn systemUsesLightTheme() bool {
     var cb: u32 = @sizeOf(u32);
     if (w32.RegQueryValueExW(hkey, valname, null, &kind, @ptrCast(&val), &cb) !=
         w32.ERROR_SUCCESS) return true;
-    if (kind != w32.REG_DWORD) return true;
+    if (kind != w32.REG_DWORD or cb != @sizeOf(u32)) return true;
     return val != 0; // 0 = dark, nonzero = light
 }
 
@@ -168,7 +207,7 @@ pub fn systemUsesLightTheme() bool {
 /// the terminal background only for the luminance-derived themes; for the
 /// explicit dark/light/system themes the caption is reset to the system
 /// default so the standard themed title bar (and legible glyphs) is drawn.
-fn applyChromeTheme(hwnd: w32.HWND, theme: anytype, bg: anytype) void {
+fn applyChromeTheme(hwnd: w32.HWND, theme: Config.WindowTheme, bg: Config.Color, system_backdrop: bool) void {
     const luminance: f32 = (0.2126 * @as(f32, @floatFromInt(bg.r)) +
         0.7152 * @as(f32, @floatFromInt(bg.g)) +
         0.0722 * @as(f32, @floatFromInt(bg.b))) / 255.0;
@@ -189,12 +228,12 @@ fn applyChromeTheme(hwnd: w32.HWND, theme: anytype, bg: anytype) void {
         @sizeOf(u32),
     );
 
-    const tint_caption = switch (theme) {
+    const tint_caption = !system_backdrop and switch (theme) {
         .auto, .ghostty => true,
         else => false,
     };
     const caption_color: u32 = if (tint_caption)
-        (@as(u32, bg.r)) | (@as(u32, bg.g) << 8) | (@as(u32, bg.b) << 16)
+        w32.RGB(bg.r, bg.g, bg.b)
     else
         w32.DWMWA_COLOR_DEFAULT;
     _ = w32.DwmSetWindowAttribute(
@@ -205,8 +244,6 @@ fn applyChromeTheme(hwnd: w32.HWND, theme: anytype, bg: anytype) void {
     );
 }
 
-/// Called from App.config_change so the title bar tracks live config
-/// reloads (background color in particular).
 /// Enable/disable the DWM accent blur behind the window (background-blur).
 /// Visible where the window is translucent (background-opacity < 1): the
 /// desktop behind shows blurred instead of sharp, the acrylic-ish look.
@@ -225,19 +262,162 @@ fn applyBackgroundBlur(hwnd: w32.HWND, enabled: bool) void {
     _ = w32.SetWindowCompositionAttribute(hwnd, &data);
 }
 
-pub fn onConfigChange(self: *Window) void {
-    if (self.hwnd) |hwnd| {
-        applyChromeTheme(hwnd, self.app.config.@"window-theme", self.app.config.background);
-        applyBackgroundBlur(hwnd, self.app.config.@"background-blur".enabled());
+fn setWindowOpacity(hwnd: w32.HWND, opacity: f64) void {
+    const style = w32.GetWindowLongW(hwnd, w32.GWL_EXSTYLE);
+    const layered = style & w32.WS_EX_LAYERED != 0;
+    if (opacity < 1) {
+        if (!layered) _ = w32.SetWindowLongW(hwnd, w32.GWL_EXSTYLE, style | w32.WS_EX_LAYERED);
+        const alpha: u8 = @intFromFloat(@round(@max(opacity, 0) * 255));
+        _ = w32.SetLayeredWindowAttributes(hwnd, 0, alpha, w32.LWA_ALPHA);
+    } else if (layered) {
+        _ = w32.SetWindowLongW(hwnd, w32.GWL_EXSTYLE, style & ~w32.WS_EX_LAYERED);
+        _ = w32.RedrawWindow(hwnd, null, null, w32.RDW_ERASE | w32.RDW_INVALIDATE | w32.RDW_FRAME | w32.RDW_ALLCHILDREN);
     }
+}
+
+fn setSystemBackdrop(hwnd: w32.HWND, material: w32.DWM_SYSTEMBACKDROP_TYPE) bool {
+    const result = w32.DwmSetWindowAttribute(hwnd, w32.DWMWA_SYSTEMBACKDROP_TYPE, &material, @sizeOf(w32.DWM_SYSTEMBACKDROP_TYPE));
+    if (result < 0) return false;
+    const inset: i32 = if (material == .none) 0 else -1;
+    if (w32.DwmExtendFrameIntoClientArea(hwnd, &.{ .left = inset, .right = inset, .top = inset, .bottom = inset }) >= 0) return true;
+    if (material != .none) {
+        const none: w32.DWM_SYSTEMBACKDROP_TYPE = .none;
+        _ = w32.DwmSetWindowAttribute(hwnd, w32.DWMWA_SYSTEMBACKDROP_TYPE, &none, @sizeOf(w32.DWM_SYSTEMBACKDROP_TYPE));
+    }
+    return false;
+}
+
+pub fn opaqueSurfaceBackground(self: *const Window) bool {
+    // A layered window already applies its opacity to the complete frame.
+    // Only a system backdrop needs the renderer to emit translucent pixels.
+    return !self.system_backdrop_active;
+}
+
+const BackgroundPresentation = struct {
+    backdrop: w32.DWM_SYSTEMBACKDROP_TYPE = .none,
+    window_opacity: f64 = 1,
+    blur: bool = false,
+
+    fn forRenderer(backend: @import("RendererStartup.zig").Backend, material: Config.WindowsBackgroundMaterial, opacity: f64, blur: bool, force_opaque: bool) BackgroundPresentation {
+        // Win32 Vulkan presentation covers the system material with an opaque
+        // client area. Layer the composed window to apply the configured opacity.
+        if (backend == .vulkan and !force_opaque and material != .solid)
+            return .{ .window_opacity = opacity };
+        return BackgroundPresentation.init(material, opacity, blur, force_opaque);
+    }
+
+    fn init(material: Config.WindowsBackgroundMaterial, opacity: f64, blur: bool, force_opaque: bool) BackgroundPresentation {
+        if (force_opaque) return .{};
+        return switch (material) {
+            .auto => .{
+                .backdrop = if (blur and opacity < 1) .transient_window else .none,
+                // These are the fallback values when DWM rejects the backdrop.
+                .window_opacity = opacity,
+                .blur = blur and opacity < 1,
+            },
+            .solid => .{},
+            .mica => .{ .backdrop = .main_window },
+            .acrylic => .{ .backdrop = .transient_window },
+        };
+    }
+};
+
+fn applyBackground(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    const config = &self.app.config;
+    const presentation = BackgroundPresentation.forRenderer(@import("RendererStartup.zig").active, config.@"windows-background-material", config.@"background-opacity", config.@"background-blur".enabled(), self.force_opaque);
+
+    // Layered-window alpha and legacy accent blur can prevent DWM from
+    // installing a system material. Remove them before enabling that material.
+    if (presentation.backdrop != .none) {
+        setWindowOpacity(hwnd, 1);
+        applyBackgroundBlur(hwnd, false);
+    }
+    const system_supported = setSystemBackdrop(hwnd, presentation.backdrop);
+    self.system_backdrop_active = system_supported and presentation.backdrop != .none;
+    if (!self.system_backdrop_active) {
+        setWindowOpacity(hwnd, presentation.window_opacity);
+        applyBackgroundBlur(hwnd, presentation.blur);
+    }
+    applyChromeTheme(hwnd, config.@"window-theme", config.background, self.system_backdrop_active);
+
+    const force_opaque = self.opaqueSurfaceBackground();
+    for (self.tab_trees[0..self.tab_count]) |*tree| {
+        var it = tree.iterator();
+        while (it.next()) |entry| entry.view.setOpaqueBackground(force_opaque);
+    }
+}
+
+pub fn toggleBackgroundOpacity(self: *Window) void {
+    if (self.app.config.@"background-opacity" >= 1 or self.app.config.@"windows-background-material" == .solid) return;
+    self.force_opaque = !self.force_opaque;
+    self.applyBackground();
+    self.invalidateTabBar();
+}
+
+test "win32 window opacity and system backdrop have distinct composition paths" {
+    for (std.enums.values(Config.WindowsBackgroundMaterial)) |material| {
+        const expected = BackgroundPresentation{ .window_opacity = if (material == .solid) 1 else 0.4 };
+        try std.testing.expectEqual(expected, BackgroundPresentation.forRenderer(.vulkan, material, 0.4, true, false));
+        try std.testing.expectEqual(BackgroundPresentation{}, BackgroundPresentation.forRenderer(.vulkan, material, 0.4, true, true));
+    }
+    const automatic = BackgroundPresentation.init(.auto, 0.4, true, false);
+    try std.testing.expectEqual(@as(f64, 0.4), automatic.window_opacity);
+    try std.testing.expectEqual(w32.DWM_SYSTEMBACKDROP_TYPE.transient_window, automatic.backdrop);
+    try std.testing.expect(automatic.blur);
+    const clear = BackgroundPresentation.init(.auto, 0.4, false, false);
+    try std.testing.expectEqual(w32.DWM_SYSTEMBACKDROP_TYPE.none, clear.backdrop);
+    try std.testing.expectEqual(@as(f64, 0.4), clear.window_opacity);
+    try std.testing.expect(!clear.blur);
+    try std.testing.expectEqual(BackgroundPresentation{}, BackgroundPresentation.init(.auto, 1, true, false));
+    for ([_]Config.WindowsBackgroundMaterial{ .mica, .acrylic }, [_]w32.DWM_SYSTEMBACKDROP_TYPE{ .main_window, .transient_window }) |material, expected| {
+        const plan = BackgroundPresentation.init(material, 0.4, true, false);
+        try std.testing.expectEqual(expected, plan.backdrop);
+        try std.testing.expectEqual(@as(f64, 1), plan.window_opacity);
+        try std.testing.expect(!plan.blur);
+    }
+    for (std.enums.values(Config.WindowsBackgroundMaterial)) |material|
+        try std.testing.expectEqual(BackgroundPresentation{}, BackgroundPresentation.init(material, 0.4, true, true));
+    try std.testing.expectEqual(BackgroundPresentation{}, BackgroundPresentation.init(.solid, 0.4, true, false));
+}
+
+fn refreshWindowFonts(self: *Window) void {
+    self.ui_font.replace(&self.tab_font, 14, self.scale, &.{ self.resize_overlay_hwnd, self.drag_label });
+    if (self.rename_edit != null) self.ui_font.replace(&self.rename_font, 12, self.scale, &.{self.rename_edit});
+}
+
+pub fn onConfigChange(self: *Window, background_changed: bool, ui_font_changed: bool) void {
+    if (ui_font_changed) {
+        self.ui_font = UiFont.resolve(self.app.config.@"windows-ui-font-family");
+        self.refreshWindowFonts();
+        for (self.tab_trees[0..self.tab_count]) |*tree| {
+            var it = tree.iterator();
+            while (it.next()) |entry| entry.view.refreshUiFonts();
+        }
+    }
+    if (background_changed) self.force_opaque = false;
+    self.applyBackground();
     self.tab_overview.updateAppearance();
+    self.updateTabBarVisibility();
+    self.invalidateTabBar();
+    if (!self.app.config.@"progress-style") {
+        for (self.tab_trees[0..self.tab_count]) |*tree| {
+            var it = tree.iterator();
+            while (it.next()) |entry| entry.view.progress = .{};
+        }
+        if (self.progress.state != .remove or self.taskbar_progress == null) self.queueProgressRefresh();
+    }
 }
 
 /// Initialize the Window by creating the top-level HWND and tab bar font.
 pub fn init(self: *Window, app: *App, options: InitOptions) !void {
     self.* = .{
         .app = app,
+        .process_elevated = processElevated(),
         .is_quick_terminal = options.is_quick_terminal,
+        .force_opaque = options.force_opaque,
+        .ui_font = UiFont.resolve(app.config.@"windows-ui-font-family"),
+        .tab_bar_visible = !options.is_quick_terminal and app.config.@"window-show-tab-bar" == .always,
     };
 
     const style: u32 = if (options.is_quick_terminal)
@@ -261,7 +441,10 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
     // CW_USEDEFAULT for one axis is not a valid literal coordinate (Win32
     // only special-cases it on x, and would use a huge negative y or treat
     // y as nCmdShow), so a partial config falls back to full default.
-    if (!options.is_quick_terminal) {
+    if (options.position) |position| {
+        cx = position.x;
+        cy = position.y;
+    } else if (!options.is_quick_terminal) {
         if (app.config.@"window-position-x") |px| {
             if (app.config.@"window-position-y") |py| {
                 cx = px;
@@ -269,7 +452,7 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
             }
         }
     }
-    if (!options.is_quick_terminal and
+    if (options.position == null and !options.is_quick_terminal and
         cx == w32.CW_USEDEFAULT and cy == w32.CW_USEDEFAULT and
         app.windows.items.len > 0)
     {
@@ -295,7 +478,7 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
     const hwnd = w32.CreateWindowExW(
         ex_style,
         App.WINDOW_CLASS_NAME,
-        std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
+        if (self.process_elevated) std.unicode.utf8ToUtf16LeStringLiteral("Admin: Madotty") else std.unicode.utf8ToUtf16LeStringLiteral("Madotty"),
         style,
         cx,
         cy,
@@ -316,7 +499,12 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
     // Store the Window pointer in GWLP_USERDATA for the WndProc.
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
-    applyChromeTheme(hwnd, app.config.@"window-theme", app.config.background);
+    if (!self.is_quick_terminal) {
+        if (w32.GetSystemMenu(hwnd, 0)) |menu| {
+            _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
+            _ = w32.AppendMenuW(menu, w32.MF_STRING, SC_SETTINGS, lang.wide("Settings"));
+        }
+    }
 
     // Apply dark theme to common controls (scrollbar, etc.).
     _ = w32.SetWindowTheme(
@@ -325,18 +513,7 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
         null,
     );
 
-    // If background opacity is less than 1.0, make the window transparent.
-    // Skip when force_opaque (parent window was toggled to opaque via
-    // toggle_background_opacity — inherit that state for the new window).
-    if (app.config.@"background-opacity" < 1.0 and !options.force_opaque) {
-        const current_ex = w32.GetWindowLongW(hwnd, w32.GWL_EXSTYLE);
-        _ = w32.SetWindowLongW(hwnd, w32.GWL_EXSTYLE, current_ex | w32.WS_EX_LAYERED);
-        const alpha: u8 = @intFromFloat(@round(app.config.@"background-opacity" * 255.0));
-        _ = w32.SetLayeredWindowAttributes(hwnd, 0, alpha, w32.LWA_ALPHA);
-    }
-    if (app.config.@"background-blur".enabled()) {
-        applyBackgroundBlur(hwnd, true);
-    }
+    self.applyBackground();
 
     // Query DPI scale.
     const dpi = w32.GetDpiForWindow(hwnd);
@@ -344,24 +521,7 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
         self.scale = @as(f32, @floatFromInt(dpi)) / 96.0;
     }
 
-    // Use the Windows UI font while keeping the compact macOS-like tab density.
-    const font_height: i32 = -@as(i32, @intFromFloat(14.0 * self.scale));
-    self.tab_font = w32.CreateFontW(
-        font_height, // cHeight (negative = character height)
-        0, // cWidth
-        0, // cEscapement
-        0, // cOrientation
-        w32.FW_NORMAL, // cWeight
-        0, // bItalic
-        0, // bUnderline
-        0, // bStrikeOut
-        w32.DEFAULT_CHARSET, // iCharSet
-        0, // iOutPrecision
-        0, // iClipPrecision
-        0, // iQuality
-        0, // iPitchAndFamily
-        std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
-    );
+    self.refreshWindowFonts();
 
     // Don't show the window yet — addTab() will show the child
     // surface which triggers ShowWindow on the parent as needed.
@@ -408,10 +568,46 @@ pub fn surfaceRect(self: *const Window) w32.RECT {
     return rect;
 }
 
+/// Size a hidden handoff window in physical pixels before installing its tab.
+pub fn resizeBeforeFirstTab(self: *Window, size: apprt.SurfaceSize) !void {
+    std.debug.assert(self.tab_count == 0);
+    const hwnd = self.hwnd orelse return error.Win32Error;
+    var outer: w32.RECT = undefined;
+    if (w32.GetWindowRect(hwnd, &outer) == 0) return error.Win32Error;
+    const surface = self.surfaceRect();
+
+    // Keep the existing frame and tab strip. Cap enormous grid requests to
+    // the monitor work area before allocating a terminal or renderer.
+    var limits: w32.RECT = .{ .left = 0, .top = 0, .right = std.math.maxInt(i32), .bottom = std.math.maxInt(i32) };
+    var monitor: w32.MONITORINFO = undefined;
+    monitor.cbSize = @sizeOf(w32.MONITORINFO);
+    if (w32.GetMonitorInfoW(w32.MonitorFromWindow(hwnd, w32.MONITOR_DEFAULTTONEAREST), &monitor) != 0)
+        limits = monitor.rcWork;
+
+    const width = @as(i64, size.width) + (outer.right - outer.left) - (surface.right - surface.left);
+    const height = @as(i64, size.height) + (outer.bottom - outer.top) - (surface.bottom - surface.top);
+    if (w32.SetWindowPos(
+        hwnd,
+        null,
+        0,
+        0,
+        @intCast(std.math.clamp(width, 1, limits.right - limits.left)),
+        @intCast(std.math.clamp(height, 1, limits.bottom - limits.top)),
+        w32.SWP_NOZORDER | w32.SWP_NOMOVE | w32.SWP_NOACTIVATE,
+    ) == 0) return error.Win32Error;
+}
+
 /// Returns the currently active Surface, or null if there are no tabs.
 pub fn getActiveSurface(self: *Window) ?*Surface {
     if (self.tab_count == 0) return null;
     return self.tab_active_surface[self.active_tab];
+}
+
+pub fn focusPane(self: *Window, surface: *Surface) void {
+    const previous = self.getActiveSurface() orelse return;
+    if (previous == surface) return;
+    self.tab_active_surface[self.active_tab] = surface;
+    self.invalidateTabBar();
 }
 
 /// Find the tab index containing a given surface.
@@ -441,7 +637,7 @@ fn findHandle(self: *Window, tab_idx: usize, surface: *Surface) ?SplitTree(Surfa
 /// Add a new tab surface to this window. The surface is created,
 /// initialized, and inserted at the position dictated by config.
 pub fn addTab(self: *Window) !*Surface {
-    return self.addTabWithOptions(.{ .context = .tab });
+    return self.app.addDefaultTab(self, .{ .context = .tab });
 }
 
 pub const AddTabOptions = Surface.InitOptions;
@@ -450,11 +646,15 @@ pub const AddTabOptions = Surface.InitOptions;
 pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
     if (self.closing) return error.WindowClosing;
     if (self.tab_count >= MAX_TABS) return error.TooManyTabs;
+    self.cancelTabDrag();
     self.cancelTabRename();
 
     const alloc = self.app.core_app.alloc;
     const surface = try alloc.create(Surface);
-    try surface.initWithOptions(self.app, self, options);
+    surface.initWithOptions(self.app, self, options) catch |err| {
+        if (!surface.leaked) alloc.destroy(surface);
+        return err;
+    };
     // After surface.init succeeds, create the SplitTree which takes ownership
     // via ref(). If this fails, we manually clean up.
     var tree = SplitTree(Surface).init(alloc, surface) catch |err| {
@@ -476,30 +676,39 @@ pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
         self.tab_trees[i] = self.tab_trees[i - 1];
         self.tab_active_surface[i] = self.tab_active_surface[i - 1];
         self.tab_titles[i] = self.tab_titles[i - 1];
-        self.tab_title_lens[i] = self.tab_title_lens[i - 1];
     }
     self.tab_trees[pos] = tree;
     self.tab_active_surface[pos] = surface;
     self.tab_count += 1;
 
-    // Set default title.
-    const default_title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
-    @memcpy(self.tab_titles[pos][0..default_title.len], default_title);
-    self.tab_title_lens[pos] = @intCast(default_title.len);
+    // The core can report a configured title before this tab enters the tree.
+    self.tab_titles[pos] = .{};
+    self.tab_titles[pos].len = @intCast(encodeTabTitle(self.tab_titles[pos].text[0..255], surface, surface.getTitle() orelse ""));
 
     if (self.tab_count == 1) {
         // First tab — show the parent window now that the terminal is ready.
         // Quick terminal windows are shown by QuickTerminal.animateIn() instead.
         if (!self.is_quick_terminal) {
             if (self.hwnd) |h| {
-                _ = w32.ShowWindow(h, w32.SW_SHOW);
+                _ = w32.ShowWindow(h, options.initial_show);
                 _ = w32.UpdateWindow(h);
             }
         }
         self.active_tab = pos;
         self.updateWindowTitle();
         // Set keyboard focus to the child surface so it receives input.
-        if (!self.is_quick_terminal) {
+        const focus = switch (options.initial_show) {
+            w32.SW_HIDE,
+            w32.SW_SHOWMINIMIZED,
+            w32.SW_SHOWNOACTIVATE,
+            w32.SW_MINIMIZE,
+            w32.SW_SHOWMINNOACTIVE,
+            w32.SW_SHOWNA,
+            w32.SW_FORCEMINIMIZE,
+            => false,
+            else => true,
+        };
+        if (!self.is_quick_terminal and focus) {
             if (surface.hwnd) |h| _ = w32.SetFocus(h);
         }
     } else {
@@ -537,8 +746,8 @@ pub fn requestCloseOverviewTab(self: *Window, id: u64) void {
     const owner_hwnd = self.hwnd;
     const result = w32.MessageBoxW(
         owner_hwnd,
-        std.unicode.utf8ToUtf16LeStringLiteral("Processes are still running in this tab.\nClose the tab and all its splits?"),
-        std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
+        lang.wide("Processes are still running in this tab.\nClose the tab and all its splits?"),
+        std.unicode.utf8ToUtf16LeStringLiteral("Madotty"),
         w32.MB_OKCANCEL | w32.MB_ICONWARNING | w32.MB_DEFBUTTON2,
     );
     if (result != w32.IDOK) return;
@@ -560,6 +769,7 @@ pub fn closeTab(self: *Window, surface: *Surface) void {
 
 fn closeTabByIndex(self: *Window, idx: usize) void {
     if (idx >= self.tab_count) return;
+    self.cancelTabDrag();
     // Cancel any in-progress rename (the edit control may belong to this tab).
     self.cancelTabRename();
     var tree = self.tab_trees[idx];
@@ -569,9 +779,9 @@ fn closeTabByIndex(self: *Window, idx: usize) void {
         self.tab_trees[i] = self.tab_trees[i + 1];
         self.tab_active_surface[i] = self.tab_active_surface[i + 1];
         self.tab_titles[i] = self.tab_titles[i + 1];
-        self.tab_title_lens[i] = self.tab_title_lens[i + 1];
     }
     self.tab_count -= 1;
+    if (self.progress.state != .remove) self.queueProgressRefresh();
     if (self.tab_count == 0) {
         self.closing = true;
         self.tab_overview.hide(false);
@@ -657,10 +867,13 @@ pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
     var old_tree = self.tab_trees[tab];
     old_tree.deinit();
     self.tab_trees[tab] = new_tree;
+    if (self.progress.state != .remove) self.queueProgressRefresh();
 
     if (next_surface) |ns| {
         log.debug("closeSplitSurface: focusing next surface", .{});
         self.tab_active_surface[tab] = ns;
+        self.refreshPaneTitle(tab);
+        self.onTabTitleChanged(ns, ns.getTitle() orelse "");
         self.layoutSplits();
         if (!self.tab_overview.active) {
             if (ns.hwnd) |h| _ = w32.SetFocus(h);
@@ -693,12 +906,11 @@ fn setActiveTabVisible(self: *Window, visible: bool) void {
 pub fn selectTabIndex(self: *Window, idx: usize) void {
     if (idx >= self.tab_count) return;
     self.cancelTabRename();
-    // Clear any in-progress tab drag
-    if (self.drag_tab >= 0) {
-        self.drag_tab = -1;
-        self.drag_active = false;
-        _ = w32.ReleaseCapture();
-    }
+    self.cancelTabDrag();
+    self.showTab(idx, true);
+}
+
+fn showTab(self: *Window, idx: usize, focus: bool) void {
     if (self.active_tab < self.tab_count) {
         var it = self.tab_trees[self.active_tab].iterator();
         while (it.next()) |entry| {
@@ -711,7 +923,7 @@ pub fn selectTabIndex(self: *Window, idx: usize) void {
     self.layoutSplits();
     // An inactive child can exit while the user is searching. Keep focus
     // in the overview; explicit activation hides it before selecting.
-    if (!self.tab_overview.active) {
+    if (focus and !self.tab_overview.active) {
         if (surface.hwnd) |h| _ = w32.SetFocus(h);
     }
     self.updateWindowTitle();
@@ -939,6 +1151,15 @@ pub fn newSplit(self: *Window, direction: SplitTree(Surface).Split.Direction) !v
         if (!new_surface.leaked) alloc.destroy(new_surface);
     }
     try new_surface.init(self.app, self, .split);
+    // A plain named shell profile can also be launched by the split command.
+    if (active_surface.plain_profile and active_surface.launch_exe != null and
+        active_surface.launch_exe == new_surface.launch_exe)
+    {
+        new_surface.profile_id = active_surface.profile_id;
+        new_surface.plain_profile = true;
+        new_surface.launch_title_len = active_surface.launch_title_len;
+        @memcpy(new_surface.launch_title[0..new_surface.launch_title_len], active_surface.launch_title[0..active_surface.launch_title_len]);
+    }
 
     // Create a single-node tree for the new surface.
     var insert_tree = try SplitTree(Surface).init(alloc, new_surface);
@@ -958,8 +1179,10 @@ pub fn newSplit(self: *Window, direction: SplitTree(Surface).Split.Direction) !v
     old_tree.deinit();
     self.tab_trees[tab] = new_tree;
 
+    self.refreshPaneTitle(tab);
+
     // Focus the new surface.
-    self.tab_active_surface[tab] = new_surface;
+    self.focusPane(new_surface);
 
     self.layoutSplits();
     if (new_surface.hwnd) |h| _ = w32.SetFocus(h);
@@ -988,7 +1211,7 @@ pub fn gotoSplit(self: *Window, goto_target: apprt.action.GotoSplit) void {
 
     switch (tree.nodes[dest_handle.idx()]) {
         .leaf => |surface| {
-            self.tab_active_surface[tab] = surface;
+            self.focusPane(surface);
             if (surface.hwnd) |h| _ = w32.SetFocus(h);
         },
         .split => {},
@@ -1064,25 +1287,36 @@ pub fn toggleSplitZoom(self: *Window) void {
     self.layoutSplits();
 }
 
-/// Navigate to a tab by GotoTab target (previous, next, last, or index).
-pub fn selectTab(self: *Window, target: apprt.action.GotoTab) bool {
-    if (self.tab_count <= 1) return false;
-    const idx: usize = switch (target) {
-        .previous => if (self.active_tab > 0) self.active_tab - 1 else self.tab_count - 1,
-        .next => if (self.active_tab + 1 < self.tab_count) self.active_tab + 1 else 0,
-        .last => self.tab_count - 1,
+fn tabTargetIndex(target: apprt.action.GotoTab, active: usize, count: usize) ?usize {
+    if (count <= 1) return null;
+    return switch (target) {
+        .previous => if (active > 0) active - 1 else count - 1,
+        .next => if (active + 1 < count) active + 1 else 0,
+        .last => count - 1,
         _ => blk: {
-            // GotoTab carries a c_int; clamp non-negative before casting
-            // so a negative sentinel doesn't panic the @intCast.
+            // Numeric goto_tab actions use one-based positions.
             const raw = @backingInt(target);
-            if (raw < 0) return false;
-            const n: usize = @intCast(raw);
-            break :blk if (n < self.tab_count) n else return false;
+            if (raw <= 0) return null;
+            break :blk @min(count, @as(usize, @intCast(raw))) - 1;
         },
     };
+}
+
+/// Navigate to a tab by GotoTab target (previous, next, last, or position).
+pub fn selectTab(self: *Window, target: apprt.action.GotoTab) bool {
+    const idx = tabTargetIndex(target, self.active_tab, self.tab_count) orelse return false;
     self.selectTabIndex(idx);
     self.invalidateTabBar();
     return true;
+}
+
+test "tab bar numbered actions select one-based positions" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(?usize, 0), tabTargetIndex(@fromBackingInt(1), 2, 3));
+    try testing.expectEqual(@as(?usize, 1), tabTargetIndex(@fromBackingInt(2), 0, 3));
+    try testing.expectEqual(@as(?usize, 2), tabTargetIndex(@fromBackingInt(8), 0, 3));
+    try testing.expectEqual(@as(?usize, 2), tabTargetIndex(.last, 0, 3));
+    try testing.expectEqual(@as(?usize, null), tabTargetIndex(@fromBackingInt(0), 0, 3));
 }
 
 /// Move the active tab by a relative offset, wrapping cyclically.
@@ -1096,8 +1330,7 @@ pub fn moveTab(self: *Window, amount: isize) void {
     // Swap all tab state between active_tab and new_index.
     std.mem.swap(SplitTree(Surface), &self.tab_trees[self.active_tab], &self.tab_trees[new_index]);
     std.mem.swap(*Surface, &self.tab_active_surface[self.active_tab], &self.tab_active_surface[new_index]);
-    std.mem.swap([256]u16, &self.tab_titles[self.active_tab], &self.tab_titles[new_index]);
-    std.mem.swap(u16, &self.tab_title_lens[self.active_tab], &self.tab_title_lens[new_index]);
+    std.mem.swap(TabTitle, &self.tab_titles[self.active_tab], &self.tab_titles[new_index]);
     self.active_tab = new_index;
     self.invalidateTabBar();
 }
@@ -1105,12 +1338,17 @@ pub fn moveTab(self: *Window, amount: isize) void {
 /// Move the tab containing `surface`, including all of its splits, into a new
 /// native window without restarting any child processes.
 pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
-    if (self.is_quick_terminal or self.tab_count <= 1) return false;
+    if (self.tab_count <= 1) return false;
+    return self.moveTabToNewWindowAt(surface, null);
+}
+
+fn moveTabToNewWindowAt(self: *Window, surface: *Surface, position: ?w32.POINT) !bool {
+    if (self.is_quick_terminal or self.closing) return false;
     const tab_idx = self.findTabIndex(surface) orelse return false;
 
     const alloc = self.app.core_app.alloc;
     const destination = try alloc.create(Window);
-    destination.init(self.app, .{}) catch |err| {
+    destination.init(self.app, .{ .position = position }) catch |err| {
         alloc.destroy(destination);
         return err;
     };
@@ -1120,16 +1358,13 @@ pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
     }
 
     try self.app.windows.append(alloc, destination);
-    var tracked = true;
-    errdefer if (tracked) {
-        for (self.app.windows.items, 0..) |window, i| {
-            if (window == destination) {
-                _ = self.app.windows.orderedRemove(i);
-                break;
-            }
-        }
-    };
+    errdefer _ = self.app.windows.pop();
+    try self.transferTab(tab_idx, destination, 0);
+    return true;
+}
 
+fn transferTab(self: *Window, tab_idx: usize, destination: *Window, slot: usize) !void {
+    if (destination.tab_count >= MAX_TABS or slot > destination.tab_count) return error.TooManyTabs;
     const destination_hwnd = destination.hwnd orelse return error.Win32Error;
     var moved_tree = self.tab_trees[tab_idx];
 
@@ -1138,48 +1373,121 @@ pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
 
     const moved_active = self.tab_active_surface[tab_idx];
     const moved_title = self.tab_titles[tab_idx];
-    const moved_title_len = self.tab_title_lens[tab_idx];
 
+    self.removeTransferredTab(tab_idx);
+
+    destination.cancelTabRename();
+    const append = destination.tab_count;
+    destination.tab_trees[append] = moved_tree;
+    destination.tab_active_surface[append] = moved_active;
+    destination.tab_titles[append] = moved_title;
+    destination.tab_count += 1;
+
+    destination.adoptTabPanes(&moved_tree);
+    if (self.progress.state != .remove) self.queueProgressRefresh();
+    if (destination.tabProgress(append).state != .remove) destination.queueProgressRefresh();
+
+    if (self.tab_count != 0) {
+        self.selectTabIndex(self.active_tab);
+        self.updateTabBarVisibility();
+        self.invalidateTabBar();
+    }
+
+    destination.updateTabBarVisibility();
+    destination.selectTabIndex(append);
+    destination.moveTabTo(append, slot);
+    _ = w32.SetForegroundWindow(destination_hwnd);
+    _ = w32.ShowWindow(destination_hwnd, w32.SW_SHOW);
+    _ = w32.UpdateWindow(destination_hwnd);
+    destination.layoutSplits();
+    if (moved_active.hwnd) |h| _ = w32.SetFocus(h);
+    if (self.tab_count == 0) {
+        self.closing = true;
+        self.tab_overview.hide(false);
+        if (self.hwnd) |h| _ = w32.PostMessageW(h, w32.WM_CLOSE, 0, 0);
+    }
+}
+
+/// Splice the dragged tab's entire tree alongside an existing pane. Both
+/// trees keep their references until allocation and HWND transfers succeed.
+pub fn mergeTabIntoPane(self: *Window, tab_idx: usize, destination: *Window, target: *Surface, direction: SplitTree(Surface).Split.Direction) !void {
+    if (self.closing or destination.closing or self.is_quick_terminal or destination.is_quick_terminal or
+        self.app != destination.app or tab_idx >= self.tab_count) return error.InvalidTabTarget;
+    const target_tab = destination.findTabIndex(target) orelse return error.InvalidTabTarget;
+    if (self == destination and tab_idx == target_tab) return error.InvalidTabTarget;
+    const handle = destination.findHandle(target_tab, target) orelse return error.InvalidTabTarget;
+    const source_hwnd = self.hwnd orelse return error.Win32Error;
+    const destination_hwnd = destination.hwnd orelse return error.Win32Error;
+    const moved_active = self.tab_active_surface[tab_idx];
+    var moved = self.tab_trees[tab_idx];
+    var original = destination.tab_trees[target_tab];
+    var joined = try original.split(self.app.core_app.alloc, handle, direction, 0.5, &moved);
+    errdefer joined.deinit();
+    if (self != destination) try reparentTabWindows(&moved, source_hwnd, destination_hwnd);
+
+    // Commit both arrays before calling native UI functions: focus and size
+    // messages may immediately look up a moved pane in its new owner.
+    destination.tab_trees[target_tab] = joined;
+    destination.tab_active_surface[target_tab] = moved_active;
+    destination.refreshPaneTitle(target_tab);
+    self.removeTransferredTab(tab_idx);
+    const new_index = if (self == destination and tab_idx < target_tab) target_tab - 1 else target_tab;
+    if (self != destination) destination.adoptTabPanes(&moved);
+    original.deinit();
+    moved.deinit();
+
+    if (self != destination) {
+        if (self.progress.state != .remove) self.queueProgressRefresh();
+        if (self.tab_count != 0) {
+            self.selectTabIndex(self.active_tab);
+            self.updateTabBarVisibility();
+        } else {
+            self.closing = true;
+            self.tab_overview.hide(false);
+            _ = w32.PostMessageW(source_hwnd, w32.WM_CLOSE, 0, 0);
+        }
+    }
+    if (destination.tabProgress(new_index).state != .remove) destination.queueProgressRefresh();
+    destination.selectTabIndex(new_index);
+    destination.updateTabBarVisibility();
+    if (self != destination) _ = w32.SetForegroundWindow(destination_hwnd);
+    if (moved_active.hwnd) |h| _ = w32.SetFocus(h);
+}
+
+/// Remove an array slot whose tree ownership has already been transferred.
+fn removeTransferredTab(self: *Window, tab_idx: usize) void {
     var i = tab_idx;
     while (i + 1 < self.tab_count) : (i += 1) {
         self.tab_trees[i] = self.tab_trees[i + 1];
         self.tab_active_surface[i] = self.tab_active_surface[i + 1];
         self.tab_titles[i] = self.tab_titles[i + 1];
-        self.tab_title_lens[i] = self.tab_title_lens[i + 1];
     }
     self.tab_count -= 1;
     if (self.active_tab > tab_idx) {
         self.active_tab -= 1;
-    } else if (self.active_tab >= self.tab_count) {
+    } else if (self.tab_count > 0 and self.active_tab >= self.tab_count) {
         self.active_tab = self.tab_count - 1;
     }
+}
 
-    destination.tab_trees[0] = moved_tree;
-    destination.tab_active_surface[0] = moved_active;
-    destination.tab_titles[0] = moved_title;
-    destination.tab_title_lens[0] = moved_title_len;
-    destination.tab_count = 1;
-    destination.active_tab = 0;
-
-    var it = destination.tab_trees[0].iterator();
+fn adoptTabPanes(destination: *Window, moved: *const SplitTree(Surface)) void {
+    var it = moved.iterator();
     while (it.next()) |entry| entry.view.parent_window = destination;
-
-    self.selectTabIndex(self.active_tab);
-    self.updateTabBarVisibility();
-    self.invalidateTabBar();
-
-    destination.updateTabBarVisibility();
-    destination.updateWindowTitle();
-    _ = w32.ShowWindow(destination_hwnd, w32.SW_SHOW);
-    _ = w32.UpdateWindow(destination_hwnd);
-    destination.layoutSplits();
-    if (moved_active.hwnd) |h| _ = w32.SetFocus(h);
-
-    tracked = false;
-    return true;
+    it = moved.iterator();
+    while (it.next()) |entry| {
+        entry.view.setOpaqueBackground(destination.opaqueSurfaceBackground());
+        entry.view.applyDpiScale(destination.scale);
+    }
 }
 
 fn reparentTabWindows(tree: *const SplitTree(Surface), source: w32.HWND, destination: w32.HWND) !void {
+    const native = struct {
+        extern "user32" fn GetFocus() callconv(.winapi) ?w32.HWND;
+    };
+    const previous_focus = native.GetFocus();
+    errdefer if (previous_focus) |hwnd| {
+        if (native.GetFocus() != hwnd) _ = w32.SetFocus(hwnd);
+    };
     var moved: usize = 0;
     var it = tree.iterator();
     while (it.next()) |entry| {
@@ -1193,6 +1501,71 @@ fn reparentTabWindows(tree: *const SplitTree(Surface), source: w32.HWND, destina
             return err;
         };
         moved += 1;
+    }
+}
+
+test "tab drag split preserves pane identity and rolls back a failed cross-window merge" {
+    const a = std.testing.allocator;
+    var app: App = undefined;
+    var core: @import("../../App.zig") = undefined;
+    core.alloc = a;
+    app.core_app = &core;
+    app.config.@"window-show-tab-bar" = .never;
+    var windows = [_]Window{ .{ .app = &app }, .{ .app = &app } };
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+    const empty = std.unicode.utf8ToUtf16LeStringLiteral("");
+    defer for (&windows) |*window| {
+        for (window.tab_trees[0..window.tab_count]) |*tree| tree.deinit();
+        if (window.hwnd) |hwnd| _ = w32.DestroyWindow(hwnd);
+    };
+    for (&windows) |*window| {
+        window.hwnd = w32.CreateWindowExW(0, class, empty, 0, 0, 0, 40, 40, null, null, null, null) orelse return error.Win32Error;
+    }
+    var panes: [3]Surface = undefined;
+    for (&panes, 0..) |*pane, i| {
+        const owner = &windows[@intFromBool(i == 2)];
+        // The fixture holds one reference in addition to the owning tree.
+        pane.* = .{ .app = &app, .parent_window = owner, .ref_count = 1 };
+        pane.hwnd = w32.CreateWindowExW(0, class, empty, w32.WS_CHILD, 0, 0, 1, 1, owner.hwnd, null, null, null) orelse return error.Win32Error;
+        const tab = owner.tab_count;
+        owner.tab_trees[tab] = try .init(a, pane);
+        owner.tab_active_surface[tab] = pane;
+        owner.tab_titles[tab].len = 0;
+        owner.tab_count += 1;
+    }
+
+    const source = &windows[0];
+    const destination = &windows[1];
+    try std.testing.expectError(error.InvalidTabTarget, source.mergeTabIntoPane(0, source, &panes[0], .left));
+    try source.mergeTabIntoPane(0, source, &panes[1], .left);
+    try std.testing.expectEqual(@as(usize, 1), source.tab_count);
+    try std.testing.expect(source.getActiveSurface().? == &panes[0]);
+    const first_split = source.tab_trees[0].nodes[0].split;
+    try std.testing.expect(source.tab_trees[0].nodes[first_split.left.idx()].leaf == &panes[0]);
+    try std.testing.expect(source.tab_trees[0].nodes[first_split.right.idx()].leaf == &panes[1]);
+
+    panes[1].palette_hwnd = @ptrFromInt(1);
+    try std.testing.expectError(error.Win32Error, source.mergeTabIntoPane(0, destination, &panes[2], .down));
+    try std.testing.expectEqual(@as(usize, 1), source.tab_count);
+    try std.testing.expectEqual(@as(usize, 1), destination.tab_count);
+    for (&panes) |*pane| {
+        try std.testing.expectEqual(@as(u32, 2), pane.ref_count);
+        try std.testing.expectEqual(pane.parent_window.hwnd, w32.GetParent(pane.hwnd.?));
+    }
+    panes[1].palette_hwnd = null;
+    try source.mergeTabIntoPane(0, destination, &panes[2], .down);
+    try std.testing.expect(source.closing);
+    try std.testing.expectEqual(@as(usize, 0), source.tab_count);
+    try std.testing.expect(destination.getActiveSurface().? == &panes[0]);
+    const nodes = destination.tab_trees[0].nodes;
+    try std.testing.expect(nodes[nodes[0].split.left.idx()].leaf == &panes[2]);
+    const subtree = nodes[nodes[0].split.right.idx()].split;
+    try std.testing.expect(nodes[subtree.left.idx()].leaf == &panes[0]);
+    try std.testing.expect(nodes[subtree.right.idx()].leaf == &panes[1]);
+    for (&panes) |*pane| {
+        try std.testing.expectEqual(@as(u32, 2), pane.ref_count);
+        try std.testing.expect(pane.parent_window == destination);
+        try std.testing.expectEqual(destination.hwnd, w32.GetParent(pane.hwnd.?));
     }
 }
 
@@ -1237,20 +1610,98 @@ test "detached tab rolls back child and popup transfers" {
     }
 }
 
+fn processElevated() bool {
+    const native = struct {
+        extern "advapi32" fn GetTokenInformation(w32.HANDLE, u32, *u32, u32, *u32) callconv(.winapi) i32;
+    };
+    // GetCurrentProcessToken() is an inline Windows SDK pseudo-handle.
+    const token: w32.HANDLE = @ptrFromInt(@as(usize, @bitCast(@as(isize, -4))));
+    const token_elevation = 20;
+    var elevated: u32 = 0;
+    var size: u32 = 0;
+    return native.GetTokenInformation(token, token_elevation, &elevated, @sizeOf(u32), &size) != 0 and elevated != 0;
+}
+
+const TabTitle = struct {
+    text: [256]u16 = undefined,
+    len: u16 = 0,
+    manual: bool = false,
+    panes: [255]u16 = undefined,
+    panes_len: u16 = 0,
+
+    fn visible(self: *const TabTitle) []const u16 {
+        if (!self.manual and self.panes_len != 0) return self.panes[0..self.panes_len];
+        return self.text[0..self.len];
+    }
+};
+
+pub fn tabLabel(self: *const Window, tab: usize) []const u16 {
+    return self.tab_titles[tab].visible();
+}
+
+/// Recompute only when panes are added, removed or merged.
+fn refreshPaneTitle(self: *Window, tab: usize) void {
+    const title = &self.tab_titles[tab];
+    title.panes_len = 0;
+    const nodes = self.tab_trees[tab].nodes;
+    if (nodes.len <= 1) return;
+    const first = self.tab_active_surface[tab];
+    var common = first.launch_title_len != 0;
+    var count: usize = 0;
+    for (nodes) |node| switch (node) {
+        .leaf => |pane| {
+            count += 1;
+            common = common and pane.profile_id == first.profile_id and
+                (first.profile_id != null or pane.launch_exe == first.launch_exe) and
+                std.mem.eql(u16, pane.launch_title[0..pane.launch_title_len], first.launch_title[0..first.launch_title_len]);
+        },
+        .split => {},
+    };
+    var buf: [64]u8 = undefined;
+    if (!common) {
+        const formatted = lang.print(&buf, "{d} panes", .{count}) catch unreachable;
+        title.panes_len = @intCast(encodeTitle(&title.panes, formatted));
+        return;
+    }
+    const suffix = std.mem.print(&buf, " × {d}", .{count}) catch unreachable;
+    var end: [32]u16 = undefined;
+    const end_len = encodeTitle(&end, suffix);
+    var len = @min(first.launch_title_len, title.panes.len - end_len);
+    if (len != 0 and std.unicode.utf16IsHighSurrogate(first.launch_title[len - 1])) len -= 1;
+    @memcpy(title.panes[0..len], first.launch_title[0..len]);
+    @memcpy(title.panes[len..][0..end_len], end[0..end_len]);
+    title.panes_len = @intCast(len + end_len);
+}
+
+pub fn setTabTitle(self: *Window, surface: *Surface, title: [:0]const u8) void {
+    const tab = self.findTabIndex(surface) orelse return;
+    self.tab_titles[tab].manual = false;
+    self.onTabTitleChanged(surface, if (title.len == 0) surface.getTitle() orelse "" else title);
+    self.tab_titles[tab].manual = title.len != 0;
+    self.invalidateTabBar();
+}
+
+const admin_prefix = std.unicode.utf8ToUtf16LeStringLiteral("Admin: ");
+const DisplayTitleBuffer = [256 + admin_prefix.len + 1]u16;
+
+fn displayTitle(buf: *DisplayTitleBuffer, title: []const u16, elevated: bool) [:0]const u16 {
+    const prefix_len = if (elevated) admin_prefix.len else 0;
+    @memcpy(buf[0..prefix_len], admin_prefix[0..prefix_len]);
+    @memcpy(buf[prefix_len..][0..title.len], title);
+    const end = prefix_len + title.len;
+    buf[end] = 0;
+    return buf[0..end :0];
+}
+
 /// Update the top-level window title to match the active tab's title.
 fn updateWindowTitle(self: *Window) void {
     const hwnd = self.hwnd orelse return;
     if (self.tab_count == 0) return;
     const len = self.window_title_override_len orelse
-        self.tab_title_lens[self.active_tab];
-    var buf: [257]u16 = undefined;
-    if (self.window_title_override_len != null) {
-        @memcpy(buf[0..len], self.window_title_override[0..len]);
-    } else {
-        @memcpy(buf[0..len], self.tab_titles[self.active_tab][0..len]);
-    }
-    buf[len] = 0;
-    _ = w32.SetWindowTextW(hwnd, @ptrCast(&buf));
+        self.tab_titles[self.active_tab].len;
+    const title = if (self.window_title_override_len != null) self.window_title_override[0..len] else self.tab_titles[self.active_tab].text[0..len];
+    var buf: DisplayTitleBuffer = undefined;
+    _ = w32.SetWindowTextW(hwnd, displayTitle(&buf, title, self.process_elevated));
 }
 
 /// Set or clear the explicit top-level window title override.
@@ -1258,8 +1709,7 @@ pub fn setWindowTitle(self: *Window, title: [:0]const u8) void {
     if (title.len == 0) {
         self.window_title_override_len = null;
     } else {
-        const len = std.unicode.utf8ToUtf16Le(&self.window_title_override, title) catch 0;
-        self.window_title_override_len = @intCast(@min(len, self.window_title_override.len));
+        self.window_title_override_len = @intCast(encodeTitle(&self.window_title_override, title));
     }
     self.updateWindowTitle();
 }
@@ -1268,13 +1718,118 @@ pub fn setWindowTitle(self: *Window, title: [:0]const u8) void {
 /// and refreshes the window title bar / tab bar if needed.
 pub fn onTabTitleChanged(self: *Window, surface: *Surface, title: [:0]const u8) void {
     const tab_idx = self.findTabIndex(surface) orelse return;
-    var wbuf: [256]u16 = undefined;
-    const wlen = std.unicode.utf8ToUtf16Le(&wbuf, title) catch 0;
-    const len: u16 = @intCast(@min(wlen, 255));
-    @memcpy(self.tab_titles[tab_idx][0..len], wbuf[0..len]);
-    self.tab_title_lens[tab_idx] = len;
-    if (tab_idx == self.active_tab) self.updateWindowTitle();
+    var buf: [255]u16 = undefined;
+    const written = buf[0..encodeTabTitle(&buf, surface, title)];
+    if (self.tab_titles[tab_idx].manual) return;
+    const previous = self.tab_titles[tab_idx].text[0..self.tab_titles[tab_idx].len];
+    if (std.mem.eql(u16, previous, written)) return;
+    @memcpy(self.tab_titles[tab_idx].text[0..written.len], written);
+    self.tab_titles[tab_idx].len = @intCast(written.len);
+    if (tab_idx == self.active_tab and self.window_title_override_len == null) self.updateWindowTitle();
     self.invalidateTabBar();
+}
+
+fn encodeTabTitle(dest: []u16, surface: *const Surface, title: []const u8) usize {
+    if (title.len != 0) return encodeTitle(dest, title);
+    const label = if (surface.launch_title_len != 0) surface.launch_title[0..surface.launch_title_len] else std.unicode.utf8ToUtf16LeStringLiteral("Madotty");
+    @memcpy(dest[0..label.len], label);
+    return label.len;
+}
+
+test "tab bar title for panes groups profiles and restores a single pane title" {
+    const Tree = SplitTree(Surface);
+    var window: Window = .{ .app = undefined, .tab_count = 1 };
+    var a: Surface = .{ .app = undefined, .profile_id = 1 };
+    a.launch_title_len = encodeTitle(&a.launch_title, "PowerShell");
+    var b = a;
+    const nodes = [_]Tree.Node{
+        .{ .split = .{ .layout = .horizontal, .ratio = 0.5, .left = @fromBackingInt(1), .right = @fromBackingInt(2) } },
+        .{ .leaf = &a },
+        .{ .leaf = &b },
+    };
+    window.tab_trees[0] = .{ .arena = undefined, .nodes = &nodes, .zoomed = null };
+    window.tab_active_surface[0] = &a;
+    window.refreshPaneTitle(0);
+    window.onTabTitleChanged(&a, "build");
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("PowerShell × 2"), window.tabLabel(0));
+
+    // Distinct profiles can have exactly the same display name.
+    b.profile_id = 2;
+    window.refreshPaneTitle(0);
+    const mixed = if (lang.isJapanese()) std.unicode.utf8ToUtf16LeStringLiteral("2個のペイン")[0..] else std.unicode.utf8ToUtf16LeStringLiteral("2 panes")[0..];
+    try std.testing.expectEqualSlices(u16, mixed, window.tabLabel(0));
+    window.setTabTitle(&a, "Workspace");
+    window.onTabTitleChanged(&b, "other shell title");
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("Workspace"), window.tabLabel(0));
+    window.setTabTitle(&a, "");
+    try std.testing.expectEqualSlices(u16, mixed, window.tabLabel(0));
+
+    window.tab_trees[0].nodes = nodes[1..2];
+    window.refreshPaneTitle(0);
+    window.onTabTitleChanged(&a, "build");
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("build"), window.tabLabel(0));
+}
+
+test "tab bar title falls back to the launched profile after an empty title" {
+    var pane: Surface = .{ .app = undefined };
+    pane.launch_title_len = encodeTitle(&pane.launch_title, "開発用 PowerShell");
+    var window: Window = .{ .app = undefined, .tab_count = 1 };
+    window.tab_active_surface[0] = &pane;
+    window.tab_titles[0].len = 0;
+    window.onTabTitleChanged(&pane, "C:\\work");
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("C:\\work"), window.tab_titles[0].text[0..window.tab_titles[0].len]);
+    window.onTabTitleChanged(&pane, "");
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("開発用 PowerShell"), window.tab_titles[0].text[0..window.tab_titles[0].len]);
+}
+
+pub fn encodeTitle(dest: []u16, title: []const u8) usize {
+    // UTF-16 never uses more units than UTF-8 uses bytes. For longer input
+    // find the largest prefix that fits, keeping surrogate pairs together.
+    var end = title.len;
+    if (end > dest.len) {
+        end = 0;
+        var remaining = dest.len;
+        while (end < title.len and remaining > 0) {
+            const bytes = std.unicode.utf8ByteSequenceLength(title[end]) catch return 0;
+            const units: usize = if (bytes == 4) 2 else 1;
+            if (units > remaining or bytes > title.len - end) break;
+            remaining -= units;
+            end += bytes;
+        }
+    }
+    return std.unicode.utf8ToUtf16Le(dest, title[0..end]) catch 0;
+}
+
+test "tab bar title respects UTF-16 capacity at emoji and Japanese boundaries" {
+    var storage: [4]u16 = undefined;
+    for ([_][]const u8{ "ABCDE", "日本🚀語", "日本語🚀" }, [_][]const u8{ "ABCD", "日本🚀", "日本語" }) |input, expected| {
+        const title = storage[0..encodeTitle(&storage, input)];
+        const utf8 = try std.unicode.utf16LeToUtf8Alloc(std.testing.allocator, title);
+        defer std.testing.allocator.free(utf8);
+        try std.testing.expectEqualStrings(expected, utf8);
+    }
+}
+
+test "elevation prefix follows active and overridden window titles" {
+    const wide = std.unicode.utf8ToUtf16LeStringLiteral;
+    const hwnd = w32.CreateWindowExW(0, wide("STATIC"), wide(""), 0, 0, 0, 1, 1, null, null, null, null) orelse return error.Win32Error;
+    defer _ = w32.DestroyWindow(hwnd);
+    var window: Window = .{ .app = undefined, .hwnd = hwnd, .tab_count = 1 };
+    const original = wide("作業 👻");
+    @memcpy(window.tab_titles[0].text[0..original.len], original);
+    window.tab_titles[0].len = original.len;
+    var buf: DisplayTitleBuffer = undefined;
+    window.updateWindowTitle();
+    var len: usize = @intCast(w32.GetWindowTextW(hwnd, &buf, buf.len));
+    try std.testing.expectEqualSlices(u16, original, buf[0..len]);
+    window.process_elevated = true;
+    window.setWindowTitle("開発");
+    len = @intCast(w32.GetWindowTextW(hwnd, &buf, buf.len));
+    try std.testing.expectEqualSlices(u16, wide("Admin: 開発"), buf[0..len]);
+    window.setWindowTitle("");
+    len = @intCast(w32.GetWindowTextW(hwnd, &buf, buf.len));
+    try std.testing.expectEqualSlices(u16, wide("Admin: 作業 👻"), buf[0..len]);
+    try std.testing.expectEqualSlices(u16, original, window.tab_titles[0].text[0..original.len]);
 }
 
 /// Update tab bar visibility based on config and tab count.
@@ -1301,13 +1856,112 @@ pub fn invalidateTabBar(self: *Window) void {
     if (self.tab_overview.active and !self.overview_refresh_pending) {
         self.overview_refresh_pending = w32.PostMessageW(hwnd, WM_REFRESH_TAB_OVERVIEW, 0, 0) != 0;
     }
-    var rect = w32.RECT{
-        .left = 0,
-        .top = 0,
-        .right = 10000,
-        .bottom = self.tabBarHeight(),
-    };
+    self.invalidateTabStrip(hwnd);
+}
+
+fn invalidateTabStrip(self: *const Window, hwnd: w32.HWND) void {
+    if (!self.tab_bar_visible) return;
+    var rect: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &rect) == 0) return;
+    rect.bottom = @min(rect.bottom, self.tabBarHeight());
+    if (rect.right <= rect.left or rect.bottom <= rect.top) return;
     _ = w32.InvalidateRect(hwnd, &rect, 0);
+}
+
+test "tab bar repaint covers the resized client width" {
+    const native = struct {
+        extern "user32" fn GetUpdateRect(w32.HWND, *w32.RECT, i32) callconv(.winapi) i32;
+    };
+    // Hidden windows have no update region. Keep this visible popup offscreen
+    // and nonactivating so the test can inspect the real GDI update bounds.
+    const hwnd = w32.CreateWindowExW(w32.WS_EX_NOACTIVATE | w32.WS_EX_TOOLWINDOW, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral(""), w32.WS_POPUP | w32.WS_VISIBLE_STYLE, -30000, 0, 800, 240, null, null, null, null) orelse return error.Win32Error;
+    defer _ = w32.DestroyWindow(hwnd);
+    var window: Window = .{ .app = undefined, .tab_bar_visible = true, .scale = 1.5 };
+    for ([_]i32{ 800, 520, 1100 }) |width| {
+        try std.testing.expect(w32.SetWindowPos(hwnd, null, 0, 0, width, 240, w32.SWP_NOMOVE | w32.SWP_NOACTIVATE | w32.SWP_NOZORDER) != 0);
+        _ = w32.ValidateRect(hwnd, null);
+        window.invalidateTabStrip(hwnd);
+        var dirty: w32.RECT = undefined;
+        try std.testing.expect(native.GetUpdateRect(hwnd, &dirty, 0) != 0);
+        try std.testing.expectEqual(w32.RECT{ .left = 0, .top = 0, .right = width, .bottom = 48 }, dirty);
+    }
+
+    var surface: Surface = .{ .app = undefined };
+    window.hwnd = hwnd;
+    window.tab_count = 1;
+    window.tab_active_surface[0] = &surface;
+    window.tab_titles[0].len = 0;
+    window.onTabTitleChanged(&surface, "日本語");
+    _ = w32.ValidateRect(hwnd, null);
+    var dirty: w32.RECT = undefined;
+    window.onTabTitleChanged(&surface, "日本語");
+    try std.testing.expectEqual(@as(i32, 0), native.GetUpdateRect(hwnd, &dirty, 0));
+    window.onTabTitleChanged(&surface, "ターミナル");
+    try std.testing.expect(native.GetUpdateRect(hwnd, &dirty, 0) != 0);
+}
+
+fn tabProgress(self: *const Window, index: usize) Progress {
+    var result: Progress = .{};
+    var panes = self.tab_trees[index].iterator();
+    while (panes.next()) |entry| result = result.preferred(entry.view.progress);
+    return result;
+}
+
+fn aggregateProgress(self: *const Window) Progress {
+    var result: Progress = .{};
+    for (0..self.tab_count) |index| result = result.preferred(self.tabProgress(index));
+    return result;
+}
+
+test "win32 progress follows the live tabs and split panes" {
+    const testing = std.testing;
+    var running: Surface = .{ .app = undefined, .progress = .{ .state = .set, .value = 37 } };
+    var failed: Surface = .{ .app = undefined, .progress = .{ .state = .@"error", .value = 64 } };
+    var empty: Surface = .{ .app = undefined };
+    var origin: Window = .{ .app = undefined, .tab_count = 2 };
+    origin.tab_trees[0] = .{ .arena = undefined, .nodes = &.{.{ .leaf = &running }}, .zoomed = null };
+    origin.tab_trees[1] = .{ .arena = undefined, .nodes = &.{
+        .{ .split = .{ .layout = .horizontal, .ratio = 0.5, .left = @fromBackingInt(@intCast(1)), .right = @fromBackingInt(@intCast(2)) } },
+        .{ .leaf = &empty },
+        .{ .leaf = &failed },
+    }, .zoomed = null };
+    try testing.expectEqual(running.progress, origin.tabProgress(0));
+    try testing.expectEqual(failed.progress, origin.tabProgress(1));
+    try testing.expectEqual(failed.progress, origin.aggregateProgress());
+    origin.active_tab = 1;
+    try testing.expectEqual(failed.progress, origin.aggregateProgress());
+
+    var destination: Window = .{ .app = undefined, .tab_count = 1 };
+    destination.tab_trees[0] = origin.tab_trees[1];
+    origin.tab_count = 1;
+    try testing.expectEqual(running.progress, origin.aggregateProgress());
+    try testing.expectEqual(failed.progress, destination.aggregateProgress());
+    destination.tab_trees[0] = .{ .arena = undefined, .nodes = &.{.{ .leaf = &empty }}, .zoomed = null };
+    try testing.expectEqual(Progress{}, destination.aggregateProgress());
+    try testing.expectEqual(running.progress, origin.aggregateProgress());
+}
+
+/// Coalesce reports and update Explorer outside the core action dispatch.
+pub fn queueProgressRefresh(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    if (self.is_quick_terminal or self.progress_refresh_pending) return;
+    self.progress_refresh_pending = w32.PostMessageW(hwnd, WM_REFRESH_PROGRESS, 0, 0) != 0;
+}
+
+fn refreshProgress(self: *Window, hwnd: w32.HWND) void {
+    self.progress_refresh_pending = false;
+    const next = if (self.app.config.@"progress-style") self.aggregateProgress() else Progress{};
+    const repaint = next.state != .remove or self.progress.state != .remove;
+    self.progress = next;
+    if (repaint and self.tab_bar_visible) self.invalidateTabStrip(hwnd);
+    if (!self.taskbar_ready) return;
+    if (self.taskbar_progress) |previous| {
+        if (std.meta.eql(previous, next)) return;
+    }
+    const published = self.app.setTaskbarProgress(hwnd, self.taskbar_progress, next);
+    // Shell COM can dispatch messages while updating a taskbar button.
+    if (w32.GetWindowLongPtrW(hwnd, w32.GWLP_USERDATA) != @as(isize, @bitCast(@intFromPtr(self)))) return;
+    self.taskbar_progress = if (published) next else null;
 }
 
 /// Fill the strip with adjacent tabs, retaining a minimum width on overflow.
@@ -1368,6 +2022,30 @@ test "tab bar drag reorder follows actual nonuniform tab midpoints" {
     try testing.expectEqual(@as(usize, 63), tabDragTarget(&rects, 10000));
 }
 
+test "tab bar shares the full track as tabs are added and keeps the buttons reachable" {
+    const testing = std.testing;
+    var window: Window = .{ .app = undefined, .tab_count = 1 };
+    window.layoutTabStrip(800, 32);
+    try testing.expectEqual(@as(i32, 736), window.tab_rects[0].right);
+    window.tab_count = 2;
+    window.layoutTabStrip(800, 32);
+    try testing.expectEqual(@as(i32, 368), window.tab_rects[0].right);
+    try testing.expectEqual(@as(i32, 368), window.tab_rects[1].left);
+    try testing.expectEqual(@as(i32, 736), window.tab_rects[1].right);
+    try testing.expectEqual(@as(?TabButton, .new_tab), window.tabButtonAt(736, 16));
+    try testing.expectEqual(@as(?TabButton, .environment), window.tabButtonAt(768, 16));
+    try testing.expectEqual(@as(?TabButton, null), window.tabButtonAt(768, 32));
+
+    window.tab_count = 10;
+    window.active_tab = 9;
+    window.scale = 1.5;
+    window.layoutTabStrip(380, 48);
+    try testing.expectEqual(@as(?usize, 9), window.tabAt(283, 24));
+    try testing.expectEqual(@as(?usize, null), window.tabAt(284, 24));
+    try testing.expectEqual(@as(?TabButton, .new_tab), window.tabButtonAt(284, 24));
+    try testing.expectEqual(@as(?TabButton, .environment), window.tabButtonAt(379, 24));
+}
+
 fn tabColor(bg: Config.Color, fg: Config.Color, weight: u8) u32 {
     const foreground: u16 = weight;
     const background: u16 = 255 - foreground;
@@ -1383,6 +2061,175 @@ fn tabCloseRect(self: *const Window, tab: w32.RECT) w32.RECT {
     const inset: i32 = @intFromFloat(@round(4.0 * self.scale));
     const top = @divTrunc(self.tabBarHeight() - size, 2);
     return .{ .left = tab.right - inset - size, .top = top, .right = tab.right - inset, .bottom = top + size };
+}
+
+fn tabShortcuts(bindings: Binding.Set, hints: []?Binding.Trigger) void {
+    @memset(hints, null);
+    if (hints.len <= 1) return;
+    var last: ?Binding.Trigger = null;
+    var iterator = bindings.bindings.iterator();
+    while (iterator.next()) |entry| {
+        const action = switch (entry.value_ptr.*) {
+            .leaf => |leaf| leaf.action,
+            else => continue,
+        };
+        const hint = switch (action) {
+            .goto_tab => |position| if (position > 0 and position <= hints.len)
+                &hints[position - 1]
+            else
+                continue,
+            .last_tab => &last,
+            else => continue,
+        };
+        const trigger = entry.key_ptr.*;
+        // The reverse map prefers configured bindings but omits the
+        // performable defaults used for Alt+digit on Windows.
+        const preferred = if (bindings.getTrigger(action)) |lookup|
+            std.meta.eql(lookup, trigger)
+        else
+            false;
+        if (hint.* == null or preferred) hint.* = trigger;
+    }
+    if (hints[hints.len - 1] == null) hints[hints.len - 1] = last;
+}
+
+test "tab bar shortcut hints follow active bindings and final tab" {
+    var bindings: Binding.Set = .{};
+    defer bindings.deinit(std.testing.allocator);
+    const first: Binding.Trigger = .{ .key = .{ .physical = .digit_1 }, .mods = .{ .alt = true } };
+    const last: Binding.Trigger = .{ .key = .{ .unicode = '9' }, .mods = .{ .ctrl = true } };
+    try bindings.putFlags(std.testing.allocator, first, .{ .goto_tab = 1 }, .{ .performable = true });
+    try bindings.putFlags(std.testing.allocator, last, .last_tab, .{ .performable = true });
+    var hints: [3]?Binding.Trigger = undefined;
+    tabShortcuts(bindings, hints[0..1]);
+    try std.testing.expectEqual(@as(?Binding.Trigger, null), hints[0]);
+    tabShortcuts(bindings, &hints);
+    try std.testing.expectEqual(first, hints[0].?);
+    try std.testing.expectEqual(@as(?Binding.Trigger, null), hints[1]);
+    try std.testing.expectEqual(last, hints[2].?);
+
+    const configured: Binding.Trigger = .{ .key = .{ .physical = .f1 } };
+    try bindings.put(std.testing.allocator, configured, .{ .goto_tab = 1 });
+    tabShortcuts(bindings, &hints);
+    try std.testing.expectEqual(configured, hints[0].?);
+}
+
+fn containsPoint(rect: w32.RECT, x: i32, y: i32) bool {
+    return x >= rect.left and x < rect.right and y >= rect.top and y < rect.bottom;
+}
+
+fn tabButtonAt(self: *const Window, x: i32, y: i32) ?TabButton {
+    for (self.tab_buttons, 0..) |rect, i| {
+        if (containsPoint(rect, x, y)) return @fromBackingInt(@intCast(i));
+    }
+    return null;
+}
+
+fn tabAt(self: *const Window, x: i32, y: i32) ?usize {
+    if (x < 0 or x >= self.tab_buttons[0].left) return null;
+    for (self.tab_rects[0..self.tab_count], 0..) |rect, i| {
+        if (containsPoint(rect, x, y)) return i;
+    }
+    return null;
+}
+
+fn layoutTabStrip(self: *Window, width: i32, height: i32) void {
+    const button_width = @min(@divTrunc(width, 2), @as(i32, @intFromFloat(@round(32 * self.scale))));
+    const available = width - 2 * button_width;
+    const minimum: i32 = @intFromFloat(@round(72 * self.scale));
+    const tabs = self.tab_rects[0..self.tab_count];
+    const tab_width = layoutTabRects(tabs, available, height, minimum);
+    if (tabs.len > 0 and tab_width > available) {
+        const offset = @max(tabs[self.active_tab].right - available, 0);
+        for (tabs) |*rect| {
+            rect.left -= offset;
+            rect.right -= offset;
+        }
+    }
+    self.tab_buttons = .{
+        .{ .left = available, .top = 0, .right = available + button_width, .bottom = height },
+        .{ .left = available + button_width, .top = 0, .right = width, .bottom = height },
+    };
+}
+
+fn drawPill(hdc: w32.HDC, rect: w32.RECT, inset: i32, color: u32) void {
+    const diameter = @min(rect.right - rect.left, rect.bottom - rect.top) - 2 * inset;
+    if (diameter <= 0) return;
+    _ = w32.SetDCBrushColor(hdc, color);
+    _ = w32.RoundRect(hdc, rect.left + inset, rect.top + inset, rect.right - inset, rect.bottom - inset, diameter, diameter);
+}
+
+fn drawTabProgress(self: *const Window, dc: w32.HDC, tab: w32.RECT, progress: Progress) void {
+    const slot: usize = switch (progress.state) {
+        .remove => return,
+        .set, .indeterminate => 2,
+        .@"error" => 1,
+        .pause => 3,
+    };
+    const config = &self.app.config;
+    const bg = config.background;
+    const fg = config.foreground;
+    const color = for ([_]usize{ slot, slot + 8 }) |index| {
+        const rgb = config.palette.value[index];
+        if (rgb.contrast(bg.toTerminalRGB()) >= 3) break w32.RGB(rgb.r, rgb.g, rgb.b);
+    } else w32.RGB(fg.r, fg.g, fg.b);
+
+    const width = @min(
+        tab.right - tab.left - @as(i32, @intFromFloat(@round(20 * self.scale))),
+        @as(i32, @intFromFloat(@round(64 * self.scale))),
+    );
+    if (width < 5) return;
+    const height = @max(1, @as(i32, @intFromFloat(@round(2 * self.scale))));
+    const bottom = tab.bottom - @as(i32, @intFromFloat(@round(5 * self.scale)));
+    const left = tab.left + @divTrunc(tab.right - tab.left - width, 2);
+    var track: w32.RECT = .{ .left = left, .top = bottom - height, .right = left + width, .bottom = bottom };
+    drawPill(dc, track, 0, tabColor(bg, fg, 68));
+    if (progress.state == .indeterminate) {
+        const dash = @min(height + 1, @divTrunc(width, 5));
+        for (0..3) |index| {
+            track.left = left + @divTrunc(width - 5 * dash, 2) + 2 * dash * @as(i32, @intCast(index));
+            track.right = track.left + dash;
+            drawPill(dc, track, 0, color);
+        }
+    } else if (progress.value != 0) {
+        track.right = left + @max(1, @divTrunc(width * progress.value + 50, 100));
+        drawPill(dc, track, 0, color);
+    }
+}
+
+fn drawNewTabControl(self: *const Window, dc: w32.HDC, brush: w32.HBRUSH, bg: Config.Color, fg: Config.Color, inset: i32) void {
+    const plus = self.tab_buttons[@backingInt(TabButton.new_tab)];
+    const menu = self.tab_buttons[@backingInt(TabButton.environment)];
+    if (plus.right - plus.left <= 2 * inset) return;
+    const control: w32.RECT = .{ .left = plus.left, .top = plus.top, .right = menu.right, .bottom = menu.bottom };
+    drawPill(dc, control, inset, tabColor(bg, fg, 15));
+    if (self.hover_button) |button| {
+        const half = self.tab_buttons[@backingInt(button)];
+        const saved = w32.SaveDC(dc);
+        if (saved != 0) {
+            _ = w32.IntersectClipRect(dc, half.left, half.top, half.right, half.bottom);
+            drawPill(dc, control, inset, tabColor(bg, fg, 30));
+            _ = w32.RestoreDC(dc, saved);
+        }
+    }
+
+    const divider_inset: i32 = @intFromFloat(@round(9 * self.scale));
+    const divider: w32.RECT = .{
+        .left = menu.left,
+        .top = control.top + divider_inset,
+        .right = menu.left + @max(1, @as(i32, @intFromFloat(@round(self.scale)))),
+        .bottom = control.bottom - divider_inset,
+    };
+    _ = w32.SetDCBrushColor(dc, tabColor(bg, fg, 43));
+    _ = w32.FillRect(dc, &divider, brush);
+
+    if (self.app.tab_icon_renderer != null) {
+        const painter = Icons.Painter.init(dc, tabColor(bg, fg, 220)) orelse return;
+        defer painter.deinit();
+        const size = 18 * self.scale;
+        painter.draw(.plus, .{ .left = plus.left + inset, .top = plus.top, .right = divider.left, .bottom = plus.bottom }, size);
+        painter.draw(.chevron_down, .{ .left = divider.right, .top = menu.top, .right = menu.right - inset, .bottom = menu.bottom }, size);
+    }
 }
 
 /// Paint the tab bar using double-buffered GDI painting.
@@ -1404,13 +2251,23 @@ fn paintTabBar(self: *Window) void {
     var client_rect: w32.RECT = undefined;
     if (w32.GetClientRect(hwnd, &client_rect) == 0) return;
     const client_w = client_rect.right - client_rect.left;
-    if (client_w <= 0) return;
+    const dirty = w32.RECT{
+        .left = @max(0, ps.rcPaint.left),
+        .top = @max(0, ps.rcPaint.top),
+        .right = @min(client_w, ps.rcPaint.right),
+        .bottom = @min(bar_h, ps.rcPaint.bottom),
+    };
+    if (dirty.left >= dirty.right or dirty.top >= dirty.bottom) return;
 
     // Double-buffer: create offscreen DC and bitmap.
     const mem_dc = w32.CreateCompatibleDC(hdc_screen) orelse return;
     defer _ = w32.DeleteDC(mem_dc);
 
-    const mem_bmp = w32.CreateCompatibleBitmap(hdc_screen, client_w, bar_h) orelse return;
+    var bitmap_bits: ?*anyopaque = null;
+    const mem_bmp = if (self.system_backdrop_active)
+        w32.CreateDIBSection(hdc_screen, &.{ .bmiHeader = .{ .biWidth = client_w, .biHeight = -bar_h } }, w32.DIB_RGB_COLORS, &bitmap_bits, null, 0) orelse return
+    else
+        w32.CreateCompatibleBitmap(hdc_screen, client_w, bar_h) orelse return;
     const old_bmp = w32.SelectObject(mem_dc, mem_bmp);
     defer {
         _ = w32.SelectObject(mem_dc, old_bmp);
@@ -1419,18 +2276,18 @@ fn paintTabBar(self: *Window) void {
 
     const bg = self.app.config.background;
     const fg = self.app.config.foreground;
-    const bar_color = tabColor(bg, fg, 7);
+    const bar_color = w32.RGB(bg.r, bg.g, bg.b);
     const hover_color = tabColor(bg, fg, 16);
     const active_bg_color = tabColor(bg, fg, 25);
-    const divider_color = tabColor(bg, fg, 40);
+    const close_hover_color = tabColor(bg, fg, 40);
     const active_text_color = w32.RGB(fg.r, fg.g, fg.b);
     const inactive_text_color = tabColor(bg, fg, 195);
+    const hint_color = tabColor(bg, fg, 155);
     const brush: w32.HBRUSH = @ptrCast(w32.GetStockObject(w32.DC_BRUSH) orelse return);
 
     // --- Fill bar background ---
-    var bar_rect = w32.RECT{ .left = 0, .top = 0, .right = client_w, .bottom = bar_h };
     _ = w32.SetDCBrushColor(mem_dc, bar_color);
-    _ = w32.FillRect(mem_dc, &bar_rect, brush);
+    _ = w32.FillRect(mem_dc, &dirty, brush);
 
     // --- Select font and set text mode ---
     var old_font: ?*anyopaque = null;
@@ -1441,122 +2298,305 @@ fn paintTabBar(self: *Window) void {
         if (old_font) |f| _ = w32.SelectObject(mem_dc, f);
     }
     _ = w32.SetBkMode(mem_dc, w32.TRANSPARENT);
+    const old_brush = w32.SelectObject(mem_dc, brush);
+    defer _ = w32.SelectObject(mem_dc, old_brush);
+    const old_pen = w32.SelectObject(mem_dc, w32.GetStockObject(w32.NULL_PEN) orelse return);
+    defer _ = w32.SelectObject(mem_dc, old_pen);
 
-    // --- Calculate tab geometry ---
-    const new_tab_btn_w: i32 = @intFromFloat(@round(36.0 * self.scale));
+    self.layoutTabStrip(client_w, bar_h);
     const title_pad: i32 = @intFromFloat(@round(28.0 * self.scale));
-    const divider_w: i32 = @max(1, @as(i32, @intFromFloat(@round(self.scale))));
-    const divider_inset: i32 = @intFromFloat(@round(8.0 * self.scale));
-
-    const available_w = client_w - new_tab_btn_w;
-
-    const min_tab_w: i32 = @intFromFloat(@round(60.0 * self.scale));
-    const tabs_right = layoutTabRects(
-        self.tab_rects[0..self.tab_count],
-        available_w,
-        bar_h,
-        min_tab_w,
-    );
+    const hint_gap: i32 = @intFromFloat(@round(6 * self.scale));
+    const inset: i32 = @intFromFloat(@round(4.0 * self.scale));
+    const tab_area_right = self.tab_buttons[0].left;
+    const saved_dc = w32.SaveDC(mem_dc);
+    if (saved_dc == 0) return;
+    _ = w32.IntersectClipRect(mem_dc, 0, 0, tab_area_right, bar_h);
+    var shortcuts: [MAX_TABS]?Binding.Trigger = undefined;
+    tabShortcuts(self.app.config.keybind.set, shortcuts[0..self.tab_count]);
+    const common_shell = mostFrequentShell(self.tab_active_surface[0..self.tab_count]);
 
     // --- Draw each tab ---
-    for (0..self.tab_count) |i| {
+    // The floating tab is only the reorder preview. Once a hover reveals
+    // another tab, show its real position and keep the pane target visible.
+    const dragged: ?usize = if (self.drag_active and self.drag_on_strip and
+        self.drag_hover_tab != self.active_tab) @intCast(self.drag_tab) else null;
+    for (0..self.tab_count) |order| {
+        // Draw the moving tab above its neighbours.
+        const i = if (dragged) |d| (if (order + 1 == self.tab_count) d else if (order >= d) order + 1 else order) else order;
+        var visual = self.tab_rects[i];
+        if (dragged) |d| {
+            const home = self.tab_rects[d];
+            const width = home.right - home.left;
+            const left = std.math.clamp(self.drag_x - self.drag_anchor, 0, @max(0, tab_area_right - width));
+            const shift = if (i == d) left - home.left else if (i > d)
+                -std.math.clamp(left + width - visual.left, 0, width)
+            else
+                std.math.clamp(visual.right - left, 0, width);
+            visual.left += shift;
+            visual.right += shift;
+        }
         const is_active = (i == self.active_tab);
         const is_hovered = (@as(isize, @intCast(i)) == self.hover_tab);
-        const x = self.tab_rects[i].left;
-        const this_tab_w = self.tab_rects[i].right - x;
+        const x = visual.left;
+        const this_tab_w = visual.right - x;
 
-        if (is_active) {
-            _ = w32.SetDCBrushColor(mem_dc, active_bg_color);
-            _ = w32.FillRect(mem_dc, &self.tab_rects[i], brush);
-        } else if (is_hovered) {
-            _ = w32.SetDCBrushColor(mem_dc, hover_color);
-            _ = w32.FillRect(mem_dc, &self.tab_rects[i], brush);
-        }
-        if (i > 0) {
-            var divider = w32.RECT{
-                .left = x,
-                .top = divider_inset,
-                .right = x + divider_w,
-                .bottom = bar_h - divider_inset,
-            };
-            _ = w32.SetDCBrushColor(mem_dc, divider_color);
-            _ = w32.FillRect(mem_dc, &divider, brush);
+        if (visual.right <= dirty.left or x >= @min(dirty.right, tab_area_right)) continue;
+        if (is_active or is_hovered)
+            drawPill(mem_dc, visual, inset, if (is_active) active_bg_color else hover_color);
+        if (self.app.config.@"progress-style" and self.progress.state != .remove)
+            self.drawTabProgress(mem_dc, visual, self.tabProgress(i));
+
+        const flags = w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX;
+        const close_rect = self.tabCloseRect(visual);
+        var padding = title_pad;
+        if (shortcuts[i]) |trigger| {
+            var utf8: [64]u8 = undefined;
+            const bytes = Surface.formatTrigger(trigger, &utf8);
+            var label: [64]u16 = undefined;
+            const len = std.unicode.utf8ToUtf16Le(&label, utf8[0..bytes]) catch 0;
+            if (len != 0) {
+                var measured = std.mem.zeroes(w32.RECT);
+                _ = w32.DrawTextW(mem_dc, &label, @intCast(len), &measured, flags | w32.DT_CALCRECT);
+                // Keep a stable slot next to the close button, including on
+                // hover. The shortcut is part of the tab's accessory area.
+                const hint_right = close_rect.left - hint_gap;
+                const with_hint = @max(title_pad, visual.right - hint_right + measured.right + hint_gap);
+                // Let the hint give up its space before the title gets too short.
+                if (this_tab_w >= 2 * with_hint + 10 * inset) {
+                    padding = with_hint;
+                    var rect: w32.RECT = .{ .left = x + this_tab_w - with_hint, .top = 0, .right = hint_right, .bottom = bar_h };
+                    _ = w32.SetTextColor(mem_dc, hint_color);
+                    _ = w32.DrawTextW(mem_dc, &label, @intCast(len), &rect, flags | w32.DT_RIGHT);
+                }
+            }
         }
 
-        // Draw tab title text.
-        const title_len = self.tab_title_lens[i];
-        if (title_len > 0) {
+        const tab_label = self.tabLabel(i);
+        const show_admin = is_active and self.process_elevated and
+            (self.is_fullscreen or self.app.config.@"window-decoration" == .none);
+        if (tab_label.len > 0 or show_admin) {
             _ = w32.SetTextColor(mem_dc, if (is_active) active_text_color else inactive_text_color);
-            var text_rect = w32.RECT{
-                .left = x + title_pad,
+            var title = tabTitleLayout(this_tab_w, padding, inset, is_hovered);
+            if (self.tab_active_surface[i].tab_shell) |shell| {
+                if (shell.id != common_shell) {
+                    const size = 4 * inset;
+                    const leading = 2 * inset + size + inset;
+                    // On the narrowest tabs the close affordance takes
+                    // priority over the icon while the pointer is inside.
+                    if (this_tab_w - leading - title.trailing >= 8 * inset and
+                        shell.draw(mem_dc, x + 2 * inset, @divTrunc(bar_h - size, 2), size))
+                        title.leading = @max(leading, title.leading);
+                }
+            }
+            const text_rect = w32.RECT{
+                .left = x + title.leading,
                 .top = 0,
-                .right = x + this_tab_w - title_pad,
+                .right = x + this_tab_w - title.trailing,
                 .bottom = bar_h,
             };
-            _ = w32.DrawTextW(
-                mem_dc,
-                @ptrCast(&self.tab_titles[i]),
-                @intCast(title_len),
-                &text_rect,
-                w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_END_ELLIPSIS | w32.DT_NOPREFIX,
-            );
+            const color = if (is_active) active_text_color else inactive_text_color;
+            const pane = self.tab_active_surface[i];
+            const path = directoryLabels(&self.tab_titles[i], pane);
+            var label_buf: DisplayTitleBuffer = undefined;
+            const used_full = if (path != null and (!show_admin or path.?.full.len <= 255)) full: {
+                const full = if (show_admin) displayTitle(&label_buf, path.?.full, true) else path.?.full;
+                break :full self.drawTabLabel(mem_dc, text_rect, full, color, title.flags, true);
+            } else false;
+            if (!used_full) {
+                const short = if (path) |p| p.short else tab_label;
+                const label = if (show_admin) displayTitle(&label_buf, short, true) else short;
+                _ = self.drawTabLabel(mem_dc, text_rect, label, color, title.flags, false);
+            }
         }
 
         if (is_hovered) {
-            var close_rect = self.tabCloseRect(self.tab_rects[i]);
             if (self.hover_close) {
-                _ = w32.SetDCBrushColor(mem_dc, divider_color);
-                _ = w32.FillRect(mem_dc, &close_rect, brush);
+                drawPill(mem_dc, close_rect, @divTrunc(inset, 2), close_hover_color);
             }
-            _ = w32.SetTextColor(mem_dc, if (self.hover_close) active_text_color else inactive_text_color);
-            const x_char = std.unicode.utf8ToUtf16LeStringLiteral("\u{00D7}");
-            _ = w32.DrawTextW(
-                mem_dc,
-                x_char,
-                1,
-                &close_rect,
-                w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
-            );
+            if (self.app.tab_icon_renderer != null) {
+                const color = if (self.hover_close) active_text_color else inactive_text_color;
+                if (Icons.Painter.init(mem_dc, color)) |painter| {
+                    defer painter.deinit();
+                    painter.draw(.close, close_rect, 18 * self.scale);
+                }
+            }
         }
     }
+    if (self.drop_slot) |slot| {
+        const edge = if (slot < self.tab_count) self.tab_rects[slot].left else if (self.tab_count > 0) self.tab_rects[self.tab_count - 1].right else 0;
+        const x = std.math.clamp(edge, 0, @max(0, tab_area_right - inset));
+        drawPill(mem_dc, .{ .left = x, .right = x + inset, .top = inset, .bottom = bar_h - inset }, 0, active_text_color);
+    }
+    _ = w32.RestoreDC(mem_dc, saved_dc);
 
-    // --- Draw new-tab (+) button ---
-    {
-        const btn_left = tabs_right;
-        const btn_right = btn_left + new_tab_btn_w;
-        self.new_tab_rect = w32.RECT{
-            .left = btn_left,
-            .top = 0,
-            .right = btn_right,
-            .bottom = bar_h,
-        };
+    if (dirty.right > tab_area_right) self.drawNewTabControl(mem_dc, brush, bg, fg, inset);
 
-        // Hover highlight for new-tab button.
-        if (self.hover_new_tab) {
-            var btn_rect = w32.RECT{ .left = btn_left, .top = 0, .right = btn_right, .bottom = bar_h };
-            _ = w32.SetDCBrushColor(mem_dc, hover_color);
-            _ = w32.FillRect(mem_dc, &btn_rect, brush);
+    if (bitmap_bits) |bits| {
+        // GDI leaves alpha unset. DWM would add the strip RGB to its
+        // material. Supply the same fill as the WGL window and keep the
+        // rasterized tabs, labels, and controls opaque.
+        _ = w32.GdiFlush();
+        const pixels: [*]u32 = @ptrCast(@alignCast(bits));
+        const base_rgb = (@as(u32, bg.r) << 16) | (@as(u32, bg.g) << 8) | bg.b;
+        const fill = backdropTabPixel(bg, self.app.config.@"background-opacity", self.app.config.@"alpha-blending");
+        for (@intCast(dirty.top)..@intCast(dirty.bottom)) |y| {
+            const row = pixels + y * @as(usize, @intCast(client_w));
+            for (row[@intCast(dirty.left)..@intCast(dirty.right)]) |*pixel| {
+                const rgb = pixel.* & 0x00ffffff;
+                pixel.* = if (rgb == base_rgb) fill else rgb | 0xff000000;
+            }
         }
-
-        _ = w32.SetTextColor(mem_dc, inactive_text_color);
-        const plus_char = std.unicode.utf8ToUtf16LeStringLiteral("+");
-        var plus_rect = w32.RECT{
-            .left = btn_left,
-            .top = 0,
-            .right = btn_right,
-            .bottom = bar_h,
-        };
-        _ = w32.DrawTextW(
-            mem_dc,
-            plus_char,
-            1,
-            &plus_rect,
-            w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
-        );
     }
 
     // --- BitBlt to screen ---
-    _ = w32.BitBlt(hdc_screen, 0, 0, client_w, bar_h, mem_dc, 0, 0, w32.SRCCOPY);
+    _ = w32.BitBlt(hdc_screen, dirty.left, dirty.top, dirty.right - dirty.left, dirty.bottom - dirty.top, mem_dc, dirty.left, dirty.top, w32.SRCCOPY);
+}
+
+const TabTitleLayout = struct { leading: i32, trailing: i32, flags: u32 };
+
+fn mostFrequentShell(panes: []const *Surface) ?u64 {
+    var counts: [MAX_TABS]struct { id: u64, count: usize } = undefined;
+    var used: usize = 0;
+    for (panes) |pane| {
+        const shell = pane.tab_shell orelse continue;
+        for (counts[0..used]) |*entry| {
+            if (entry.id == shell.id) {
+                entry.count += 1;
+                break;
+            }
+        } else {
+            counts[used] = .{ .id = shell.id, .count = 1 };
+            used += 1;
+        }
+    }
+    if (used == 0) return null;
+    var common = counts[0];
+    for (counts[1..used]) |entry| {
+        if (entry.count > common.count) common = entry;
+    }
+    return common.id;
+}
+
+test "tab bar icons distinguish mixed known shells" {
+    var first: Surface = undefined;
+    var second: Surface = undefined;
+    first.tab_shell = .{ .id = 1, .icon = null };
+    second.tab_shell = null;
+    try std.testing.expectEqual(@as(?u64, 1), mostFrequentShell(&.{ &first, &second }));
+    second.tab_shell = first.tab_shell;
+    try std.testing.expectEqual(@as(?u64, 1), mostFrequentShell(&.{ &first, &second }));
+    second.tab_shell.?.id = 2;
+    try std.testing.expectEqual(@as(?u64, 1), mostFrequentShell(&.{ &first, &second }));
+    try std.testing.expectEqual(@as(?u64, 2), mostFrequentShell(&.{ &first, &second, &second }));
+}
+
+const DirectoryLabels = struct { full: []const u16, short: []const u16 };
+
+fn directoryLabels(title: *const TabTitle, pane: *const Surface) ?DirectoryLabels {
+    const dir = pane.reported_directory;
+    if (dir.len == 0 or title.manual or title.panes_len != 0) return null;
+    const label = title.visible();
+    const split = std.mem.lastIndexOfScalar(u16, dir, '\\') orelse return null;
+    const leaf = dir[split + 1 ..];
+    if (std.mem.eql(u16, label, dir))
+        return .{ .full = dir, .short = if (leaf.len == 0) label else leaf };
+    if (std.mem.eql(u16, label, leaf) or pane.getTitle() == null)
+        return .{ .full = dir, .short = label };
+    return null;
+}
+
+fn drawTabLabel(self: *Window, dc: w32.HDC, bounds: w32.RECT, label: []const u16, color: u32, alignment: u32, require_fit: bool) bool {
+    if (bounds.right <= bounds.left or label.len == 0) return false;
+    if (self.app.tab_text.drawShaped(dc, bounds, label, color, alignment == w32.DT_CENTER, require_fit)) return true;
+    // If DirectWrite rejected a shaped path, use its short label instead.
+    if (require_fit) for (label) |unit| {
+        if (unit > 0x7f) return false;
+    };
+    const flags = w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX;
+    var align_flags = alignment;
+    if (require_fit or alignment == w32.DT_CENTER) {
+        var measured = std.mem.zeroes(w32.RECT);
+        if (w32.DrawTextW(dc, label.ptr, @intCast(label.len), &measured, flags | w32.DT_CALCRECT) == 0 or
+            measured.right > bounds.right - bounds.left)
+        {
+            if (require_fit) return false;
+            align_flags = w32.DT_LEFT;
+        }
+    }
+    var rect = bounds;
+    return w32.DrawTextW(dc, label.ptr, @intCast(label.len), &rect, flags | align_flags) != 0;
+}
+
+test "tab bar title offers the full directory only for automatic directory titles" {
+    const wide = std.unicode.utf8ToUtf16LeStringLiteral;
+    var pane: Surface = .{ .app = undefined, .reported_directory = wide("D:\\work\\日本語") };
+    var title: TabTitle = .{};
+    title.len = @intCast(encodeTitle(&title.text, "日本語"));
+    try std.testing.expectEqualSlices(u16, pane.reported_directory, directoryLabels(&title, &pane).?.full);
+    title.len = @intCast(encodeTitle(&title.text, "D:\\work\\日本語"));
+    try std.testing.expectEqualSlices(u16, wide("日本語"), directoryLabels(&title, &pane).?.short);
+    title.manual = true;
+    try std.testing.expect(directoryLabels(&title, &pane) == null);
+    title.manual = false;
+    title.panes_len = 2;
+    try std.testing.expect(directoryLabels(&title, &pane) == null);
+    title.panes_len = 0;
+    pane.title[0..4].* = "Vim".* ++ [_]u8{0};
+    pane.title_len = 3;
+    title.len = @intCast(encodeTitle(&title.text, "Vim"));
+    try std.testing.expect(directoryLabels(&title, &pane) == null);
+}
+
+fn tabTitleLayout(width: i32, accessory: i32, inset: i32, hovered: bool) TabTitleLayout {
+    // A narrow title starts at a stable position even as the close button
+    // appears. Clip its tail so an ellipsis doesn't consume the label.
+    if (width - 2 * accessory < 10 * inset) return .{
+        .leading = 2 * inset,
+        .trailing = if (hovered) accessory else 2 * inset,
+        .flags = w32.DT_LEFT,
+    };
+    return .{ .leading = accessory, .trailing = accessory, .flags = w32.DT_CENTER };
+}
+
+test "tab bar narrow titles use the close slot until hovered" {
+    const compact = tabTitleLayout(72, 28, 4, false);
+    try std.testing.expectEqual(TabTitleLayout{ .leading = 8, .trailing = 8, .flags = w32.DT_LEFT }, compact);
+    const hover = tabTitleLayout(108, 42, 6, true);
+    try std.testing.expectEqual(TabTitleLayout{ .leading = 12, .trailing = 42, .flags = w32.DT_LEFT }, hover);
+    try std.testing.expectEqual(tabTitleLayout(160, 28, 4, true), tabTitleLayout(160, 28, 4, false));
+}
+
+fn backdropTabPixel(bg: Config.Color, opacity: f64, blending: Config.AlphaBlending) u32 {
+    const alpha: u8 = @intFromFloat(@round(std.math.clamp(opacity, 0, 1) * 255));
+    const fraction = @as(f32, @floatFromInt(alpha)) / 255;
+    var pixel = @as(u32, alpha) << 24;
+    // Match the background shader and the renderer's target format.
+    for ([_]u8{ bg.r, bg.g, bg.b }, [_]u5{ 16, 8, 0 }) |channel, shift| {
+        const input = @as(f32, @floatFromInt(channel)) / 255;
+        const linear = if (!blending.isLinear()) input else if (input <= 0.04045)
+            input / 12.92
+        else
+            std.math.pow(f32, (input + 0.055) / 1.055, 2.4);
+        const premultiplied = linear * fraction;
+        const encoded = if (build_config.renderer == .d3d12 and !blending.isLinear())
+            premultiplied
+        else if (premultiplied <= 0.0031308)
+            premultiplied * 12.92
+        else
+            1.055 * std.math.pow(f32, premultiplied, 1.0 / 2.4) - 0.055;
+        const output: u8 = @intFromFloat(@round(encoded * 255));
+        pixel |= @as(u32, output) << shift;
+    }
+    return pixel;
+}
+
+test "win32 tab bar backdrop matches the renderer background alpha and RGB" {
+    const bg: Config.Color = .{ .r = 0x22, .g = 0x31, .b = 0x44 };
+    try std.testing.expectEqual(@as(u32, 0), backdropTabPixel(bg, 0, .@"linear-corrected"));
+    try std.testing.expectEqual(@as(u32, 0x73141f2d), backdropTabPixel(bg, 0.45, .@"linear-corrected"));
+    try std.testing.expectEqual(@as(u32, 0xff223144), backdropTabPixel(bg, 1, .@"linear-corrected"));
+    const native_fill: u32 = if (build_config.renderer == .d3d12) 0x730f161f else 0x73455361;
+    try std.testing.expectEqual(native_fill, backdropTabPixel(bg, 0.45, .native));
 }
 
 /// Honor a program's CSI 8 t resize only when it owns the whole window.
@@ -1787,35 +2827,359 @@ fn showResizeOverlay(self: *Window) void {
 /// Dispatches to addTab, closeTab, or selectTabIndex depending on hit position.
 fn handleTabBarClick(self: *Window, x: i16, y: i16) void {
     if (!self.tab_bar_visible) return;
-    if (y >= self.tabBarHeight()) return;
-
-    // Check new-tab button.
-    if (x >= self.new_tab_rect.left and x < self.new_tab_rect.right) {
-        _ = self.addTab() catch |err| {
-            log.err("failed to create new tab: {}", .{err});
-            return;
-        };
+    if (self.tabButtonAt(x, y)) |button| {
+        switch (button) {
+            .new_tab => _ = self.addTab() catch |err| {
+                log.err("failed to create new tab: {}", .{err});
+                return;
+            },
+            .environment => self.openEnvironmentMenu(),
+        }
         return;
     }
 
-    // Check each tab.
-    for (0..self.tab_count) |i| {
-        const rect = self.tab_rects[i];
-        if (x >= rect.left and x < rect.right) {
-            const close_rect = self.tabCloseRect(rect);
-            if (x >= close_rect.left and x < close_rect.right and y >= close_rect.top and y < close_rect.bottom) {
-                self.closeTabByIndex(i);
-            } else {
-                self.selectTabIndex(i);
-                // Start tracking potential tab drag
-                self.drag_tab = @intCast(i);
-                self.drag_start_x = x;
-                self.drag_active = false;
-                if (self.hwnd) |h| _ = w32.SetCapture(h);
-                self.invalidateTabBar();
-            }
-            return;
+    const i = self.tabAt(x, y) orelse return;
+    if (containsPoint(self.tabCloseRect(self.tab_rects[i]), x, y)) {
+        self.closeTabByIndex(i);
+    } else {
+        const previous = self.active_tab;
+        self.selectTabIndex(i);
+        self.drag_tab = @intCast(i);
+        self.drag_previous_tab = previous;
+        self.drag_start = .{ .x = x, .y = y };
+        self.drag_anchor = x - self.tab_rects[i].left;
+        self.drag_x = x;
+        self.drag_active = false;
+        if (self.hwnd) |h| {
+            _ = w32.SetCapture(h);
+            if (GetCapture() != h) self.cancelTabDrag();
         }
+        self.invalidateTabBar();
+    }
+}
+
+const SplitDirection = SplitTree(Surface).Split.Direction;
+const PaneDrop = struct { direction: SplitDirection, rect: w32.RECT };
+const DropTarget = struct {
+    window: *Window,
+    target: union(enum) {
+        none,
+        strip: usize,
+        pane: struct { surface: *Surface, drop: PaneDrop },
+    },
+};
+
+/// The edge bands occupy at most a third of the pane. At corners prefer the
+/// closer edge relative to its band, including on very narrow or short panes.
+fn paneDrop(rect: w32.RECT, point: w32.POINT, scale: f32) ?PaneDrop {
+    if (!containsPoint(rect, point.x, point.y)) return null;
+    const width = rect.right - rect.left;
+    const height = rect.bottom - rect.top;
+    const gap: i32 = @intFromFloat(@round(5 * scale));
+    const limit: i32 = @max(1, @as(i32, @intFromFloat(@round(96 * scale))));
+    const band_x = @min(@divTrunc(width, 3), limit);
+    const band_y = @min(@divTrunc(height, 3), limit);
+    const left = point.x - rect.left;
+    const right = rect.right - 1 - point.x;
+    const top = point.y - rect.top;
+    const bottom = rect.bottom - 1 - point.y;
+    const dx = @min(left, right);
+    const dy = @min(top, bottom);
+    const x_edge = width >= gap + 2 and dx < band_x;
+    const y_edge = height >= gap + 2 and dy < band_y;
+    if (!x_edge and !y_edge) return null;
+    var preview = rect;
+    if (x_edge and (!y_edge or @as(i64, dx) * band_y <= @as(i64, dy) * band_x)) {
+        const mid = rect.left + @divTrunc(width, 2);
+        if (left <= right) preview.right = mid - @divTrunc(gap, 2) else preview.left = mid + @divTrunc(gap + 1, 2);
+        return .{ .direction = if (left <= right) .left else .right, .rect = preview };
+    }
+    const mid = rect.top + @divTrunc(height, 2);
+    if (top <= bottom) preview.bottom = mid - @divTrunc(gap, 2) else preview.top = mid + @divTrunc(gap + 1, 2);
+    return .{ .direction = if (top <= bottom) .up else .down, .rect = preview };
+}
+
+test "win32 tab drag pane edges preview the inserted split" {
+    const rect: w32.RECT = .{ .left = -300, .top = 20, .right = -100, .bottom = 120 };
+    const left = paneDrop(rect, .{ .x = -295, .y = 70 }, 1).?;
+    try std.testing.expectEqual(SplitDirection.left, left.direction);
+    try std.testing.expectEqual(@as(i32, -202), left.rect.right);
+    const right = paneDrop(rect, .{ .x = -104, .y = 70 }, 1).?;
+    try std.testing.expectEqual(SplitDirection.right, right.direction);
+    try std.testing.expectEqual(@as(i32, -197), right.rect.left);
+    const up = paneDrop(rect, .{ .x = -200, .y = 23 }, 2).?;
+    try std.testing.expectEqual(SplitDirection.up, up.direction);
+    try std.testing.expectEqual(@as(i32, 65), up.rect.bottom);
+    const down = paneDrop(rect, .{ .x = -200, .y = 118 }, 2).?;
+    try std.testing.expectEqual(SplitDirection.down, down.direction);
+    try std.testing.expectEqual(@as(i32, 75), down.rect.top);
+    try std.testing.expect(paneDrop(rect, .{ .x = -201, .y = 68 }, 1) == null);
+    try std.testing.expect(paneDrop(rect, .{ .x = -100, .y = 60 }, 1) == null);
+    try std.testing.expect(paneDrop(.{ .left = 0, .top = 0, .right = 6, .bottom = 6 }, .{ .x = 0, .y = 0 }, 1) == null);
+}
+
+fn dropTarget(self: *Window, screen: w32.POINT) ?DropTarget {
+    var hit = w32.WindowFromPoint(screen) orelse return null;
+    if (hit == self.split_preview) hit = self.preview_owner orelse return null;
+    while (w32.GetParent(hit)) |parent| hit = parent;
+    for (self.app.windows.items) |other| {
+        if (other.hwnd != hit or other.closing or other.is_quick_terminal or other.tab_count == 0) continue;
+        const none: DropTarget = .{ .window = other, .target = .none };
+        var local = screen;
+        if (w32.ScreenToClient(hit, &local) == 0) return none;
+        if (local.y < 0 or (other.tab_bar_visible and local.y < other.tabBarHeight())) {
+            if (other == self) {
+                if (local.y < 0 or local.x < 0 or local.x >= self.tab_buttons[0].left) return none;
+                return .{ .window = self, .target = .{ .strip = tabDragTarget(self.tab_rects[0..self.tab_count], local.x) } };
+            }
+            if (other.tab_count >= MAX_TABS) return none;
+            var slot: usize = 0;
+            if (other.tab_bar_visible and local.y >= 0) {
+                for (other.tab_rects[0..other.tab_count]) |rect| {
+                    if (local.x < rect.left + @divTrunc(rect.right - rect.left, 2)) break;
+                    slot += 1;
+                }
+            } else slot = other.tab_count;
+            return .{ .window = other, .target = .{ .strip = slot } };
+        }
+        if (other == self and self.drag_tab == @as(isize, @intCast(other.active_tab))) return none;
+        var panes = other.tab_trees[other.active_tab].iterator();
+        while (panes.next()) |entry| {
+            const hwnd = entry.view.hwnd orelse continue;
+            var rect: w32.RECT = undefined;
+            if (w32.IsWindowVisible_(hwnd) == 0 or w32.GetWindowRect(hwnd, &rect) == 0) continue;
+            if (paneDrop(rect, screen, other.scale)) |drop|
+                return .{ .window = other, .target = .{ .pane = .{ .surface = entry.view, .drop = drop } } };
+        }
+        return none;
+    }
+    return null;
+}
+
+fn showDropTarget(self: *Window, target: ?DropTarget) void {
+    for (self.app.windows.items) |other| {
+        const slot: ?usize = if (target) |t| (if (t.window == other and other != self and t.target == .strip) t.target.strip else null) else null;
+        if (other.drop_slot != slot) {
+            other.drop_slot = slot;
+            other.invalidateTabBar();
+        }
+    }
+    if (target) |t| if (t.target == .pane) {
+        const rect = t.target.pane.drop.rect;
+        if (self.preview_rect) |old| if (std.meta.eql(old, rect) and self.preview_owner == t.window.hwnd) return;
+        if (self.split_preview == null) {
+            self.split_preview = w32.CreateWindowExW(w32.WS_EX_NOACTIVATE | w32.WS_EX_TOOLWINDOW | w32.WS_EX_TRANSPARENT | w32.WS_EX_LAYERED, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral(""), w32.WS_POPUP, 0, 0, 0, 0, self.hwnd, null, self.app.hinstance, null) orelse return;
+            _ = w32.SetLayeredWindowAttributes(self.split_preview.?, 0, 90, w32.LWA_ALPHA);
+        }
+        self.preview_rect = rect;
+        self.preview_owner = t.window.hwnd;
+        _ = w32.SetWindowPos(self.split_preview.?, w32.HWND_TOPMOST, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, w32.SWP_NOACTIVATE | w32.SWP_SHOWWINDOW);
+        return;
+    };
+    if (self.preview_rect != null) {
+        self.preview_rect = null;
+        self.preview_owner = null;
+        if (self.split_preview) |popup| _ = w32.ShowWindow(popup, w32.SW_HIDE);
+    }
+}
+
+fn setDragHover(self: *Window, idx: ?usize) void {
+    if (self.drag_hover_tab == idx) return;
+    const hwnd = self.hwnd orelse return;
+    _ = w32.KillTimer(hwnd, TAB_HOVER_TIMER);
+    self.drag_hover_tab = idx;
+    if (idx) |tab| if (tab != self.active_tab) {
+        _ = w32.SetTimer(hwnd, TAB_HOVER_TIMER, 350, null);
+    };
+}
+
+fn showDraggedTitle(self: *Window, point: w32.POINT, on_strip: bool) void {
+    if (on_strip) {
+        if (self.drag_label) |label| _ = w32.ShowWindow(label, w32.SW_HIDE);
+        return;
+    }
+    if (self.drag_label == null) {
+        const i: usize = @intCast(self.drag_tab);
+        var title: [257]u16 = undefined;
+        const visible = self.tabLabel(i);
+        const len = visible.len;
+        @memcpy(title[0..len], visible);
+        title[len] = 0;
+        const label = w32.CreateWindowExW(w32.WS_EX_NOACTIVATE | w32.WS_EX_TOOLWINDOW | w32.WS_EX_TRANSPARENT | w32.WS_EX_LAYERED, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), @ptrCast(&title), w32.WS_POPUP | w32.WS_BORDER | w32.SS_CENTER | w32.SS_CENTERIMAGE | w32.SS_NOPREFIX | w32.SS_ENDELLIPSIS, 0, 0, 0, 0, self.hwnd, null, self.app.hinstance, null) orelse return;
+        self.drag_label = label;
+        _ = w32.SetLayeredWindowAttributes(label, 0, 230, w32.LWA_ALPHA);
+        if (self.tab_font) |font| _ = w32.SendMessageW(label, w32.WM_SETFONT, @intFromPtr(font), 0);
+    }
+    const gap: i32 = @intFromFloat(14 * self.scale);
+    _ = w32.SetWindowPos(self.drag_label.?, w32.HWND_TOPMOST, point.x + gap, point.y + gap, @intFromFloat(184 * self.scale), @intFromFloat(32 * self.scale), w32.SWP_NOACTIVATE | w32.SWP_SHOWWINDOW);
+}
+
+pub fn cancelTabDrag(self: *Window) void {
+    self.endTabDrag(true);
+}
+
+fn endTabDrag(self: *Window, restore: bool) void {
+    if (self.drag_tab < 0) return;
+    const tab = self.drag_previous_tab;
+    self.setDragHover(null);
+    self.showDropTarget(null);
+    self.drag_tab = -1;
+    self.drag_active = false;
+    self.drag_on_strip = false;
+    if (self.split_preview) |popup| {
+        self.split_preview = null;
+        _ = w32.DestroyWindow(popup);
+    }
+    if (self.drag_label) |label| {
+        self.drag_label = null;
+        _ = w32.DestroyWindow(label);
+    }
+    self.invalidateTabBar();
+    if (self.hwnd) |hwnd| {
+        if (GetCapture() == hwnd) _ = w32.ReleaseCapture();
+        if (restore and !self.closing and tab < self.tab_count and self.active_tab != tab)
+            self.showTab(tab, w32.GetForegroundWindow() == hwnd);
+    }
+}
+
+fn tabDragStarted(start: w32.POINT, point: w32.POINT, scale: f32) bool {
+    const threshold: i64 = @intFromFloat(@ceil(5 * scale));
+    return @abs(@as(i64, point.x) - start.x) > threshold or
+        @abs(@as(i64, point.y) - start.y) > threshold;
+}
+
+fn beginTabDrag(self: *Window, point: w32.POINT) void {
+    if (self.drag_active or !tabDragStarted(self.drag_start, point, self.scale)) return;
+    self.drag_active = true;
+    // Pressing an inactive tab selects it for a normal click. On a drag,
+    // restore the pane that was under the pointer before the press.
+    if (self.drag_previous_tab < self.tab_count and self.active_tab != self.drag_previous_tab)
+        self.showTab(self.drag_previous_tab, false);
+}
+
+fn finishTabDrag(self: *Window, point: w32.POINT) void {
+    if (self.drag_tab < 0) return;
+    const tab: usize = @intCast(self.drag_tab);
+    self.beginTabDrag(point);
+    if (!self.drag_active or tab >= self.tab_count) {
+        self.endTabDrag(false);
+        return;
+    }
+
+    const hwnd = self.hwnd orelse return;
+    var position = point;
+    var outer: w32.RECT = undefined;
+    if (w32.ClientToScreen(hwnd, &position) == 0 or w32.GetWindowRect(hwnd, &outer) == 0) {
+        self.cancelTabDrag();
+        return;
+    }
+    const target = self.dropTarget(position);
+    const previous = self.drag_previous_tab;
+    self.endTabDrag(if (target) |t| t.window != self or t.target != .pane else true);
+    if (target) |t| {
+        switch (t.target) {
+            .none => {},
+            .strip => |slot| if (t.window == self) {
+                if (self.active_tab != tab) self.showTab(tab, w32.GetForegroundWindow() == hwnd);
+                self.moveTabTo(tab, slot);
+            } else {
+                self.transferTab(tab, t.window, slot) catch |err| log.err("failed to merge dragged tab: {}", .{err});
+            },
+            .pane => |pane| self.mergeTabIntoPane(tab, t.window, pane.surface, pane.drop.direction) catch |err| {
+                if (t.window == self and previous < self.tab_count) self.showTab(previous, w32.GetForegroundWindow() == hwnd);
+                log.err("failed to split dragged tab: {}", .{err});
+            },
+        }
+        return;
+    }
+    if (containsPoint(outer, position.x, position.y)) return;
+
+    if (w32.MonitorFromPoint(position, w32.MONITOR_DEFAULTTONEAREST)) |handle| {
+        var monitor: w32.MONITORINFO = undefined;
+        monitor.cbSize = @sizeOf(w32.MONITORINFO);
+        if (w32.GetMonitorInfoW(handle, &monitor) != 0) {
+            // Keep a usable corner of the title bar on the destination monitor.
+            const margin: i32 = @intFromFloat(@ceil(32 * self.scale));
+            position = clampTabDrop(position, monitor.rcWork, margin);
+        }
+    }
+    _ = self.moveTabToNewWindowAt(self.tab_active_surface[tab], position) catch |err|
+        log.err("failed to detach dragged tab: {}", .{err});
+}
+
+fn clampTabDrop(point: w32.POINT, work: w32.RECT, margin: i32) w32.POINT {
+    return .{
+        .x = std.math.clamp(point.x, work.left, @max(work.left, work.right - margin)),
+        .y = std.math.clamp(point.y, work.top, @max(work.top, work.bottom - margin)),
+    };
+}
+
+test "win32 tab drag threshold uses both axes and DPI" {
+    const start: w32.POINT = .{ .x = 100, .y = 20 };
+    try std.testing.expect(!tabDragStarted(start, .{ .x = 93, .y = 14 }, 1.5));
+    try std.testing.expect(tabDragStarted(start, .{ .x = 91, .y = 20 }, 1.5));
+    try std.testing.expect(tabDragStarted(start, .{ .x = 100, .y = 29 }, 1.5));
+}
+
+test "win32 tab drag drop stays reachable on a negative-coordinate monitor" {
+    const work: w32.RECT = .{ .left = -1280, .top = -200, .right = 0, .bottom = 760 };
+    try std.testing.expectEqual(w32.POINT{ .x = -640, .y = 50 }, clampTabDrop(.{ .x = -640, .y = 50 }, work, 48));
+    try std.testing.expectEqual(w32.POINT{ .x = -48, .y = 712 }, clampTabDrop(.{ .x = 0, .y = 750 }, work, 48));
+}
+
+fn openEnvironmentMenu(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    var arena = std.heap.ArenaAllocator.init(self.app.core_app.alloc);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const environments = Profiles.discover(alloc) catch |err| failed: {
+        log.err("failed to discover shell profiles: {t}", .{err});
+        break :failed &.{};
+    };
+    const icons = alloc.alloc(?w32.HANDLE, environments.len) catch return;
+    @memset(icons, null);
+    defer for (icons) |icon| {
+        if (icon) |bitmap| _ = w32.DeleteObject(bitmap);
+    };
+    const menu = w32.CreatePopupMenu() orelse return;
+    defer _ = w32.DestroyMenu(menu);
+
+    for (environments, 0..) |environment, i| {
+        const name = std.mem.replaceOwned(u8, alloc, environment.name, "&", "&&") catch return;
+        const label = std.unicode.utf8ToUtf16LeAllocZ(alloc, name) catch continue;
+        const flags = if (self.tab_count >= MAX_TABS) w32.MF_GRAYED else w32.MF_STRING;
+        if (w32.AppendMenuW(menu, flags, i + 1, label) != 0) {
+            icons[i] = Profiles.attachIcon(alloc, menu, @intCast(i + 1), environment, self.scale);
+        }
+    }
+    const settings_id = environments.len + 1;
+    if (environments.len != 0) _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, settings_id, lang.wide("Settings"));
+
+    const anchor = self.tab_buttons[@backingInt(TabButton.environment)];
+    var pt: w32.POINT = .{ .x = anchor.left, .y = anchor.bottom };
+    if (w32.ClientToScreen(hwnd, &pt) == 0) return;
+    const owner: isize = @bitCast(@intFromPtr(self));
+    const choice = w32.TrackPopupMenuEx(menu, w32.TPM_LEFTALIGN | w32.TPM_TOPALIGN | w32.TPM_RETURNCMD, pt.x, pt.y, hwnd, null);
+    // The native menu runs a nested message loop; the owner may have closed.
+    if (w32.GetWindowLongPtrW(hwnd, w32.GWLP_USERDATA) != owner or self.closing) return;
+    if (choice == settings_id) {
+        Settings.open(self.app, hwnd);
+    } else if (choice > 0 and choice <= environments.len) {
+        const profile = environments[@intCast(choice - 1)];
+        const command: Config.Command = .{ .direct = profile.argv };
+        _ = self.addTabWithOptions(.{
+            .context = .tab,
+            .command = &command,
+            .profile = profile,
+            .working_directory = profile.directory,
+            // Shell integration can add flags that change the meaning of
+            // a profile's command (for example PowerShell's -Command).
+            .preserve_command = profile.argv.len > 1,
+        }) catch |err| {
+            log.err("failed to open environment err={}", .{err});
+            return;
+        };
     }
 }
 
@@ -1832,7 +3196,6 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
     const saved_tree = self.tab_trees[from];
     const saved_surface = self.tab_active_surface[from];
     const saved_title = self.tab_titles[from];
-    const saved_title_len = self.tab_title_lens[from];
 
     if (from < to) {
         // Shift left: move [from+1..to+1] to [from..to]
@@ -1841,7 +3204,6 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
             self.tab_trees[i] = self.tab_trees[i + 1];
             self.tab_active_surface[i] = self.tab_active_surface[i + 1];
             self.tab_titles[i] = self.tab_titles[i + 1];
-            self.tab_title_lens[i] = self.tab_title_lens[i + 1];
         }
     } else {
         // Shift right: move [to..from] to [to+1..from+1]
@@ -1850,7 +3212,6 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
             self.tab_trees[i] = self.tab_trees[i - 1];
             self.tab_active_surface[i] = self.tab_active_surface[i - 1];
             self.tab_titles[i] = self.tab_titles[i - 1];
-            self.tab_title_lens[i] = self.tab_title_lens[i - 1];
         }
     }
 
@@ -1858,7 +3219,6 @@ fn moveTabTo(self: *Window, from: usize, to: usize) void {
     self.tab_trees[to] = saved_tree;
     self.tab_active_surface[to] = saved_surface;
     self.tab_titles[to] = saved_title;
-    self.tab_title_lens[to] = saved_title_len;
 
     self.active_tab = to;
     self.invalidateTabBar();
@@ -1881,33 +3241,27 @@ fn handleTabBarMouseMove(self: *Window, x: i16, y: i16) void {
         self.tracking_mouse = true;
     }
 
-    var new_hover: isize = -1;
-    var new_close = false;
-    var new_new_tab = false;
+    const tab = self.tabAt(x, y);
+    const new_hover: isize = if (tab) |i| @intCast(i) else -1;
+    const new_close = if (tab) |i| containsPoint(self.tabCloseRect(self.tab_rects[i]), x, y) else false;
+    const new_button = self.tabButtonAt(x, y);
 
-    if (y < self.tabBarHeight()) {
-        // Check new-tab button.
-        if (x >= self.new_tab_rect.left and x < self.new_tab_rect.right) {
-            new_new_tab = true;
-        } else {
-            // Check tabs.
-            for (0..self.tab_count) |i| {
-                const rect = self.tab_rects[i];
-                if (x >= rect.left and x < rect.right) {
-                    new_hover = @intCast(i);
-                    const close_rect = self.tabCloseRect(rect);
-                    new_close = x >= close_rect.left and x < close_rect.right and y >= close_rect.top and y < close_rect.bottom;
-                    break;
-                }
-            }
-        }
-    }
-
-    if (new_hover != self.hover_tab or new_close != self.hover_close or new_new_tab != self.hover_new_tab) {
+    if (new_hover != self.hover_tab or new_close != self.hover_close or new_button != self.hover_button) {
+        self.invalidateTabHover();
         self.hover_tab = new_hover;
         self.hover_close = new_close;
-        self.hover_new_tab = new_new_tab;
-        self.invalidateTabBar();
+        self.hover_button = new_button;
+        self.invalidateTabHover();
+    }
+}
+
+fn invalidateTabHover(self: *const Window) void {
+    const hwnd = self.hwnd orelse return;
+    if (self.hover_tab >= 0 and self.hover_tab < @as(isize, @intCast(self.tab_count))) {
+        _ = w32.InvalidateRect(hwnd, &self.tab_rects[@intCast(self.hover_tab)], 0);
+    }
+    if (self.hover_button) |button| {
+        _ = w32.InvalidateRect(hwnd, &self.tab_buttons[@backingInt(button)], 0);
     }
 }
 
@@ -1924,26 +3278,19 @@ fn handleTabBarRightClick(self: *Window, x: i16, y: i16) void {
     if (y >= self.tabBarHeight()) return;
 
     // Hit-test to find which tab was right-clicked.
-    var clicked_tab: ?usize = null;
-    for (0..self.tab_count) |i| {
-        const rect = self.tab_rects[i];
-        if (x >= rect.left and x < rect.right) {
-            clicked_tab = i;
-            break;
-        }
-    }
+    const clicked_tab = self.tabAt(x, y);
 
     // If clicked on empty area (not a tab), only show "New Tab".
     const menu = w32.CreatePopupMenu() orelse return;
     defer _ = w32.DestroyMenu(menu);
 
     if (clicked_tab) |tab| {
-        _ = w32.AppendMenuW(menu, w32.MF_STRING, TAB_CTX_CLOSE, std.unicode.utf8ToUtf16LeStringLiteral("Close Tab"));
-        _ = w32.AppendMenuW(menu, if (self.tab_count > 1) w32.MF_STRING else w32.MF_GRAYED, TAB_CTX_CLOSE_OTHERS, std.unicode.utf8ToUtf16LeStringLiteral("Close Other Tabs"));
-        _ = w32.AppendMenuW(menu, if (tab + 1 < self.tab_count) w32.MF_STRING else w32.MF_GRAYED, TAB_CTX_CLOSE_RIGHT, std.unicode.utf8ToUtf16LeStringLiteral("Close Tabs to the Right"));
+        _ = w32.AppendMenuW(menu, w32.MF_STRING, TAB_CTX_CLOSE, lang.wide("Close Tab"));
+        _ = w32.AppendMenuW(menu, if (self.tab_count > 1) w32.MF_STRING else w32.MF_GRAYED, TAB_CTX_CLOSE_OTHERS, lang.wide("Close Other Tabs"));
+        _ = w32.AppendMenuW(menu, if (tab + 1 < self.tab_count) w32.MF_STRING else w32.MF_GRAYED, TAB_CTX_CLOSE_RIGHT, lang.wide("Close Tabs to the Right"));
         _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
     }
-    _ = w32.AppendMenuW(menu, w32.MF_STRING, TAB_CTX_NEW_TAB, std.unicode.utf8ToUtf16LeStringLiteral("New Tab"));
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, TAB_CTX_NEW_TAB, lang.wide("New Tab"));
 
     // Convert client coords to screen coords for the popup.
     var pt = w32.POINT{ .x = @intCast(x), .y = @intCast(y) };
@@ -1996,11 +3343,11 @@ fn handleTabBarRightClick(self: *Window, x: i16, y: i16) void {
 /// Handle WM_MOUSELEAVE: reset all hover state and repaint.
 fn handleTabBarMouseLeave(self: *Window) void {
     self.tracking_mouse = false;
-    if (self.hover_tab != -1 or self.hover_new_tab) {
+    if (self.hover_tab != -1 or self.hover_button != null) {
+        self.invalidateTabHover();
         self.hover_tab = -1;
         self.hover_close = false;
-        self.hover_new_tab = false;
-        self.invalidateTabBar();
+        self.hover_button = null;
     }
 }
 
@@ -2030,13 +3377,11 @@ pub fn startTabRename(self: *Window, tab_idx: usize) void {
         };
     };
 
-    // tab_titles stores only `tab_title_lens` valid u16s; the rest is
-    // uninitialized. CreateWindowExW reads a NUL-terminated wide string,
-    // so a NUL-terminated copy avoids the Edit displaying garbage past
-    // the real title.
+    // CreateWindowExW requires a NUL-terminated title.
     var title_buf: [257]u16 = undefined;
-    const tlen = self.tab_title_lens[tab_idx];
-    @memcpy(title_buf[0..tlen], self.tab_titles[tab_idx][0..tlen]);
+    const visible = self.tabLabel(tab_idx);
+    const tlen = visible.len;
+    @memcpy(title_buf[0..tlen], visible);
     title_buf[tlen] = 0;
 
     // Create an Edit control overlaid on the tab
@@ -2069,26 +3414,7 @@ pub fn startTabRename(self: *Window, tab_idx: usize) void {
         null,
     );
 
-    // Set font — stored for cleanup
-    self.rename_font = w32.CreateFontW(
-        -@as(i32, @intFromFloat(@round(12.0 * self.scale))),
-        0,
-        0,
-        0,
-        400,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
-    );
-    if (self.rename_font) |f| {
-        _ = w32.SendMessageW(edit, w32.WM_SETFONT, @intFromPtr(f), 1);
-    }
+    self.ui_font.replace(&self.rename_font, 12, self.scale, &.{edit});
 
     // Select all text
     _ = w32.SendMessageW(edit, 0x00B1, 0, -1); // EM_SETSEL(0, -1)
@@ -2132,10 +3458,13 @@ pub fn finishTabRename(self: *Window) void {
             self.window_title_override_len = len;
         }
         self.updateWindowTitle();
-    } else if (wlen > 0) {
+    } else if (wlen == 0) {
+        self.setTabTitle(self.tab_active_surface[tab_idx], "");
+    } else if (!std.mem.eql(u16, self.tabLabel(tab_idx), wbuf[0..wlen])) {
+        self.tab_titles[tab_idx].manual = true;
         const len: u16 = @intCast(@min(wlen, 255));
-        @memcpy(self.tab_titles[tab_idx][0..len], wbuf[0..len]);
-        self.tab_title_lens[tab_idx] = len;
+        @memcpy(self.tab_titles[tab_idx].text[0..len], wbuf[0..len]);
+        self.tab_titles[tab_idx].len = len;
         if (tab_idx == self.active_tab) self.updateWindowTitle();
     }
 
@@ -2201,10 +3530,8 @@ pub fn confirmCloseIfNeeded(self: *Window) bool {
 
     const result = w32.MessageBoxW(
         self.hwnd,
-        std.unicode.utf8ToUtf16LeStringLiteral(
-            "Processes are still running in this window.\nClose anyway?",
-        ),
-        std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
+        lang.wide("Processes are still running in this window.\nClose anyway?"),
+        std.unicode.utf8ToUtf16LeStringLiteral("Madotty"),
         w32.MB_OKCANCEL | w32.MB_ICONWARNING | w32.MB_DEFBUTTON2,
     );
     return result == w32.IDOK;
@@ -2243,6 +3570,11 @@ fn cleanupAllSurfaces(self: *Window) void {
 /// Surfaces are already cleaned up by close() before DestroyWindow.
 fn onDestroy(self: *Window) void {
     const app = self.app;
+    self.endTabDrag(false);
+    for (app.windows.items) |source| {
+        if (source.preview_rect != null and source.preview_owner == self.hwnd)
+            source.showDropTarget(null);
+    }
     self.tab_overview.deinit();
 
     // Quick terminal windows are managed by QuickTerminal, not the windows list.
@@ -2297,6 +3629,13 @@ pub fn windowWndProc(
     else
         return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
 
+    if (window.app.taskbar_created_message != 0 and msg == window.app.taskbar_created_message) {
+        window.taskbar_ready = true;
+        window.taskbar_progress = Progress{};
+        if (window.progress.state != .remove) window.queueProgressRefresh();
+        return 0;
+    }
+
     // Once the last tab is closed and WM_CLOSE has been posted, drop any
     // input messages still queued for this window. They could otherwise
     // mutate state (allocate, capture mouse, start drags) on a window
@@ -2324,6 +3663,19 @@ pub fn windowWndProc(
     };
 
     switch (msg) {
+        w32.WM_SETTINGCHANGE => {
+            // Windows broadcasts the app theme change with wParam == 0.
+            // Check the actual preference without depending on lParam text.
+            if (!window.closing and wparam == 0) window.app.queueColorSchemeCheck();
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        w32.WM_SYSCOMMAND => {
+            if (wparam & 0xFFF0 == SC_SETTINGS and !window.closing) {
+                Settings.open(window.app, hwnd);
+                return 0;
+            }
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         WM_TOGGLE_TAB_OVERVIEW => {
             window.tab_overview.toggle(window) catch |err| {
                 log.warn("unable to open tab overview err={}", .{err});
@@ -2333,6 +3685,10 @@ pub fn windowWndProc(
         WM_REFRESH_TAB_OVERVIEW => {
             window.overview_refresh_pending = false;
             window.tab_overview.refresh();
+            return 0;
+        },
+        WM_REFRESH_PROGRESS => {
+            window.refreshProgress(hwnd);
             return 0;
         },
         w32.WM_GETOBJECT => {
@@ -2346,6 +3702,15 @@ pub fn windowWndProc(
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_TIMER => {
+            if (wparam == TAB_HOVER_TIMER) {
+                _ = w32.KillTimer(hwnd, TAB_HOVER_TIMER);
+                if (window.drag_hover_tab) |idx| if (window.drag_active and idx < window.tab_count and
+                    idx != window.active_tab and GetCapture() == hwnd)
+                {
+                    window.showTab(idx, false);
+                };
+                return 0;
+            }
             if (wparam == RESIZE_OVERLAY_TIMER_ID) {
                 if (window.resize_overlay_hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
                 _ = w32.KillTimer(hwnd, RESIZE_OVERLAY_TIMER_ID);
@@ -2355,6 +3720,9 @@ pub fn windowWndProc(
         },
 
         w32.WM_CTLCOLORSTATIC => {
+            if (window.split_preview) |preview| if (@intFromPtr(preview) == @as(usize, @bitCast(lparam))) {
+                if (GetSysColorBrush(13)) |brush| return @bitCast(@intFromPtr(brush)); // COLOR_HIGHLIGHT
+            };
             // Dark theming for the STATIC popups owned by this window
             // (hovered-URL link preview, resize overlay). Static controls
             // send this to their owner, i.e. here — not to surfaceWndProc.
@@ -2375,6 +3743,23 @@ pub fn windowWndProc(
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
 
+        w32.WM_DPICHANGED => {
+            const dpi: u16 = @truncate(wparam);
+            if (dpi == 0) return 0;
+            window.scale = @as(f32, @floatFromInt(dpi)) / 96;
+            window.refreshWindowFonts();
+            for (window.tab_trees[0..window.tab_count]) |*tree| {
+                var it = tree.iterator();
+                while (it.next()) |entry| entry.view.applyDpiScale(window.scale);
+            }
+            if (lparam != 0) {
+                const rect: *const w32.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                _ = w32.SetWindowPos(hwnd, null, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, w32.SWP_NOZORDER | w32.SWP_NOACTIVATE);
+            }
+            window.layoutSplits();
+            window.invalidateTabBar();
+            return 0;
+        },
         w32.WM_SIZE => {
             // Minimizing does not hide child surface HWNDs, so tell the core
             // to stop rendering the active tab while minimized. Return early:
@@ -2474,6 +3859,11 @@ pub fn windowWndProc(
             window.paintTabBar();
             return 0;
         },
+        w32.WM_DWMCOMPOSITIONCHANGED => {
+            window.applyBackground();
+            window.invalidateTabBar();
+            return 0;
+        },
         w32.WM_COMMAND => {
             const notification: u16 = @intCast((wparam >> 16) & 0xFFFF);
             const control_id: u16 = @intCast(wparam & 0xFFFF);
@@ -2514,26 +3904,24 @@ pub fn windowWndProc(
                 window.endDividerDrag();
                 return 0;
             }
-            if (window.drag_tab >= 0) {
-                window.drag_tab = -1;
-                window.drag_active = false;
-                _ = w32.ReleaseCapture();
-                return 0;
-            }
+            window.finishTabDrag(.{ .x = @as(i16, @truncate(lparam)), .y = @as(i16, @truncate(lparam >> 16)) });
             return 0;
+        },
+        WM_CAPTURECHANGED => {
+            window.cancelTabDrag();
+            window.dragging_split = false;
+            return 0;
+        },
+        WM_CANCELMODE => {
+            window.cancelTabDrag();
+            window.endDividerDrag();
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_LBUTTONDBLCLK => {
             const x: i32 = @as(i16, @truncate(lparam & 0xFFFF));
             const y: i32 = @as(i16, @truncate((lparam >> 16) & 0xFFFF));
-            // Double-click on tab bar starts inline rename
             if (y < window.tabBarHeight()) {
-                for (0..window.tab_count) |i| {
-                    const rect = window.tab_rects[i];
-                    if (x >= rect.left and x < rect.right) {
-                        window.startTabRename(i);
-                        return 0;
-                    }
-                }
+                if (window.tabAt(x, y)) |i| window.startTabRename(i);
                 return 0;
             }
             if (window.hitTestDivider(x, y)) |hit| {
@@ -2561,19 +3949,21 @@ pub fn windowWndProc(
             }
             // Handle tab drag reorder
             if (window.drag_tab >= 0) {
-                const xi16: i16 = @truncate(x);
-                const dx = if (xi16 > window.drag_start_x) xi16 - window.drag_start_x else window.drag_start_x - xi16;
-                if (!window.drag_active and dx > 5) {
-                    window.drag_active = true;
-                }
-                if (window.drag_active and window.tab_count > 1) {
-                    const from: usize = @intCast(window.drag_tab);
-                    const target = tabDragTarget(window.tab_rects[0..window.tab_count], x);
-                    if (target != from) {
-                        window.moveTabTo(from, target);
-                        window.drag_tab = @intCast(target);
-                        if (window.hwnd) |h| _ = w32.UpdateWindow(h);
+                window.beginTabDrag(.{ .x = x, .y = y });
+                if (window.drag_active) {
+                    window.drag_x = x;
+                    var screen: w32.POINT = .{ .x = x, .y = y };
+                    if (w32.ClientToScreen(hwnd, &screen) != 0) {
+                        const target = window.dropTarget(screen);
+                        window.showDropTarget(target);
+                        const on_strip = y >= 0 and y < window.tabBarHeight() and x >= 0 and x < window.tab_buttons[0].left;
+                        window.drag_on_strip = on_strip;
+                        const hover = if (on_strip) window.tabAt(x, y) else null;
+                        window.setDragHover(if (hover == @as(usize, @intCast(window.drag_tab))) null else hover);
+                        const over_pane = if (target) |t| t.target == .pane else false;
+                        window.showDraggedTitle(screen, on_strip or over_pane);
                     }
+                    window.invalidateTabBar();
                 }
                 return 0;
             }

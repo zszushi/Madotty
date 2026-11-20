@@ -649,6 +649,18 @@ const VTEvent = struct {
 
         // Add additional fields to metadata
         switch (osc) {
+            .iterm_report_cell_size => |ending| {
+                try encodeMetadataSingle(alloc, md, "terminator", ending);
+            },
+            .iterm_inline_image => |packet| {
+                try md.put("packet", @tagName(packet));
+                const payload_len = switch (packet) {
+                    .file => |file| file.data.len,
+                    .file_part => |part| part.len,
+                    .multipart_file, .file_end, .cancel => 0,
+                };
+                if (payload_len != 0) try encodeMetadataSingle(alloc, md, "base64 bytes", payload_len);
+            },
             inline else => |v, tag| if (tag == osc) {
                 try encodeMetadata(alloc, md, v);
             },

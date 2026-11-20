@@ -126,6 +126,10 @@ pub const Action = union(enum) {
         params: []const u16 = &.{},
         final: u8,
 
+        pub fn isSixel(self: DCS) bool {
+            return self.final == 'q' and self.intermediates.len == 0 and self.params.len <= 3;
+        }
+
         pub const C = extern struct {
             intermediates: [*]const u8,
             intermediates_len: usize,
@@ -210,6 +214,8 @@ pub const MAX_PARAMS = 24;
 
 /// Current state of the state machine
 state: State,
+/// Sixel data is ASCII, so a raw C1 ST can end it without splitting UTF-8.
+sixel_passthrough: bool = false,
 
 /// Intermediate tracking.
 intermediates: [MAX_INTERMEDIATE]u8,
@@ -255,6 +261,10 @@ pub fn deinit(self: *Parser) void {
 /// Up to 3 actions may need to be executed -- in order -- representing
 /// the state exit, transition, and entry actions.
 pub fn next(self: *Parser, c: u8) [3]?Action {
+    if (c == 0x9C and self.state == .dcs_passthrough and self.sixel_passthrough) {
+        self.state = .ground;
+        return .{ .{ .dcs_unhook = {} }, null, null };
+    }
     const effect = table[c][@backingInt(self.state)];
 
     // log.info("next: {x}", .{c});
@@ -295,6 +305,7 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
                 break :osc_string null;
             },
             .dcs_passthrough => dcs_hook: {
+                self.sixel_passthrough = false;
                 // Ignore too many parameters
                 if (self.params_idx >= MAX_PARAMS) break :dcs_hook null;
                 // Finalize parameters
@@ -302,13 +313,13 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
                     self.params[self.params_idx] = self.param_acc;
                     self.params_idx += 1;
                 }
-                break :dcs_hook .{
-                    .dcs_hook = .{
-                        .intermediates = self.intermediates[0..self.intermediates_idx],
-                        .params = self.params[0..self.params_idx],
-                        .final = c,
-                    },
+                const dcs: Action.DCS = .{
+                    .intermediates = self.intermediates[0..self.intermediates_idx],
+                    .params = self.params[0..self.params_idx],
+                    .final = c,
                 };
+                self.sixel_passthrough = dcs.isSixel();
+                break :dcs_hook .{ .dcs_hook = dcs };
             },
             .sos_pm_apc_string => Action{ .apc_start = {} },
             else => null,

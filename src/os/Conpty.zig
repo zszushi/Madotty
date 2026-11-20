@@ -11,11 +11,15 @@ const HMODULE = std.os.windows.HMODULE;
 const Create = *const @TypeOf(windows.exp.kernel32.CreatePseudoConsole);
 const Resize = *const @TypeOf(windows.exp.kernel32.ResizePseudoConsole);
 const Close = *const @TypeOf(windows.exp.kernel32.ClosePseudoConsole);
+const Pack = *const fn (windows.HANDLE, windows.HANDLE, windows.HANDLE, *?windows.HPCON) callconv(.winapi) windows.HRESULT;
+const Release = *const fn (windows.HPCON) callconv(.winapi) windows.HRESULT;
 
 module: ?HMODULE = null,
 create: Create = &windows.exp.kernel32.CreatePseudoConsole,
 resize: Resize = &windows.exp.kernel32.ResizePseudoConsole,
 close: Close = &windows.exp.kernel32.ClosePseudoConsole,
+pack: ?Pack = null,
+release_reference: ?Release = null,
 
 pub const Error = error{
     Unexpected,
@@ -23,6 +27,17 @@ pub const Error = error{
     ConptyLoadFailed,
     ConptyMissingExport,
     ConptyHostMissing,
+    ConptyPackUnavailable,
+    ConptyPackFailed,
+    ConptyReleaseUnavailable,
+    ConptyReleaseFailed,
+    InvalidHandoffHandle,
+};
+
+pub const HandoffHandles = struct {
+    server: windows.HANDLE,
+    reference: windows.HANDLE,
+    signal: windows.HANDLE,
 };
 
 pub fn init() Error!Conpty {
@@ -70,7 +85,50 @@ pub fn init() Error!Conpty {
         .create = try resolve(module, Create, "ConptyCreatePseudoConsole"),
         .resize = try resolve(module, Resize, "ConptyResizePseudoConsole"),
         .close = try resolve(module, Close, "ConptyClosePseudoConsole"),
+        .pack = resolveOptional(module, Pack, "ConptyPackPseudoConsole"),
+        .release_reference = resolveOptional(module, Release, "ConptyReleasePseudoConsole"),
     };
+}
+
+/// Duplicate the RPC-borrowed handles before their call ends. On success
+/// the bundled backend takes ownership of the duplicates in its HPCON.
+pub fn packHandoff(self: Conpty, handles: HandoffHandles) Error!windows.HPCON {
+    const pack = self.pack orelse return error.ConptyPackUnavailable;
+    if (self.release_reference == null) return error.ConptyReleaseUnavailable;
+    const server = try duplicateHandoffHandle(handles.server);
+    errdefer _ = windows.exp.kernel32.CloseHandle(server);
+    const reference = try duplicateHandoffHandle(handles.reference);
+    errdefer _ = windows.exp.kernel32.CloseHandle(reference);
+    const signal = try duplicateHandoffHandle(handles.signal);
+    errdefer _ = windows.exp.kernel32.CloseHandle(signal);
+
+    var native: ?windows.HPCON = null;
+    const result = pack(server, reference, signal, &native);
+    if (result != windows.S_OK or native == null) {
+        log.warn("pseudoconsole handoff packing failed hresult=0x{x}", .{@as(u32, @bitCast(result))});
+        return error.ConptyPackFailed;
+    }
+    return native.?;
+}
+
+/// Drop only the inherited console session reference. The signal pipe and
+/// the backend remain usable after the original client is connected.
+pub fn releaseReference(self: Conpty, native: windows.HPCON) Error!void {
+    const release = self.release_reference orelse return error.ConptyReleaseUnavailable;
+    const result = release(native);
+    if (result != windows.S_OK) {
+        log.warn("pseudoconsole reference release failed hresult=0x{x}", .{@as(u32, @bitCast(result))});
+        return error.ConptyReleaseFailed;
+    }
+}
+
+fn duplicateHandoffHandle(handle: windows.HANDLE) Error!windows.HANDLE {
+    if (handle == windows.INVALID_HANDLE_VALUE) return error.InvalidHandoffHandle;
+    const process = GetCurrentProcess();
+    var copy: windows.HANDLE = undefined;
+    if (DuplicateHandle(process, handle, process, &copy, 0, windows.FALSE, 0x00000002) == windows.FALSE)
+        return windows.unexpectedError(windows.GetLastError());
+    return copy;
 }
 
 pub fn deinit(self: *Conpty) void {
@@ -79,11 +137,15 @@ pub fn deinit(self: *Conpty) void {
 }
 
 fn resolve(module: HMODULE, comptime T: type, name: [:0]const u8) Error!T {
-    const address = GetProcAddress(module, name.ptr) orelse {
+    return resolveOptional(module, T, name) orelse {
         log.err("bundled conpty.dll is missing export {s} err={}", .{ name, windows.GetLastError() });
         return error.ConptyMissingExport;
     };
-    return @ptrCast(address);
+}
+
+fn resolveOptional(module: HMODULE, comptime T: type, name: [:0]const u8) ?T {
+    const address = GetProcAddress(module, name.ptr) orelse return null;
+    return @as(T, @ptrCast(address));
 }
 
 /// Replace the filename in an absolute executable path without allocating or
@@ -104,6 +166,16 @@ extern "kernel32" fn GetFileAttributesW(filename: [*:0]const u16) callconv(.wina
 extern "kernel32" fn LoadLibraryExW(filename: [*:0]const u16, file: ?windows.HANDLE, flags: windows.DWORD) callconv(.winapi) ?HMODULE;
 extern "kernel32" fn GetProcAddress(module: HMODULE, name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
 extern "kernel32" fn FreeLibrary(module: HMODULE) callconv(.winapi) windows.BOOL;
+extern "kernel32" fn GetCurrentProcess() callconv(.winapi) windows.HANDLE;
+extern "kernel32" fn DuplicateHandle(
+    source_process: windows.HANDLE,
+    source_handle: windows.HANDLE,
+    target_process: windows.HANDLE,
+    target_handle: *windows.HANDLE,
+    access: windows.DWORD,
+    inherit: windows.BOOL,
+    options: windows.DWORD,
+) callconv(.winapi) windows.BOOL;
 
 test "Conpty sibling path stays beside executable" {
     const testing = std.testing;

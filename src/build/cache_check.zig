@@ -30,7 +30,7 @@ fn check(io: std.Io, allocator: std.mem.Allocator, cache_path: []const u8) !void
         total +|= file.size;
         if (total > limit_bytes) {
             std.debug.print(
-                "Build cache files exceed 20 GiB ({s}). Review stale artifacts; see README.md#build-cache.\n",
+                "Build cache files exceed 20 GiB ({s}). Review stale artifacts; see docs/development.md#build-cache.\n",
                 .{cache_path},
             );
             return;

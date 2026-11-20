@@ -319,10 +319,13 @@ pub const Scrollbar = struct {
 
         self.repaint();
 
-        // Return the width that the caller should subtract from the grid area.
-        // Always-visible steals a column of grid space; overlay floats on top.
+        return self.reservedWidth();
+    }
+
+    /// The width unavailable to the terminal grid. Overlay mode reserves none.
+    pub fn reservedWidth(self: *const Scrollbar) i32 {
         return switch (self.mode) {
-            .always_visible => width,
+            .always_visible => self.currentWidth(),
             .overlay => 0,
         };
     }

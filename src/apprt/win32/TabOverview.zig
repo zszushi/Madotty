@@ -3,6 +3,7 @@
 const TabOverview = @This();
 
 const std = @import("std");
+const lang = @import("UiLanguage.zig");
 const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
 
@@ -131,7 +132,7 @@ fn create(self: *TabOverview, owner: *Window) !void {
     self.hwnd = w32.CreateWindowExW(
         w32.WS_EX_TOOLWINDOW,
         class_name,
-        std.unicode.utf8ToUtf16LeStringLiteral("Tab overview"),
+        lang.wide("Tab overview"),
         w32.WS_POPUP | w32.WS_CAPTION | ws_sysmenu | w32.WS_THICKFRAME,
         0,
         0,
@@ -147,14 +148,14 @@ fn create(self: *TabOverview, owner: *Window) !void {
     const static = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
     const button = std.unicode.utf8ToUtf16LeStringLiteral("BUTTON");
     const empty = std.unicode.utf8ToUtf16LeStringLiteral("");
-    self.label = try self.control(static, std.unicode.utf8ToUtf16LeStringLiteral("Search &tabs"), 0, 1003);
+    self.label = try self.control(static, lang.wide("Search &tabs"), 0, 1003);
     self.edit = try self.control(std.unicode.utf8ToUtf16LeStringLiteral("EDIT"), empty, w32.WS_BORDER | ws_tabstop | w32.ES_AUTOHSCROLL, search_id);
     // Do not sort: list order follows tab order, with native scrolling and accessibility.
     self.list = try self.control(std.unicode.utf8ToUtf16LeStringLiteral("LISTBOX"), empty, w32.WS_BORDER | w32.WS_VSCROLL | ws_tabstop | 0x0001 | 0x0100, list_id);
     self.status = try self.control(static, empty, 0, 1004);
-    self.open_button = try self.control(button, std.unicode.utf8ToUtf16LeStringLiteral("&Switch"), ws_tabstop | 0x0001, open_id);
-    self.close_button = try self.control(button, std.unicode.utf8ToUtf16LeStringLiteral("&Close tab"), ws_tabstop, close_id);
-    self.cancel_button = try self.control(button, std.unicode.utf8ToUtf16LeStringLiteral("Cancel"), ws_tabstop, cancel_id);
+    self.open_button = try self.control(button, lang.wide("&Switch"), ws_tabstop | 0x0001, open_id);
+    self.close_button = try self.control(button, lang.wide("&Close tab"), ws_tabstop, close_id);
+    self.cancel_button = try self.control(button, lang.wide("Cancel"), ws_tabstop, cancel_id);
     _ = w32.SendMessageW(self.edit.?, 0x00C5, 255, 0); // EM_SETLIMITTEXT
     self.updateAppearance();
     self.layout();
@@ -177,7 +178,7 @@ pub fn updateAppearance(self: *TabOverview) void {
         self.brush = brush;
     }
     const old_font = self.font;
-    self.font = w32.CreateFontW(-self.px(16), 0, 0, 0, 400, 0, 0, 0, w32.DEFAULT_CHARSET, 0, 0, 0, 0, std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI")) orelse old_font;
+    self.font = owner.ui_font.create(16, self.scale) orelse old_font;
     const dark: u32 = if (switch (config.@"window-theme") {
         .dark => true,
         .light => false,
@@ -281,7 +282,7 @@ pub fn refresh(self: *TabOverview) void {
     self.count = 0;
     var selected: usize = 0;
     for (0..@min(owner.tab_count, max_tabs)) |i| {
-        const title = owner.tab_titles[i][0..owner.tab_title_lens[i]];
+        const title = owner.tabLabel(i);
         if (!matches(title, query[0..query_len])) continue;
         var text: [288:0]u16 = undefined;
         var prefix_buf: [24]u8 = undefined;
@@ -306,7 +307,7 @@ pub fn refresh(self: *TabOverview) void {
     }
     var status: [96:0]u16 = undefined;
     var status_buf: [96]u8 = undefined;
-    const message = std.mem.print(&status_buf, "{d} of {d} tabs. * marks the active tab.", .{ self.count, owner.tab_count }) catch return;
+    const message = lang.print(&status_buf, "{d} of {d} tabs. * marks the active tab.", .{ self.count, owner.tab_count }) catch return;
     const status_len = std.unicode.utf8ToUtf16Le(&status, message) catch return;
     status[status_len] = 0;
     _ = w32.SetWindowTextW(self.status.?, &status);
@@ -480,8 +481,8 @@ test "tab overview native controls filtering stable selection DPI and teardown" 
         nodes[i][0] = .{ .leaf = surface };
         owner.tab_trees[i] = .{ .arena = undefined, .nodes = &nodes[i], .zoomed = null };
         owner.tab_active_surface[i] = surface;
-        @memcpy(owner.tab_titles[i][0..titles[i].len], titles[i]);
-        owner.tab_title_lens[i] = @intCast(titles[i].len);
+        @memcpy(owner.tab_titles[i].text[0..titles[i].len], titles[i]);
+        owner.tab_titles[i].len = @intCast(titles[i].len);
     }
     // These are borrowed stack trees, not ref-counted live sessions. Never
     // call Window.deinit/close on this fixture.
@@ -505,8 +506,7 @@ test "tab overview native controls filtering stable selection DPI and teardown" 
     // same surface at its new index, not select the old numeric position.
     std.mem.swap(Tree, &owner.tab_trees[1], &owner.tab_trees[2]);
     std.mem.swap(*Surface, &owner.tab_active_surface[1], &owner.tab_active_surface[2]);
-    std.mem.swap([256]u16, &owner.tab_titles[1], &owner.tab_titles[2]);
-    std.mem.swap(u16, &owner.tab_title_lens[1], &owner.tab_title_lens[2]);
+    std.mem.swap(@TypeOf(owner.tab_titles[0]), &owner.tab_titles[1], &owner.tab_titles[2]);
     overview.activateSelection();
     try testing.expectEqual(@as(usize, 2), owner.active_tab);
     try testing.expect(!overview.active);
@@ -518,7 +518,7 @@ test "tab overview native controls filtering stable selection DPI and teardown" 
     _ = w32.SendMessageW(overview.list.?, lb_setcursel, 1, 0);
     const selected = overview.selectedID();
     // A title update must preserve selection by identity.
-    owner.tab_titles[1][0] = 'l';
+    owner.tab_titles[1].text[0] = 'l';
     overview.refresh();
     try testing.expectEqual(selected, overview.selectedID());
     try testing.expect(overview.handleKey(overview.edit.?, w32.VK_DOWN));

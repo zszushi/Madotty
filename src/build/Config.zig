@@ -25,6 +25,7 @@ wasm_target: WasmTarget,
 /// Comptime interfaces
 app_runtime: ApprtRuntime = .none,
 renderer: RendererBackend = .opengl,
+dxc: ?[]const u8 = null,
 font_backend: FontBackend = .freetype,
 
 /// Feature flags
@@ -57,6 +58,8 @@ windows_console: bool = false,
 emit_bench: bool = false,
 emit_docs: bool = false,
 emit_exe: bool = false,
+emit_windows_d3d12: bool = false,
+emit_windows_vulkan: bool = false,
 emit_helpgen: bool = false,
 emit_lib_vt: bool = false,
 emit_macos_app: bool = false,
@@ -209,8 +212,15 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
     config.renderer = b.option(
         RendererBackend,
         "renderer",
-        "The app runtime to use. Not all values supported on all platforms.",
+        "The graphics API to use. Not all values are supported on all platforms.",
     ) orelse RendererBackend.default(target.result, wasm_target);
+    config.dxc = b.option([]const u8, "dxc", "Path to the DirectX Shader Compiler executable");
+    if ((config.renderer == .d3d12 or config.renderer == .vulkan) and
+        (target.result.os.tag != .windows or config.app_runtime != .win32))
+    {
+        std.log.err("-Drenderer={t} requires the Win32 application runtime and a Windows target", .{config.renderer});
+        return error.InvalidRendererTarget;
+    }
 
     //---------------------------------------------------------------
     // Feature Flags
@@ -504,6 +514,15 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
         "emit-exe",
         "Build and install main executables with 'build'",
     ) orelse !config.emit_lib_vt;
+
+    config.emit_windows_d3d12 = b.option(bool, "emit-windows-d3d12", "Include a selectable DirectX 12 backend in a Win32 OpenGL build") orelse false;
+    config.emit_windows_vulkan = b.option(bool, "emit-windows-vulkan", "Include the Vulkan executable in a Win32 OpenGL build") orelse false;
+    if ((config.emit_windows_d3d12 or config.emit_windows_vulkan) and (!config.emit_exe or config.app_runtime != .win32 or
+        target.result.os.tag != .windows or config.renderer != .opengl))
+    {
+        std.log.err("Alternate Windows renderers require a Win32 OpenGL executable build", .{});
+        return error.InvalidRendererTarget;
+    }
 
     config.emit_test_exe = b.option(
         bool,

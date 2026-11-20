@@ -47,6 +47,7 @@ const DisplayLink = switch (builtin.target.os.tag) {
 };
 
 const log = std.log.scoped(.generic_renderer);
+const is_win32 = apprt.runtime == apprt.win32;
 
 /// Create a renderer type with the provided graphics API wrapper.
 ///
@@ -120,6 +121,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// The mailbox for communicating with the window.
         surface_mailbox: apprt.surface.Mailbox,
+
+        win32_background: if (is_win32) struct {
+            surface: *apprt.Surface,
+            force_opaque: bool,
+        } else void,
 
         /// The latest exported frame ready to be consumed by an apprt
         /// who needs to manually composite the frame with UI elements.
@@ -205,6 +211,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         font_grid: *font.SharedGrid,
         font_shaper: font.Shaper,
         font_shaper_cache: font.ShaperCache,
+        sized_shaper: ?font.Shaper = null,
+        sized_cells: font.shape.SizedCells = .{},
 
         /// The images that we may render.
         images: ImageState = .empty,
@@ -266,7 +274,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         reinitialize_shaders: bool = false,
 
         /// Whether or not we have custom shaders.
-        has_custom_shaders: bool = false,
+        has_custom_shaders: std.atomic.Value(bool) = .init(false),
 
         /// Our shader pipelines.
         shaders: Shaders,
@@ -318,12 +326,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             /// frame state struct so we can start working on a new frame.
             frame_sema: std.Io.Semaphore = .{ .permits = buf_count },
 
-            pub fn init(api: GraphicsAPI, custom_shaders: bool) !SwapChain {
+            pub fn init(api: GraphicsAPI) !SwapChain {
                 var result: SwapChain = .{ .frames = undefined };
 
                 // Initialize all of our frame state.
+                var initialized: usize = 0;
+                errdefer for (result.frames[0..initialized]) |*frame| frame.deinit();
                 for (&result.frames) |*frame| {
-                    frame.* = try FrameState.init(api, custom_shaders);
+                    frame.* = try FrameState.init(api);
+                    initialized += 1;
                 }
 
                 return result;
@@ -343,8 +354,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             /// always be paired with a call to releaseFrame.
             pub fn nextFrame(self: *SwapChain) *FrameState {
                 self.frame_sema.waitUncancelable(global.io());
-                self.frame_index = (self.frame_index + 1) % buf_count;
+                self.frame_index = self.nextFrameIndex();
                 return &self.frames[self.frame_index];
+            }
+
+            fn nextFrameIndex(self: *const SwapChain) std.math.IntFittingRange(0, buf_count) {
+                return (self.frame_index + 1) % buf_count;
             }
 
             /// This should be called when the frame has completed drawing.
@@ -392,7 +407,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const CellTextBuffer = Buffer(shaderpkg.CellText);
             const BgImageBuffer = Buffer(shaderpkg.BgImage);
 
-            pub fn init(api: GraphicsAPI, custom_shaders: bool) !FrameState {
+            pub fn init(api: GraphicsAPI) !FrameState {
                 // Uniform buffer contains exactly 1 uniform struct. The
                 // uniform data will be undefined so this must be set before
                 // a frame is drawn.
@@ -434,13 +449,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 });
                 errdefer color.deinit();
 
-                var custom_shader_state =
-                    if (custom_shaders)
-                        try CustomShaderState.init(api)
-                    else
-                        null;
-                errdefer if (custom_shader_state) |*state| state.deinit();
-
                 // Initialize the target. Just as with the other resources,
                 // start it off as small as we can since it'll be resized.
                 const target = try api.initTarget(1, 1);
@@ -453,7 +461,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .grayscale = grayscale,
                     .color = color,
                     .target = target,
-                    .custom_shader_state = custom_shader_state,
                 };
             }
 
@@ -513,24 +520,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 std.mem.swap(Texture, &self.front_texture, &self.back_texture);
             }
 
-            pub fn init(api: GraphicsAPI) !CustomShaderState {
+            pub fn init(api: GraphicsAPI, width: usize, height: usize) !CustomShaderState {
                 // Create a GPU buffer to hold our uniforms.
                 var uniforms = try UniformBuffer.init(api.uniformBufferOptions(), 1);
                 errdefer uniforms.deinit();
 
-                // Initialize the front and back textures at 1x1 px, this
-                // is slightly wasteful but it's only done once so whatever.
                 const front_texture = try Texture.init(
                     api.textureOptions(),
-                    1,
-                    1,
+                    @intCast(width),
+                    @intCast(height),
                     null,
                 );
                 errdefer front_texture.deinit();
                 const back_texture = try Texture.init(
                     api.textureOptions(),
-                    1,
-                    1,
+                    @intCast(width),
+                    @intCast(height),
                     null,
                 );
                 errdefer back_texture.deinit();
@@ -611,6 +616,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             min_contrast: f32,
             padding_color: configpkg.WindowPaddingColor,
             custom_shaders: configpkg.RepeatablePath,
+            custom_shader_parameters: configpkg.RepeatableString,
             bg_image: ?configpkg.Path,
             bg_image_opacity: f32,
             bg_image_position: configpkg.BackgroundImagePosition,
@@ -634,6 +640,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Copy our shaders
                 const custom_shaders = try config.@"custom-shader".clone(alloc);
+                const custom_shader_parameters = try config.@"custom-shader-parameter".clone(alloc);
 
                 // Copy our background image
                 const bg_image =
@@ -686,6 +693,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .search_selected_foreground = config.@"search-selected-foreground",
 
                     .custom_shaders = custom_shaders,
+                    .custom_shader_parameters = custom_shader_parameters,
                     .bg_image = bg_image,
                     .bg_image_opacity = config.@"background-image-opacity",
                     .bg_image_position = config.@"background-image-position",
@@ -740,10 +748,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             };
 
+            const opaque_background = is_win32 and options.rt_surface.force_opaque_background.load(.monotonic);
+            const background_opacity = if (opaque_background) 1 else options.config.background_opacity;
             var result: Self = .{
                 .alloc = alloc,
                 .config = options.config,
                 .surface_mailbox = options.surface_mailbox,
+                .win32_background = if (is_win32) .{
+                    .surface = options.rt_surface,
+                    .force_opaque = opaque_background,
+                } else {},
                 .grid_metrics = font_critical.metrics,
                 .size = options.size,
                 .focused = true,
@@ -775,10 +789,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         // Note that if we're on macOS with glass effects
                         // we'll disable background opacity but we handle
                         // that in updateFrame.
-                        @intFromFloat(@round(options.config.background_opacity * 255.0)),
+                        @intFromFloat(@round(background_opacity * 255.0)),
                     },
                     .bools = .{
-                        .cursor_wide = false,
+                        .cursor_width = 1,
                         .use_display_p3 = options.config.colorspace == .@"display-p3",
                         .use_linear_blending = options.config.blending.isLinear(),
                         .use_linear_correction = options.config.blending == .@"linear-corrected",
@@ -823,7 +837,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Graphics API stuff
                 .api = api,
                 .swap_chain = null,
-                .has_custom_shaders = has_custom_shaders,
+                .has_custom_shaders = .init(has_custom_shaders),
                 .reinitialize_shaders = true,
                 // Shaders are initialized lazily on the render thread.
                 .shaders = .uninit,
@@ -836,6 +850,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try result.prepBackgroundImage();
 
             return result;
+        }
+
+        fn effectiveBackgroundOpacity(self: *const Self) f64 {
+            if (is_win32 and self.win32_background.force_opaque) return 1;
+            return self.config.background_opacity;
         }
 
         pub fn deinit(self: *Self) void {
@@ -866,6 +885,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             self.font_shaper.deinit();
             self.font_shaper_cache.deinit(self.alloc);
+            if (self.sized_shaper) |*shaper| shaper.deinit();
+            self.sized_cells.deinit(self.alloc);
 
             self.config.deinit();
             self.api.deinit();
@@ -883,21 +904,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 arena_alloc,
                 self.config.custom_shaders,
                 GraphicsAPI.custom_shader_target,
+                self.config.custom_shader_parameters.list.items,
             ) catch |err| err: {
                 log.warn("error loading custom shaders err={}", .{err});
                 break :err &.{};
             };
 
-            const has_custom_shaders = custom_shaders.len > 0;
-
-            var shaders = try self.api.initShaders(
+            const shaders = try self.api.initShaders(
                 self.alloc,
                 custom_shaders,
             );
-            errdefer shaders.deinit(self.alloc);
 
+            self.shaders.deinit(self.alloc);
             self.shaders = shaders;
-            self.has_custom_shaders = has_custom_shaders;
+            self.has_custom_shaders.store(shaders.post_pipelines.len != 0, .monotonic);
         }
 
         /// Callback called by renderer.Thread when it begins.
@@ -1152,14 +1172,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         pub fn animationWake(self: *const Self) ?AnimationWake {
             // Custom shaders animate by redrawing on a fixed cadence,
             // gated by configuration and focus.
-            const shader_delay: ?u64 = shader: {
-                if (!self.has_custom_shaders) break :shader null;
-                break :shader switch (self.config.custom_shader_animation) {
-                    .false => null,
-                    .always => draw_interval_ms,
-                    .true => if (self.focused) draw_interval_ms else null,
-                };
-            };
+            const shader_delay: ?u64 = if (self.shaderAnimationActive()) draw_interval_ms else null;
 
             // Kitty animations tick during updateFrame; between
             // updates the deadline is absolute on the animation
@@ -1190,6 +1203,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             return null;
         }
 
+        fn shaderAnimationActive(self: *const Self) bool {
+            return self.has_custom_shaders.load(.monotonic) and switch (self.config.custom_shader_animation) {
+                .false => false,
+                .always => true,
+                .true => self.focused,
+            };
+        }
+
         /// Returns true if the display link is running, meaning frames
         /// are paced by display refresh. In that case the render thread
         /// must only draw when the display link wakes it through
@@ -1209,12 +1230,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// Must be called on the render thread.
         pub fn setFocus(self: *Self, focus: bool) !void {
-            assert(self.focused != focus);
-
-            self.focused = focus;
-
-            // Flag that we need to update our custom shaders
-            self.custom_shader_focused_changed = true;
+            {
+                self.draw_mutex.lockUncancelable(global.io());
+                defer self.draw_mutex.unlock(global.io());
+                assert(self.focused != focus);
+                self.focused = focus;
+                self.custom_shader_focused_changed = true;
+            }
 
             self.syncDisplayLink(null, null);
         }
@@ -1259,6 +1281,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Resources that are already released are skipped.
         pub fn releaseGpuResources(self: *Self) void {
             if (self.swap_chain) |*sc| {
+                if (@hasDecl(GraphicsAPI, "waitGpuIdle")) self.api.waitGpuIdle() catch |err|
+                    log.warn("GPU idle wait failed: {t}", .{err});
                 // Waits for any in-flight frames to complete, then
                 // frees all GPU resources.
                 sc.deinit();
@@ -1393,6 +1417,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // the course of a frame. Always flush those objects, including
             // when rebuilding the frame fails due to memory pressure.
             defer self.font_shaper.endFrame();
+            defer if (self.sized_shaper) |*shaper| shaper.endFrame();
 
             // We fully deinit and reset the terminal state every so often
             // so that a particularly large terminal state doesn't cause
@@ -1663,6 +1688,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.draw_mutex.lockUncancelable(global.io());
                 defer self.draw_mutex.unlock(global.io());
 
+                if (comptime is_win32) {
+                    const force_opaque = self.win32_background.surface.force_opaque_background.load(.monotonic);
+                    if (self.win32_background.force_opaque != force_opaque) {
+                        self.win32_background.force_opaque = force_opaque;
+                        self.terminal_state.dirty = .full;
+                    }
+                }
+
                 // Build our GPU cells
                 self.rebuildCells(
                     critical.preedit,
@@ -1693,7 +1726,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.terminal_state.colors.background.r,
                     self.terminal_state.colors.background.g,
                     self.terminal_state.colors.background.b,
-                    @intFromFloat(@round(self.config.background_opacity * 255.0)),
+                    @intFromFloat(@round(self.effectiveBackgroundOpacity() * 255.0)),
                 };
 
                 // If we're on macOS and have glass styles, we remove
@@ -1791,10 +1824,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // context, which drawFrame guarantees).
             const swap_chain: *SwapChain, const swap_chain_rebuilt: bool =
                 if (self.swap_chain) |*sc| .{ sc, false } else rebuild: {
-                    self.swap_chain = try SwapChain.init(
-                        self.api,
-                        self.has_custom_shaders,
-                    );
+                    self.swap_chain = try SwapChain.init(self.api);
                     break :rebuild .{ &self.swap_chain.?, true };
                 };
 
@@ -1807,12 +1837,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             //
             // While any animation is in progress (a pending animation wake)
             // every draw must actually render.
+            const animating_shader = self.shaderAnimationActive();
             const needs_redraw =
                 size_changed or
                 swap_chain_rebuilt or
+                self.reinitialize_shaders or
                 self.cells_rebuilt or
                 self.images_rebuilt or
-                self.animationWake() != null or
+                animating_shader or
                 sync;
 
             if (!needs_redraw) {
@@ -1821,40 +1853,40 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // display link at this point.
                 return true;
             }
+
+            // Let the animation timer retry without blocking the HWND owner
+            // or advancing the frame while it still has pending GPU reads.
+            if (comptime @hasDecl(GraphicsAPI, "frameSlotReady")) {
+                if (animating_shader and !sync and !size_changed and !swap_chain_rebuilt and
+                    !self.reinitialize_shaders and !try self.api.frameSlotReady(swap_chain.nextFrameIndex())) return false;
+            }
+
             self.cells_rebuilt = false;
             self.images_rebuilt = false;
+            errdefer self.cells_rebuilt = true;
 
             // Wait for a frame to be available.
             const frame = swap_chain.nextFrame();
             errdefer swap_chain.releaseFrame();
-            // log.debug("drawing frame index={}", .{swap_chain.frame_index});
+            if (@hasDecl(GraphicsAPI, "prepareFrame")) try self.api.prepareFrame(swap_chain.frame_index);
 
             // If we need to reinitialize our shaders, do so.
             if (self.reinitialize_shaders) {
-                self.reinitialize_shaders = false;
-                self.shaders.deinit(self.alloc);
+                // Some backends release the CPU frame when work is submitted.
+                // Their submitted frames may still reference these pipelines.
+                if (@hasDecl(GraphicsAPI, "waitGpuIdle")) try self.api.waitGpuIdle();
                 try self.initShaders();
+                self.reinitialize_shaders = false;
             }
 
             // Our shaders should not be defunct at this point.
             assert(!self.shaders.defunct);
 
-            // If we have custom shaders, make sure we have the
-            // custom shader state in our frame state, otherwise
-            // if we have a state but don't need it we remove it.
-            if (self.has_custom_shaders) {
-                if (frame.custom_shader_state == null) {
-                    frame.custom_shader_state = try .init(self.api);
-                    try frame.custom_shader_state.?.resize(
-                        self.api,
-                        surface_size.width,
-                        surface_size.height,
-                    );
-                }
-            } else if (frame.custom_shader_state) |*state| {
+            const has_custom_shaders = self.has_custom_shaders.load(.monotonic);
+            if (!has_custom_shaders) if (frame.custom_shader_state) |*state| {
                 state.deinit();
                 frame.custom_shader_state = null;
-            }
+            };
 
             // If our stored size doesn't match the
             // surface size we need to update it.
@@ -1880,6 +1912,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 );
                 frame.target_config_modified = self.target_config_modified;
             }
+            if (has_custom_shaders and frame.custom_shader_state == null) {
+                frame.custom_shader_state = try .init(self.api, self.size.screen.width, self.size.screen.height);
+            }
 
             // Upload images to the GPU as necessary.
             _ = self.images.upload(self.alloc, &self.api);
@@ -1889,6 +1924,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Update per-frame custom shader uniforms.
             try self.updateCustomShaderUniformsForFrame();
+            if (frame.custom_shader_state) |*state| {
+                try state.uniforms.sync(&.{self.custom_shader_uniforms});
+            }
 
             // Setup our frame data
             try frame.uniforms.sync(&.{self.uniforms});
@@ -1908,16 +1946,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (modified <= frame.grayscale_modified) break :texture;
                 self.font_grid.lock.lockSharedUncancelable(global.io());
                 defer self.font_grid.lock.unlockShared(global.io());
-                frame.grayscale_modified = self.font_grid.atlas_grayscale.modified.load(.monotonic);
                 try self.syncAtlasTexture(&self.font_grid.atlas_grayscale, &frame.grayscale);
+                frame.grayscale_modified = self.font_grid.atlas_grayscale.modified.load(.monotonic);
             }
             texture: {
                 const modified = self.font_grid.atlas_color.modified.load(.monotonic);
                 if (modified <= frame.color_modified) break :texture;
                 self.font_grid.lock.lockSharedUncancelable(global.io());
                 defer self.font_grid.lock.unlockShared(global.io());
-                frame.color_modified = self.font_grid.atlas_color.modified.load(.monotonic);
                 try self.syncAtlasTexture(&self.font_grid.atlas_color, &frame.color);
+                frame.color_modified = self.font_grid.atlas_color.modified.load(.monotonic);
             }
 
             // Get a frame context from the graphics API.
@@ -1968,6 +2006,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.images.draw(
                     &self.api,
                     self.shaders.pipelines.image,
+                    frame.uniforms.buffer,
                     &pass,
                     .kitty_below_bg,
                 );
@@ -1984,6 +2023,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.images.draw(
                     &self.api,
                     self.shaders.pipelines.image,
+                    frame.uniforms.buffer,
                     &pass,
                     .kitty_below_text,
                 );
@@ -2011,6 +2051,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.images.draw(
                     &self.api,
                     self.shaders.pipelines.image,
+                    frame.uniforms.buffer,
                     &pass,
                     .kitty_above_text,
                 );
@@ -2020,6 +2061,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (self.overlay != null) self.images.draw(
                     &self.api,
                     self.shaders.pipelines.image,
+                    frame.uniforms.buffer,
                     &pass,
                     .overlay,
                 );
@@ -2027,9 +2069,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // If we have custom shaders, then we render them.
             if (frame.custom_shader_state) |*state| {
-                // Sync our uniforms.
-                try state.uniforms.sync(&.{self.custom_shader_uniforms});
-
                 for (self.shaders.post_pipelines, 0..) |pipeline, i| {
                     defer state.swap();
 
@@ -2198,6 +2237,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 errdefer font_shaper.deinit();
                 self.font_shaper.deinit();
                 self.font_shaper = font_shaper;
+                if (self.sized_shaper) |*shaper| shaper.deinit();
+                self.sized_shaper = null;
             }
 
             // We also need to reset the shaper cache so shaper info
@@ -2230,7 +2271,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     config.bg_image != null;
 
             const old_blending = self.config.blending;
-            const custom_shaders_changed = !self.config.custom_shaders.equal(config.custom_shaders);
+            const custom_shaders_changed = !self.config.custom_shaders.equal(config.custom_shaders) or
+                !self.config.custom_shader_parameters.equal(config.custom_shader_parameters);
 
             self.config.deinit();
             self.config = config.*;
@@ -2357,8 +2399,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// This should be called in `updateFrame` when terminal state changes.
         fn updateCustomShaderUniformsFromState(self: *Self) void {
-            // We only need to do this if we have custom shaders.
-            if (!self.has_custom_shaders) return;
+            // The first draw that loads shaders also needs terminal-derived
+            // values, even when shaders were just enabled in a running session.
+            const loading = self.reinitialize_shaders and self.config.custom_shaders.value.items.len != 0;
+            if (!loading and !self.has_custom_shaders.load(.monotonic)) return;
 
             // Only update when terminal state is dirty.
             if (self.terminal_state.dirty == .false) return;
@@ -2450,7 +2494,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// This should be called exactly once per frame, inside `drawFrame`.
         fn updateCustomShaderUniformsForFrame(self: *Self) !void {
             // We only need to do this if we have custom shaders.
-            if (!self.has_custom_shaders) return;
+            if (!self.has_custom_shaders.load(.monotonic)) return;
 
             const uniforms: *shadertoy.Uniforms = &self.custom_shader_uniforms;
 
@@ -2786,14 +2830,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // a cursor. Otherwise, get our cursor cell, because we may
                 // need it for styling.
                 const cursor_vp = state.cursor.viewport orelse break :cursor;
-                const cursor_style: terminal.Style = cursor_style: {
-                    const cells = state.row_data.items(.cells);
-                    const cell = cells[cursor_vp.y].get(cursor_vp.x);
-                    break :cursor_style if (cell.raw.hasStyling())
-                        cell.style
-                    else
-                        .{};
-                };
+                const cells = row_cells[cursor_vp.y].slice();
+                const span = if (state.cursor.cell.sized != 0)
+                    terminal.page.Cell.sizedSpan(cells.items(.raw), cursor_vp.x)
+                else
+                    null;
+                const x, const width: u3 = if (span) |v|
+                    .{ @as(terminal.size.CellCountInt, @intCast(v.start)), @intCast(v.end - v.start) }
+                else if (cursor_vp.wide_tail)
+                    .{ cursor_vp.x -| 1, 2 }
+                else
+                    .{ cursor_vp.x, state.cursor.cell.gridWidth() };
+                const cursor_cell = cells.get(if (span != null) x else cursor_vp.x);
+                const cursor_style: terminal.Style = if (cursor_cell.raw.hasStyling()) cursor_cell.style else .{};
 
                 // If we have preedit text, we don't setup a cursor
                 if (preedit != null) break :cursor;
@@ -2820,7 +2869,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                 .bold = self.config.bold_color,
                             });
                             const bg_style = cursor_style.bg(
-                                &state.cursor.cell,
+                                &cursor_cell.raw,
                                 &state.colors.palette,
                             ) orelse state.colors.background;
 
@@ -2842,30 +2891,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
 
                 self.addCursor(
-                    &state.cursor,
+                    x,
+                    cursor_vp.y,
+                    width,
                     style,
                     cursor_color,
                 );
 
                 // If the cursor is visible then we set our uniforms.
                 if (style == .block) {
-                    const wide = state.cursor.cell.wide;
-
-                    self.uniforms.cursor_pos = .{
-                        // If we are a spacer tail of a wide cell, our cursor needs
-                        // to move back one cell. The saturate is to ensure we don't
-                        // overflow but this shouldn't happen with well-formed input.
-                        switch (wide) {
-                            .narrow, .spacer_head, .wide => cursor_vp.x,
-                            .spacer_tail => cursor_vp.x -| 1,
-                        },
-                        @intCast(cursor_vp.y),
-                    };
-
-                    self.uniforms.bools.cursor_wide = switch (wide) {
-                        .narrow, .spacer_head => false,
-                        .wide, .spacer_tail => true,
-                    };
+                    self.uniforms.cursor_pos = .{ x, cursor_vp.y };
+                    self.uniforms.bools.cursor_width = width;
 
                     const uniform_color = if (self.config.cursor_text) |txt| blk: {
                         // If cursor-text is set, then compute the correct color.
@@ -2881,7 +2917,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .bold = self.config.bold_color,
                         });
                         const bg_style = cursor_style.bg(
-                            &state.cursor.cell,
+                            &cursor_cell.raw,
                             &state.colors.palette,
                         ) orelse state.colors.background;
 
@@ -2956,6 +2992,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const cells_len = @min(cells_slice.len, self.cells.size.columns);
             const cells_raw = cells_slice.items(.raw);
             const cells_style = cells_slice.items(.style);
+            const graphemes = cells_slice.items(.grapheme);
 
             // On primary screen, we still apply vertical padding
             // extension under certain conditions we feel are safe.
@@ -3068,14 +3105,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // Advance our index until we reach or pass
                     // our current x position in the shaper cells.
                     const shaper_cells_unwrapped = shaper_cells.?;
-                    while (run.offset + shaper_cells_unwrapped[shaper_cells_i].x < x) {
+                    while (shaper_cells_i < shaper_cells_unwrapped.len and
+                        run.offset + shaper_cells_unwrapped[shaper_cells_i].x < x)
+                    {
                         shaper_cells_i += 1;
                     }
                 }
 
                 const wide = cell.wide;
-                const style: terminal.Style = if (cell.hasStyling())
-                    managed_style.*
+                const span = if (cell.sized != 0)
+                    terminal.page.Cell.sizedSpan(cells_raw, x)
+                else
+                    null;
+                const style_cell = if (span) |v| &cells_raw[v.start] else cell;
+                const style: terminal.Style = if (style_cell.hasStyling())
+                    if (span) |v| cells_style[v.start] else managed_style.*
                 else
                     .{};
 
@@ -3089,22 +3133,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // Order below matters for precedence.
 
                     // Selection should take the highest precedence.
-                    const x_compare = if (wide == .spacer_tail)
-                        x -| 1
-                    else
-                        x;
+                    const x_compare = if (span) |v| v.start else if (wide == .spacer_tail) x -| 1 else x;
+                    const x_end = if (span) |v| v.end - 1 else x_compare;
                     if (selection) |sel| {
-                        if (x_compare >= sel[0] and
-                            x_compare <= sel[1]) break :selected .selection;
+                        if (x_end >= sel[0] and x_compare <= sel[1]) break :selected .selection;
                     }
 
                     // If we're highlighted, then we're selected. In the
                     // future we want to use a different style for this
                     // but this to get started.
                     for (highlights.items) |hl| {
-                        if (x_compare >= hl.range[0] and
-                            x_compare <= hl.range[1])
-                        {
+                        if (x_end >= hl.range[0] and x_compare <= hl.range[1]) {
                             const tag: HighlightTag = @fromBackingInt(hl.tag);
                             break :selected switch (tag) {
                                 .search_match => .search,
@@ -3120,7 +3159,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // the cell style (SGR), before applying any additional
                 // configuration, inversions, selections, etc.
                 const bg_style = style.bg(
-                    cell,
+                    style_cell,
                     &state.colors.palette,
                 );
                 const fg_style = style.fg(.{
@@ -3155,7 +3194,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     },
 
                     // Not selected
-                    .false => if (style.flags.inverse != isCovering(cell.codepoint()))
+                    .false => if (style.flags.inverse != (span == null and isCovering(cell.codepoint())))
                         // Two cases cause us to invert (use the fg color as the bg)
                         // - The "inverse" style flag.
                         // - A "covering" glyph; we use fg for bg in that
@@ -3228,7 +3267,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         // If the user requested to have opacity on all cells, apply it.
                         if (self.config.background_opacity_cells and bg_style != null) {
                             var opacity: f64 = @floatFromInt(default);
-                            opacity *= self.config.background_opacity;
+                            opacity *= self.effectiveBackgroundOpacity();
                             break :bg_alpha @intFromFloat(opacity);
                         }
 
@@ -3258,6 +3297,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     continue;
                 }
 
+                // A sized head draws its text and decorations for the entire
+                // block. The continuation cells still need backgrounds above.
+                const width: u3 = if (span) |v| width: {
+                    if (x != v.start) continue;
+                    if (preedit_range) |range| {
+                        if (range.y == y and range.x[0] < v.end and v.start <= range.x[1]) continue;
+                    }
+                    break :width @intCast(@min(v.end, cells_len) - x);
+                } else 1;
+
                 // Give links a single underline, unless they already have
                 // an underline, in which case use a double underline to
                 // distinguish them.
@@ -3280,6 +3329,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (underline != .none) self.addUnderline(
                     @intCast(x),
                     @intCast(y),
+                    width,
                     underline,
                     style.underlineColor(&state.colors.palette) orelse fg,
                     alpha,
@@ -3290,7 +3340,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     );
                 };
 
-                if (style.flags.overline) self.addOverline(@intCast(x), @intCast(y), fg, alpha) catch |err| {
+                if (style.flags.overline) self.addOverline(@intCast(x), y, width, fg, alpha) catch |err| {
                     log.warn(
                         "error adding overline to cell, will be invalid x={} y={}, err={}",
                         .{ x, y, err },
@@ -3305,7 +3355,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     shaper_cells_i = 0;
                 }
 
-                if (shaper_run) |run| glyphs: {
+                if (span != null) {
+                    try self.addSizedText(
+                        @intCast(x),
+                        y,
+                        width,
+                        cell.*,
+                        if (cell.hasGrapheme()) graphemes[x] else &.{},
+                        style,
+                        fg,
+                        alpha,
+                    );
+                } else if (shaper_run) |run| glyphs: {
                     // If we haven't shaped this run yet, do so.
                     shaper_cells = shaper_cells orelse
                         // Try to read the cells from the shaping cache if we can.
@@ -3338,7 +3399,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                     // If there are no shaper cells for this run, ignore it.
                     // This can occur for runs of empty cells, and is fine.
-                    if (shaped_cells.len == 0) break :glyphs;
+                    if (shaper_cells_i >= shaped_cells.len) break :glyphs;
 
                     // If we encounter a shaper cell to the left of the current
                     // cell then we have some problems. This logic relies on x
@@ -3362,6 +3423,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             shaper_run.?,
                             fg,
                             alpha,
+                            0,
+                            null,
                         ) catch |err| {
                             log.warn(
                                 "error adding glyph to cell, will be invalid x={} y={}, err={}",
@@ -3375,6 +3438,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (style.flags.strikethrough) self.addStrikethrough(
                     @intCast(x),
                     @intCast(y),
+                    width,
                     fg,
                     alpha,
                 ) catch |err| {
@@ -3391,6 +3455,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             x: terminal.size.CellCountInt,
             y: terminal.size.CellCountInt,
+            width: u3,
             style: terminal.Attribute.Underline,
             color: terminal.color.RGB,
             alpha: u8,
@@ -3409,7 +3474,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 font.sprite_index,
                 @backingInt(sprite),
                 .{
-                    .cell_width = 1,
+                    .cell_width = width,
                     .grid_metrics = self.grid_metrics,
                 },
             );
@@ -3432,6 +3497,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             x: terminal.size.CellCountInt,
             y: terminal.size.CellCountInt,
+            width: u3,
             color: terminal.color.RGB,
             alpha: u8,
         ) !void {
@@ -3440,7 +3506,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 font.sprite_index,
                 @backingInt(font.Sprite.overline),
                 .{
-                    .cell_width = 1,
+                    .cell_width = width,
                     .grid_metrics = self.grid_metrics,
                 },
             );
@@ -3463,6 +3529,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             x: terminal.size.CellCountInt,
             y: terminal.size.CellCountInt,
+            width: u3,
             color: terminal.color.RGB,
             alpha: u8,
         ) !void {
@@ -3471,7 +3538,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 font.sprite_index,
                 @backingInt(font.Sprite.strikethrough),
                 .{
-                    .cell_width = 1,
+                    .cell_width = width,
                     .grid_metrics = self.grid_metrics,
                 },
             );
@@ -3489,6 +3556,34 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             });
         }
 
+        fn addSizedText(
+            self: *Self,
+            x: terminal.size.CellCountInt,
+            y: terminal.size.CellCountInt,
+            width: u3,
+            head: terminal.page.Cell,
+            extra: []const u21,
+            style: terminal.Style,
+            color: terminal.color.RGB,
+            alpha: u8,
+        ) !void {
+            if (!head.hasText()) return;
+            // The normal row iterator may already have prepared its next run.
+            // A separate, lazily created shaper leaves that buffer untouched.
+            if (self.sized_shaper == null) self.sized_shaper = try font.Shaper.init(self.alloc, .{
+                .features = self.config.font_features.items,
+            });
+            const shaper = &self.sized_shaper.?;
+            const cells = try self.sized_cells.build(self.alloc, head, extra, style, width);
+            const raw = cells.items(.raw);
+            var iter = shaper.runIterator(.{ .grid = self.font_grid, .cells = cells, .allow_text_ligatures = true });
+            while (try iter.next(self.alloc)) |run| {
+                for (try shaper.shape(run)) |glyph| {
+                    try self.addGlyph(run.offset + glyph.x, y, raw.len, raw, glyph, run, color, alpha, x, width);
+                }
+            }
+        }
+
         // Add a glyph to the specified cell.
         fn addGlyph(
             self: *Self,
@@ -3500,6 +3595,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             shaper_run: font.shape.TextRun,
             color: terminal.color.RGB,
             alpha: u8,
+            origin_x: terminal.size.CellCountInt,
+            clip_width: ?u3,
         ) !void {
             const cell = cell_raws[x];
             const cp = cell.codepoint();
@@ -3535,13 +3632,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 return;
             }
 
-            try self.cells.add(self.alloc, .text, .{
+            var glyph: shaderpkg.CellText = .{
                 .atlas = switch (render.presentation) {
                     .emoji => .color,
                     .text => .grayscale,
                 },
                 .bools = .{ .no_min_contrast = noMinContrast(cp) },
-                .grid_pos = .{ @intCast(x), @intCast(y) },
+                .grid_pos = .{ origin_x + x, y },
                 .color = .{ color.r, color.g, color.b, alpha },
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
@@ -3549,31 +3646,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(render.glyph.offset_x + shaper_cell.x_offset),
                     @intCast(render.glyph.offset_y + shaper_cell.y_offset),
                 },
-            });
+            };
+            if (clip_width) |width| {
+                const cell_px: i32 = @intCast(self.grid_metrics.cell_width);
+                const offset = cell_px * @as(i32, x);
+                if (!cellpkg.clipTextHorizontally(&glyph, -offset, cell_px * @as(i32, width) - offset)) return;
+            }
+            try self.cells.add(self.alloc, .text, glyph);
         }
 
         fn addCursor(
             self: *Self,
-            cursor_state: *const terminal.RenderState.Cursor,
+            x: terminal.size.CellCountInt,
+            y: terminal.size.CellCountInt,
+            width: u3,
             cursor_style: renderer.CursorStyle,
             cursor_color: terminal.color.RGB,
         ) void {
-            const cursor_vp = cursor_state.viewport orelse return;
-
-            // Add the cursor. We render the cursor over the wide character if
-            // we're on the wide character tail.
-            const wide, const x = cell: {
-                // The cursor goes over the screen cursor position.
-                if (!cursor_vp.wide_tail) break :cell .{
-                    cursor_state.cell.wide == .wide,
-                    cursor_vp.x,
-                };
-
-                // If we're part of a wide character, we move the cursor back
-                // to the actual character.
-                break :cell .{ true, cursor_vp.x - 1 };
-            };
-
             const alpha: u8 = if (!self.focused) 255 else alpha: {
                 const alpha = 255 * self.config.cursor_opacity;
                 break :alpha @intFromFloat(@ceil(alpha));
@@ -3598,7 +3687,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         font.sprite_index,
                         @backingInt(sprite),
                         .{
-                            .cell_width = if (wide) 2 else 1,
+                            .cell_width = width,
                             .grid_metrics = self.grid_metrics,
                         },
                     ) catch |err| {
@@ -3613,7 +3702,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .regular,
                     .text,
                     .{
-                        .cell_width = if (wide) 2 else 1,
+                        .cell_width = width,
                         .grid_metrics = self.grid_metrics,
                     },
                 ) catch |err| {
@@ -3630,7 +3719,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.cells.setCursor(.{
                 .atlas = .grayscale,
                 .bools = .{ .is_cursor_glyph = true },
-                .grid_pos = .{ x, cursor_vp.y },
+                .grid_pos = .{ x, y },
                 .color = .{ cursor_color.r, cursor_color.g, cursor_color.b, alpha },
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
@@ -3681,9 +3770,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             });
 
             // Add underline
-            try self.addUnderline(@intCast(coord.x), @intCast(coord.y), .single, screen_fg, 255);
+            try self.addUnderline(@intCast(coord.x), @intCast(coord.y), 1, .single, screen_fg, 255);
             if (cp.wide and coord.x < self.cells.size.columns - 1) {
-                try self.addUnderline(@intCast(coord.x + 1), @intCast(coord.y), .single, screen_fg, 255);
+                try self.addUnderline(@intCast(coord.x + 1), @intCast(coord.y), 1, .single, screen_fg, 255);
             }
         }
 
@@ -3696,11 +3785,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             texture: *Texture,
         ) !void {
             if (atlas.size > texture.width) {
-                // Free our old texture
+                const replacement = try self.api.initAtlasTexture(atlas);
+                errdefer replacement.deinit();
+                try replacement.replaceRegion(0, 0, atlas.size, atlas.size, atlas.data);
                 texture.*.deinit();
-
-                // Reallocate
-                texture.* = try self.api.initAtlasTexture(atlas);
+                texture.* = replacement;
+                return;
             }
 
             try texture.replaceRegion(0, 0, atlas.size, atlas.size, atlas.data);

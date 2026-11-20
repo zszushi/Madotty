@@ -740,7 +740,7 @@ pub const ScreenFormatter = struct {
 
             // Pending wrap, we can't use CUP because it resets pending wrap.
             const start_x = switch (cursor.page_cell.wide) {
-                .spacer_tail => cursor.x - 1,
+                .spacer_tail => cursor.x - (cursor.page_cell.sizedTailOffset() orelse 1),
                 .narrow, .wide, .spacer_head => cursor.x,
             };
 
@@ -1259,7 +1259,7 @@ pub const PageFormatter = struct {
                 start_x: {
                     break :start_x switch (cells[start_x].wide) {
                         // Include the prior cell to get the full wide char
-                        .spacer_tail => start_x - 1,
+                        .spacer_tail => start_x - (cells[start_x].sizedTailOffset() orelse 1),
 
                         // If we're a spacer head on our first row then we
                         // skip this whole row.
@@ -1776,6 +1776,9 @@ pub const PageFormatter = struct {
                 .narrow, .wide => {},
                 .spacer_head, .spacer_tail => continue,
             }
+            if (comptime emit == .vt) {
+                if (cell.sizedWidth() != null) break;
+            }
 
             // Only text cells: bg-color cells synthesize styles and take
             // the slow path.
@@ -2080,12 +2083,15 @@ pub const PageFormatter = struct {
             return;
         }
 
+        const sized = if (emit == .vt) cell.sizedWidth() else null;
+        if (sized) |width| try writer.print("\x1b]66;w={d};", .{width});
         try self.writeCodepointWithReplacement(emit, writer, cell.content.codepoint.data);
         if (comptime tag == .codepoint_grapheme) {
             for (self.page.lookupGrapheme(cell).?) |cp| {
                 try self.writeCodepointWithReplacement(emit, writer, cp);
             }
         }
+        if (sized != null) try writer.writeAll("\x1b\\");
     }
 
     fn writeCodepointWithReplacement(
@@ -5828,6 +5834,37 @@ test "Terminal vt cursor preserves pending wrap after a wide character" {
     );
     defer alloc.free(target_contents);
     try testing.expectEqualStrings(source_contents, target_contents);
+}
+
+test "OSC 66 survives VT formatting at the right edge" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var source = try Terminal.init(testing.io, alloc, .{ .cols = 6, .rows = 2 });
+    defer source.deinit(alloc);
+    var source_stream = source.vtStream();
+    defer source_stream.deinit();
+    source_stream.nextSlice("ab\x1b]66;w=4;x y\x07");
+    try testing.expect(source.screens.active.cursor.pending_wrap);
+
+    var output: std.Io.Writer.Allocating = .init(alloc);
+    defer output.deinit();
+    var formatter: TerminalFormatter = .init(&source, .vt);
+    formatter.extra = .none;
+    formatter.extra.screen.cursor = true;
+    try formatter.format(&output.writer);
+
+    var target = try Terminal.init(testing.io, alloc, .{ .cols = 6, .rows = 2 });
+    defer target.deinit(alloc);
+    var target_stream = target.vtStream();
+    defer target_stream.deinit();
+    target_stream.nextSlice(output.writer.buffered());
+
+    const cursor = target.screens.active.cursor;
+    try testing.expect(cursor.pending_wrap);
+    const cells = cursor.page_pin.cells(.all);
+    try testing.expectEqual(@as(?u3, 4), cells[2].sizedWidth());
+    try testing.expectEqualSlices(u21, &.{ ' ', 'y' }, cursor.page_pin.node.page().lookupGrapheme(&cells[2]).?);
+    try testing.expectEqual(@as(?u3, 3), cells[5].sizedTailOffset());
 }
 
 test "Screen vt with style" {

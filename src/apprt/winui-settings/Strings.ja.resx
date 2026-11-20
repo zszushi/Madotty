@@ -1,0 +1,263 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <resheader name="resmimetype"><value>text/microsoft-resx</value></resheader>
+  <resheader name="version"><value>2.0</value></resheader>
+  <resheader name="reader"><value>System.Resources.ResXResourceReader, System.Windows.Forms</value></resheader>
+  <resheader name="writer"><value>System.Resources.ResXResourceWriter, System.Windows.Forms</value></resheader>
+  <data name="Save" xml:space="preserve"><value>保存</value></data>
+  <data name="Cancel" xml:space="preserve"><value>キャンセル</value></data>
+  <data name="EditConfig" xml:space="preserve"><value>設定ファイルを編集</value></data>
+  <data name="SettingsTitle" xml:space="preserve"><value>Madotty の設定</value></data>
+  <data name="TerminalBackground" xml:space="preserve"><value>端末の背景に合わせる</value></data>
+  <data name="System" xml:space="preserve"><value>システムに合わせる</value></data>
+  <data name="Light" xml:space="preserve"><value>ライト</value></data>
+  <data name="Dark" xml:space="preserve"><value>ダーク</value></data>
+  <data name="FollowConfig" xml:space="preserve"><value>設定ファイルに従う</value></data>
+  <data name="Solid" xml:space="preserve"><value>単色</value></data>
+  <data name="Mica" xml:space="preserve"><value>マイカ</value></data>
+  <data name="Acrylic" xml:space="preserve"><value>アクリル</value></data>
+  <data name="Always" xml:space="preserve"><value>常に表示</value></data>
+  <data name="MultipleTabs" xml:space="preserve"><value>タブが複数あるとき</value></data>
+  <data name="Never" xml:space="preserve"><value>表示しない</value></data>
+  <data name="AfterActive" xml:space="preserve"><value>現在のタブの右</value></data>
+  <data name="AtEnd" xml:space="preserve"><value>末尾</value></data>
+  <data name="Block" xml:space="preserve"><value>ブロック</value></data>
+  <data name="Bar" xml:space="preserve"><value>縦線</value></data>
+  <data name="Underline" xml:space="preserve"><value>下線</value></data>
+  <data name="HollowBlock" xml:space="preserve"><value>枠線のみ</value></data>
+  <data name="ContextMenu" xml:space="preserve"><value>コンテキストメニューを表示</value></data>
+  <data name="Paste" xml:space="preserve"><value>貼り付け</value></data>
+  <data name="Copy" xml:space="preserve"><value>コピー</value></data>
+  <data name="CopyOrPaste" xml:space="preserve"><value>選択時はコピー、それ以外は貼り付け</value></data>
+  <data name="DoNothing" xml:space="preserve"><value>何もしない</value></data>
+  <data name="Typography" xml:space="preserve"><value>フォント</value></data>
+  <data name="InterfaceFont" xml:space="preserve"><value>画面表示用フォント</value></data>
+  <data name="TerminalFont" xml:space="preserve"><value>端末のフォント</value></data>
+  <data name="TerminalFontSize" xml:space="preserve"><value>端末の文字サイズ (pt)</value></data>
+  <data name="WindowOpacity" xml:space="preserve"><value>ウィンドウの不透明度</value></data>
+  <data name="Window" xml:space="preserve"><value>ウィンドウ</value></data>
+  <data name="WindowTheme" xml:space="preserve"><value>ウィンドウのテーマ</value></data>
+  <data name="BackgroundMaterial" xml:space="preserve"><value>背景の素材</value></data>
+  <data name="Appearance" xml:space="preserve"><value>外観</value></data>
+  <data name="UnavailableProfile" xml:space="preserve"><value>利用できないプロファイル</value></data>
+  <data name="DefaultProfile" xml:space="preserve"><value>既定のプロファイル</value></data>
+  <data name="Startup" xml:space="preserve"><value>起動</value></data>
+  <data name="Terminal" xml:space="preserve"><value>端末</value></data>
+  <data name="Cursor" xml:space="preserve"><value>カーソル</value></data>
+  <data name="DefaultShape" xml:space="preserve"><value>既定の形状</value></data>
+  <data name="SelectionMouse" xml:space="preserve"><value>選択とマウス</value></data>
+  <data name="CopyOnSelect" xml:space="preserve"><value>選択時にコピー</value></data>
+  <data name="RightClick" xml:space="preserve"><value>右クリックの動作</value></data>
+  <data name="Tabs" xml:space="preserve"><value>タブ</value></data>
+  <data name="TabBar" xml:space="preserve"><value>タブバー</value></data>
+  <data name="Visibility" xml:space="preserve"><value>表示条件</value></data>
+  <data name="NewTabs" xml:space="preserve"><value>新しいタブ</value></data>
+  <data name="Position" xml:space="preserve"><value>追加位置</value></data>
+  <data name="InheritDirectory" xml:space="preserve"><value>作業フォルダーを引き継ぐ</value></data>
+  <data name="ProgressIndicators" xml:space="preserve"><value>進捗の表示</value></data>
+  <data name="ShowProgress" xml:space="preserve"><value>タブとタスクバーに表示</value></data>
+  <data name="Rendering" xml:space="preserve"><value>レンダリング</value></data>
+  <data name="GraphicsApi" xml:space="preserve"><value>グラフィックス API</value></data>
+  <data name="Shaders" xml:space="preserve"><value>シェーダー</value></data>
+  <data name="Keybindings" xml:space="preserve"><value>キーボードショートカット</value></data>
+  <data name="Privacy" xml:space="preserve"><value>プライバシー</value></data>
+  <data name="SettingsPages" xml:space="preserve"><value>設定ページ</value></data>
+  <data name="TintOpacity" xml:space="preserve"><value>端末の背景色の不透明度</value></data>
+  <data name="Automatic" xml:space="preserve"><value>自動</value></data>
+  <data name="SystemDefault" xml:space="preserve"><value>システムの既定</value></data>
+  <data name="PreviewSaved" xml:space="preserve"><value>プレビューを保存しました</value></data>
+  <data name="ChangeFailed" xml:space="preserve"><value>変更を適用できませんでした。</value></data>
+  <data name="Waiting" xml:space="preserve"><value>Madotty の応答を待っています…</value></data>
+  <data name="SavingDisabled" xml:space="preserve"><value>今回の起動では設定を保存できません。</value></data>
+  <data name="SearchThemes" xml:space="preserve"><value>テーマを検索</value></data>
+  <data name="Theme" xml:space="preserve"><value>テーマ</value></data>
+  <data name="DarkTheme" xml:space="preserve"><value>ダークテーマ</value></data>
+  <data name="LightTheme" xml:space="preserve"><value>ライトテーマ</value></data>
+  <data name="TerminalColors" xml:space="preserve"><value>端末の配色</value></data>
+  <data name="SeparateThemes" xml:space="preserve"><value>ライトとダークで別のテーマを使う</value></data>
+  <data name="LoadThemesFailed" xml:space="preserve"><value>端末のテーマを読み込めませんでした。</value></data>
+  <data name="ThemeListStalled" xml:space="preserve"><value>テーマ一覧の続きを読み込めませんでした。</value></data>
+  <data name="DefaultTerminal" xml:space="preserve"><value>既定のターミナル アプリ</value></data>
+  <data name="RequiresWin11" xml:space="preserve"><value>Windows 11 が必要です。</value></data>
+  <data name="IsDefault" xml:space="preserve"><value>Madotty が既定のターミナルです。</value></data>
+  <data name="ChooseInWindows" xml:space="preserve"><value>Windows の設定で選ぶ</value></data>
+  <data name="Register" xml:space="preserve"><value>Madotty を登録</value></data>
+  <data name="NotRegistered" xml:space="preserve"><value>登録には信頼済みの連携パッケージが必要です。</value></data>
+  <data name="RegistrationCheckFailed" xml:space="preserve"><value>ターミナルの登録状態を確認できませんでした。</value></data>
+  <data name="TrustedPackageRequired" xml:space="preserve"><value>信頼された署名付きの Madotty 連携パッケージが必要です。</value></data>
+  <data name="TerminalNotListed" xml:space="preserve"><value>Windows のターミナル一覧に Madotty が表示されていません。</value></data>
+  <data name="OpenSettingsFailed" xml:space="preserve"><value>Windows の設定を開けませんでした。</value></data>
+  <data name="Ask" xml:space="preserve"><value>そのつど確認</value></data>
+  <data name="Allow" xml:space="preserve"><value>許可</value></data>
+  <data name="Deny" xml:space="preserve"><value>拒否</value></data>
+  <data name="Clipboard" xml:space="preserve"><value>クリップボード</value></data>
+  <data name="ReadAccess" xml:space="preserve"><value>端末内のプログラムによる読み取り</value></data>
+  <data name="WriteAccess" xml:space="preserve"><value>端末内のプログラムによる書き込み</value></data>
+  <data name="ConfirmPaste" xml:space="preserve"><value>安全でない貼り付けの前に確認</value></data>
+  <data name="LinksNotifications" xml:space="preserve"><value>リンクと通知</value></data>
+  <data name="DetectUrls" xml:space="preserve"><value>端末のテキスト内の URL を検出</value></data>
+  <data name="AllowNotifications" xml:space="preserve"><value>デスクトップ通知を許可</value></data>
+  <data name="SearchActions" xml:space="preserve"><value>操作名またはショートカットで検索</value></data>
+  <data name="SearchKeybindings" xml:space="preserve"><value>ショートカットを検索</value></data>
+  <data name="LoadingKeybindings" xml:space="preserve"><value>ショートカットを読み込み中…</value></data>
+  <data name="NoKeybindings" xml:space="preserve"><value>ショートカットは設定されていません。</value></data>
+  <data name="NoKeybindingMatches" xml:space="preserve"><value>一致するショートカットはありません。</value></data>
+  <data name="LoadKeybindingsFailed" xml:space="preserve"><value>ショートカットを読み込めませんでした。</value></data>
+  <data name="KeybindingListStalled" xml:space="preserve"><value>ショートカット一覧の続きを読み込めませんでした。</value></data>
+  <data name="Global" xml:space="preserve"><value>グローバル</value></data>
+  <data name="AllTerminals" xml:space="preserve"><value>すべての端末</value></data>
+  <data name="PassInput" xml:space="preserve"><value>入力を端末にも送る</value></data>
+  <data name="WhenAvailable" xml:space="preserve"><value>操作できるときのみ</value></data>
+  <data name="AddGlsl" xml:space="preserve"><value>GLSL を追加…</value></data>
+  <data name="Remove" xml:space="preserve"><value>削除</value></data>
+  <data name="MoveUp" xml:space="preserve"><value>上へ</value></data>
+  <data name="MoveDown" xml:space="preserve"><value>下へ</value></data>
+  <data name="OptionalFile" xml:space="preserve"><value>ファイルがなくても続行</value></data>
+  <data name="NoShaders" xml:space="preserve"><value>シェーダーは追加されていません</value></data>
+  <data name="WhenContentChanges" xml:space="preserve"><value>内容が変わったとき</value></data>
+  <data name="WhenFocused" xml:space="preserve"><value>フォーカスがあるとき</value></data>
+  <data name="AlwaysAnimate" xml:space="preserve"><value>常に再生</value></data>
+  <data name="ShaderOrder" xml:space="preserve"><value>シェーダーの適用順</value></data>
+  <data name="ShaderPasses" xml:space="preserve"><value>適用するシェーダー</value></data>
+  <data name="Playback" xml:space="preserve"><value>再生</value></data>
+  <data name="Animation" xml:space="preserve"><value>アニメーション</value></data>
+  <data name="Parameters" xml:space="preserve"><value>パラメーター</value></data>
+  <data name="AddShader" xml:space="preserve"><value>GLSL シェーダーを追加</value></data>
+  <data name="LoadShaderFailed" xml:space="preserve"><value>シェーダーのパラメーターを読み込めませんでした。</value></data>
+  <data name="UnavailableItem" xml:space="preserve"><value>{0}（利用不可）</value></data>
+  <data name="CurrentRenderer" xml:space="preserve"><value>現在は {0} を使用しています。</value></data>
+  <data name="RendererUnavailable" xml:space="preserve"><value>{0} は利用できません。</value></data>
+  <data name="RendererFailed" xml:space="preserve"><value>{0} を起動できませんでした。</value></data>
+  <data name="NextLaunch" xml:space="preserve"><value>変更は次回の起動時に反映されます。</value></data>
+  <data name="BindingTable" xml:space="preserve"><value>テーブル {0}</value></data>
+  <data name="DefaultValue" xml:space="preserve"><value>既定値：{0:G}</value></data>
+  <data name="Action_ignore" xml:space="preserve"><value>入力を無視</value></data>
+  <data name="Action_unbind" xml:space="preserve"><value>割り当てを解除</value></data>
+  <data name="Action_csi" xml:space="preserve"><value>CSI シーケンスを送信</value></data>
+  <data name="Action_esc" xml:space="preserve"><value>ESC シーケンスを送信</value></data>
+  <data name="Action_text" xml:space="preserve"><value>テキストを送信</value></data>
+  <data name="Action_cursor_key" xml:space="preserve"><value>カーソルキーを送信</value></data>
+  <data name="Action_reset" xml:space="preserve"><value>端末をリセット</value></data>
+  <data name="Action_copy_to_clipboard" xml:space="preserve"><value>クリップボードにコピー</value></data>
+  <data name="Action_paste_from_clipboard" xml:space="preserve"><value>クリップボードから貼り付け</value></data>
+  <data name="Action_paste_from_selection" xml:space="preserve"><value>選択内容を貼り付け</value></data>
+  <data name="Action_copy_url_to_clipboard" xml:space="preserve"><value>URL をコピー</value></data>
+  <data name="Action_copy_title_to_clipboard" xml:space="preserve"><value>タイトルをコピー</value></data>
+  <data name="Action_increase_font_size" xml:space="preserve"><value>文字を大きくする</value></data>
+  <data name="Action_decrease_font_size" xml:space="preserve"><value>文字を小さくする</value></data>
+  <data name="Action_reset_font_size" xml:space="preserve"><value>文字サイズを元に戻す</value></data>
+  <data name="Action_set_font_size" xml:space="preserve"><value>文字サイズを設定</value></data>
+  <data name="Action_search" xml:space="preserve"><value>テキストを検索</value></data>
+  <data name="Action_search_selection" xml:space="preserve"><value>選択範囲を検索</value></data>
+  <data name="Action_navigate_search" xml:space="preserve"><value>検索結果を移動</value></data>
+  <data name="Action_start_search" xml:space="preserve"><value>検索を開始</value></data>
+  <data name="Action_end_search" xml:space="preserve"><value>検索を終了</value></data>
+  <data name="Action_clear_screen" xml:space="preserve"><value>画面を消去</value></data>
+  <data name="Action_select_all" xml:space="preserve"><value>すべて選択</value></data>
+  <data name="Action_scroll_to_top" xml:space="preserve"><value>先頭までスクロール</value></data>
+  <data name="Action_scroll_to_bottom" xml:space="preserve"><value>末尾までスクロール</value></data>
+  <data name="Action_scroll_to_selection" xml:space="preserve"><value>選択箇所までスクロール</value></data>
+  <data name="Action_scroll_to_row" xml:space="preserve"><value>指定行までスクロール</value></data>
+  <data name="Action_scroll_page_up" xml:space="preserve"><value>前のページにスクロール</value></data>
+  <data name="Action_scroll_page_down" xml:space="preserve"><value>次のページにスクロール</value></data>
+  <data name="Action_scroll_page_fractional" xml:space="preserve"><value>指定したページ幅でスクロール</value></data>
+  <data name="Action_scroll_page_lines" xml:space="preserve"><value>指定した行数だけスクロール</value></data>
+  <data name="Action_adjust_selection" xml:space="preserve"><value>選択範囲を調整</value></data>
+  <data name="Action_jump_to_prompt" xml:space="preserve"><value>プロンプトへ移動</value></data>
+  <data name="Action_write_scrollback_file" xml:space="preserve"><value>履歴をファイルに書き出す</value></data>
+  <data name="Action_write_screen_file" xml:space="preserve"><value>画面をファイルに書き出す</value></data>
+  <data name="Action_write_selection_file" xml:space="preserve"><value>選択範囲をファイルに書き出す</value></data>
+  <data name="Action_new_window" xml:space="preserve"><value>新しいウィンドウを開く</value></data>
+  <data name="Action_new_tab" xml:space="preserve"><value>新しいタブを開く</value></data>
+  <data name="Action_previous_tab" xml:space="preserve"><value>前のタブへ移動</value></data>
+  <data name="Action_next_tab" xml:space="preserve"><value>次のタブへ移動</value></data>
+  <data name="Action_last_tab" xml:space="preserve"><value>最後のタブへ移動</value></data>
+  <data name="Action_goto_tab" xml:space="preserve"><value>指定したタブへ移動</value></data>
+  <data name="Action_move_tab" xml:space="preserve"><value>タブを移動</value></data>
+  <data name="Action_move_tab_to_new_window" xml:space="preserve"><value>タブを新しいウィンドウに移動</value></data>
+  <data name="Action_toggle_tab_overview" xml:space="preserve"><value>タブ一覧を切り替え</value></data>
+  <data name="Action_prompt_surface_title" xml:space="preserve"><value>端末名を変更</value></data>
+  <data name="Action_prompt_tab_title" xml:space="preserve"><value>タブ名を変更</value></data>
+  <data name="Action_prompt_window_title" xml:space="preserve"><value>ウィンドウ名を変更</value></data>
+  <data name="Action_set_surface_title" xml:space="preserve"><value>端末名を設定</value></data>
+  <data name="Action_set_tab_title" xml:space="preserve"><value>タブ名を設定</value></data>
+  <data name="Action_set_window_title" xml:space="preserve"><value>ウィンドウ名を設定</value></data>
+  <data name="Action_new_split" xml:space="preserve"><value>ペインを分割</value></data>
+  <data name="Action_goto_split" xml:space="preserve"><value>別のペインへ移動</value></data>
+  <data name="Action_goto_window" xml:space="preserve"><value>別のウィンドウへ移動</value></data>
+  <data name="Action_toggle_split_zoom" xml:space="preserve"><value>ペインの拡大を切り替え</value></data>
+  <data name="Action_toggle_readonly" xml:space="preserve"><value>読み取り専用を切り替え</value></data>
+  <data name="Action_resize_split" xml:space="preserve"><value>ペインのサイズを変更</value></data>
+  <data name="Action_equalize_splits" xml:space="preserve"><value>ペインのサイズをそろえる</value></data>
+  <data name="Action_reset_window_size" xml:space="preserve"><value>ウィンドウサイズを元に戻す</value></data>
+  <data name="Action_inspector" xml:space="preserve"><value>インスペクターを操作</value></data>
+  <data name="Action_show_gtk_inspector" xml:space="preserve"><value>GTK インスペクターを表示</value></data>
+  <data name="Action_show_on_screen_keyboard" xml:space="preserve"><value>スクリーンキーボードを表示</value></data>
+  <data name="Action_open_config" xml:space="preserve"><value>設定を開く</value></data>
+  <data name="Action_reload_config" xml:space="preserve"><value>設定を再読み込み</value></data>
+  <data name="Action_close_surface" xml:space="preserve"><value>端末を閉じる</value></data>
+  <data name="Action_close_tab" xml:space="preserve"><value>タブを閉じる</value></data>
+  <data name="Action_close_window" xml:space="preserve"><value>ウィンドウを閉じる</value></data>
+  <data name="Action_close_all_windows" xml:space="preserve"><value>すべてのウィンドウを閉じる</value></data>
+  <data name="Action_toggle_maximize" xml:space="preserve"><value>最大化を切り替え</value></data>
+  <data name="Action_toggle_fullscreen" xml:space="preserve"><value>全画面表示を切り替え</value></data>
+  <data name="Action_toggle_window_decorations" xml:space="preserve"><value>ウィンドウ枠を切り替え</value></data>
+  <data name="Action_toggle_window_float_on_top" xml:space="preserve"><value>最前面表示を切り替え</value></data>
+  <data name="Action_toggle_secure_input" xml:space="preserve"><value>セキュア入力を切り替え</value></data>
+  <data name="Action_toggle_mouse_reporting" xml:space="preserve"><value>マウスイベントの送信を切り替え</value></data>
+  <data name="Action_reset_mouse_reporting" xml:space="preserve"><value>マウスイベントの送信をリセット</value></data>
+  <data name="Action_toggle_command_palette" xml:space="preserve"><value>コマンドパレットを切り替え</value></data>
+  <data name="Action_toggle_quick_terminal" xml:space="preserve"><value>クイックターミナルを切り替え</value></data>
+  <data name="Action_toggle_visibility" xml:space="preserve"><value>表示を切り替え</value></data>
+  <data name="Action_toggle_background_opacity" xml:space="preserve"><value>背景の不透明度を切り替え</value></data>
+  <data name="Action_check_for_updates" xml:space="preserve"><value>更新を確認</value></data>
+  <data name="Action_undo" xml:space="preserve"><value>元に戻す</value></data>
+  <data name="Action_redo" xml:space="preserve"><value>やり直す</value></data>
+  <data name="Action_end_key_sequence" xml:space="preserve"><value>キーシーケンスを終了</value></data>
+  <data name="Action_activate_key_table" xml:space="preserve"><value>キーテーブルを有効にする</value></data>
+  <data name="Action_activate_key_table_once" xml:space="preserve"><value>次の入力だけキーテーブルを有効にする</value></data>
+  <data name="Action_deactivate_key_table" xml:space="preserve"><value>キーテーブルを無効にする</value></data>
+  <data name="Action_deactivate_all_key_tables" xml:space="preserve"><value>すべてのキーテーブルを無効にする</value></data>
+  <data name="Action_quit" xml:space="preserve"><value>Madotty を終了</value></data>
+  <data name="Action_crash" xml:space="preserve"><value>クラッシュを発生させる</value></data>
+  <data name="On" xml:space="preserve"><value>オン</value></data>
+  <data name="Off" xml:space="preserve"><value>オフ</value></data>
+  <data name="SettingsDataMissing" xml:space="preserve"><value>設定データが届きませんでした。</value></data>
+  <data name="SettingsDataInvalid" xml:space="preserve"><value>設定データに無効な値が含まれています。</value></data>
+  <data name="ClipboardPolicyUnknown" xml:space="preserve"><value>クリップボードのアクセス許可が無効です。</value></data>
+  <data name="TerminalColorInvalid" xml:space="preserve"><value>端末の色が無効です。</value></data>
+  <data name="ProfileIdMissing" xml:space="preserve"><value>プロファイル ID がありません。</value></data>
+  <data name="ProfileNameMissing" xml:space="preserve"><value>プロファイル名がありません。</value></data>
+  <data name="GraphicsApiInvalid" xml:space="preserve"><value>設定されたグラフィックス API が無効です。</value></data>
+  <data name="ShaderAnimationInvalid" xml:space="preserve"><value>シェーダーの再生条件が無効です。</value></data>
+  <data name="ShaderRangeInvalid" xml:space="preserve"><value>シェーダーパラメーターの範囲が無効です。</value></data>
+  <data name="ShaderPassInvalid" xml:space="preserve"><value>シェーダーパラメーターの適用先が無効です。</value></data>
+  <data name="ShaderFieldString" xml:space="preserve"><value>シェーダーの「{0}」には文字列が必要です。</value></data>
+  <data name="ShaderFieldFinite" xml:space="preserve"><value>シェーダーの「{0}」には有限の数値が必要です。</value></data>
+  <data name="ConnectionUnavailable" xml:space="preserve"><value>Madotty に接続できません。</value></data>
+  <data name="SettingsMessageTooLarge" xml:space="preserve"><value>設定データが大きすぎます。</value></data>
+  <data name="ConnectionClosed" xml:space="preserve"><value>Madotty との接続が切れました。</value></data>
+  <data name="InvalidKeybinding" xml:space="preserve"><value>ショートカットの設定が無効です。</value></data>
+  <data name="Option_left" xml:space="preserve"><value>左</value></data>
+  <data name="Option_right" xml:space="preserve"><value>右</value></data>
+  <data name="Option_up" xml:space="preserve"><value>上</value></data>
+  <data name="Option_down" xml:space="preserve"><value>下</value></data>
+  <data name="Option_previous" xml:space="preserve"><value>前</value></data>
+  <data name="Option_next" xml:space="preserve"><value>次</value></data>
+  <data name="Option_top" xml:space="preserve"><value>上端</value></data>
+  <data name="Option_bottom" xml:space="preserve"><value>下端</value></data>
+  <data name="Option_page_up" xml:space="preserve"><value>前のページ</value></data>
+  <data name="Option_page_down" xml:space="preserve"><value>次のページ</value></data>
+  <data name="Option_home" xml:space="preserve"><value>先頭</value></data>
+  <data name="Option_end" xml:space="preserve"><value>末尾</value></data>
+  <data name="Option_beginning_of_line" xml:space="preserve"><value>行頭</value></data>
+  <data name="Option_end_of_line" xml:space="preserve"><value>行末</value></data>
+  <data name="Option_auto" xml:space="preserve"><value>自動</value></data>
+  <data name="Option_plain" xml:space="preserve"><value>プレーンテキスト</value></data>
+  <data name="Option_html" xml:space="preserve"><value>HTML</value></data>
+  <data name="Option_vt" xml:space="preserve"><value>VT エスケープシーケンス</value></data>
+  <data name="Option_mixed" xml:space="preserve"><value>テキストと HTML</value></data>
+  <data name="Option_toggle" xml:space="preserve"><value>切り替え</value></data>
+  <data name="Option_show" xml:space="preserve"><value>表示</value></data>
+  <data name="Option_hide" xml:space="preserve"><value>非表示</value></data>
+</root>

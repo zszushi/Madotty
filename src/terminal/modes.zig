@@ -98,6 +98,11 @@ pub const ModeState = struct {
             return .{ .tag = tag, .state = .permanently_reset };
         }
 
+        // Each Sixel bitmap has its own color registers.
+        if (build_options.kitty_graphics and !tag.ansi and tag.value == 1070) {
+            return .{ .tag = tag, .state = .permanently_set };
+        }
+
         // These unimplemented ANSI modes report fixed reset, matching
         // xterm: GATM, SRTM, VEM, HEM, PUM, FEAM, FETM, MATM, TTM, SATM,
         // TSM, EBM. Report permanently_reset instead of not_recognized so
@@ -356,6 +361,7 @@ pub fn defaultConfigurable(mode: Mode) bool {
 ///
 /// NOTE: When adding a new mode entry, also add a corresponding
 /// GHOSTTY_MODE_* macro in include/ghostty/vt/modes.h.
+/// Append entries to preserve the packed bit positions used by snapshots.
 const entries: []const ModeEntry = &.{
     // ANSI
     .{ .name = "disable_keyboard", .value = 2, .ansi = true }, // KAM
@@ -418,6 +424,8 @@ const entries: []const ModeEntry = &.{
         .disabled = build_options.artifact != .lib and builtin.target.os.tag == .windows,
     },
     .{ .name = "win32_input", .value = 9001 },
+    .{ .name = "sixel_display_mode", .value = 80, .disabled = !build_options.kitty_graphics },
+    .{ .name = "sixel_cursor_right", .value = 8452, .disabled = !build_options.kitty_graphics },
 };
 
 test {

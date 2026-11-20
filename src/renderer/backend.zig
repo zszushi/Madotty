@@ -5,6 +5,8 @@ const WasmTarget = @import("../os/wasm/target.zig").Target;
 pub const Backend = enum {
     opengl,
     metal,
+    d3d12,
+    vulkan,
 
     pub fn default(
         target: std.Target,

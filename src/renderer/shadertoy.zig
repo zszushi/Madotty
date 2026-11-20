@@ -5,8 +5,7 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 const glslang = @import("glslang");
 const spvcross = @import("spirv_cross");
 const configpkg = @import("../config.zig");
-const compat_file = @import("../lib/compat/file.zig");
-const global = @import("../global.zig");
+const shader_parameters = @import("shader_parameters.zig");
 
 const log = std.log.scoped(.shadertoy);
 
@@ -42,26 +41,38 @@ pub const Uniforms = extern struct {
 };
 
 /// The target to load shaders for.
-pub const Target = enum { glsl, msl };
+pub const Target = enum { glsl, msl, hlsl, spirv };
 
 /// Load a set of shaders from files and convert them to the target
-/// format. The shader order is preserved.
+/// format. The shader order is preserved. SPIR-V is returned as bytes,
+/// which can contain zeroes before the trailing sentinel.
 pub fn loadFromFiles(
     alloc_gpa: Allocator,
     paths: configpkg.RepeatablePath,
     target: Target,
+    parameter_values: []const [:0]const u8,
 ) ![]const [:0]const u8 {
     var list: std.ArrayList([:0]const u8) = .empty;
     defer list.deinit(alloc_gpa);
     errdefer for (list.items) |shader| alloc_gpa.free(shader);
 
-    for (paths.value.items) |item| {
+    var overrides: std.ArrayList(shader_parameters.Override) = .empty;
+    defer overrides.deinit(alloc_gpa);
+    for (parameter_values) |value| {
+        const parsed = shader_parameters.parseOverride(value) catch {
+            log.warn("ignoring invalid custom shader parameter '{s}'", .{value});
+            continue;
+        };
+        try overrides.append(alloc_gpa, parsed);
+    }
+
+    for (paths.value.items, 1..) |item, pass| {
         const path, const optional = switch (item) {
             .optional => |path| .{ path, true },
             .required => |path| .{ path, false },
         };
 
-        const shader = loadFromFile(alloc_gpa, path, target) catch |err| {
+        const shader = loadPass(alloc_gpa, path, target, pass, overrides.items) catch |err| {
             if (err == error.FileNotFound and optional) {
                 continue;
             }
@@ -69,7 +80,10 @@ pub fn loadFromFiles(
             return err;
         };
         log.info("loaded custom shader path={s}", .{path});
-        try list.append(alloc_gpa, shader);
+        list.append(alloc_gpa, shader) catch |err| {
+            alloc_gpa.free(shader);
+            return err;
+        };
     }
 
     return try list.toOwnedSlice(alloc_gpa);
@@ -82,33 +96,42 @@ pub fn loadFromFile(
     path: []const u8,
     target: Target,
 ) ![:0]const u8 {
+    return loadPass(alloc_gpa, path, target, 1, &.{});
+}
+
+fn loadPass(
+    alloc_gpa: Allocator,
+    path: []const u8,
+    target: Target,
+    pass: usize,
+    overrides: []const shader_parameters.Override,
+) ![:0]const u8 {
     var arena = ArenaAllocator.init(alloc_gpa);
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    // Read it all into memory -- we don't expect shaders to be large.
-    const src = src: {
-        // Load the shader file
-        const cwd = std.Io.Dir.cwd();
-        const file = try cwd.openFile(global.io(), path, .{});
-        defer file.close(global.io());
-        break :src try compat_file.readToEndAlloc(
-            file,
-            alloc,
-            4 * 1024 * 1024, // 4MB
-        );
+    const source = try shader_parameters.readSource(alloc, path);
+    const rewritten = shader_parameters.rewrite(alloc, source, pass, overrides) catch |err| switch (err) {
+        error.InvalidShaderParameter => blk: {
+            log.warn("ignoring custom shader overrides for invalid declarations path={s}", .{path});
+            break :blk null;
+        },
+        else => return err,
     };
+    return compileSource(alloc_gpa, alloc, path, rewritten orelse source, target);
+}
 
+fn compileSource(alloc_gpa: Allocator, alloc: Allocator, path: []const u8, src: []const u8, target: Target) ![:0]const u8 {
     // Convert to full GLSL
     const glsl: [:0]const u8 = glsl: {
         var stream: std.Io.Writer.Allocating = .init(alloc);
-        try glslFromShader(&stream.writer, src);
+        try writeGlslSource(&stream.writer, src, target);
         try stream.writer.writeByte(0);
         break :glsl stream.written()[0 .. stream.written().len - 1 :0];
     };
 
     // Convert to SPIR-V
-    const spirv: []const u8 = spirv: {
+    const spirv: []align(@alignOf(u32)) const u8 = spirv: {
         var stream: std.Io.Writer.Allocating = .init(alloc);
         var errlog: SpirvLog = .{ .alloc = alloc };
         defer errlog.deinit();
@@ -131,12 +154,20 @@ pub fn loadFromFile(
         break :spirv list.items;
     };
 
-    // Convert to MSL
+    // Convert to the renderer's shader language.
     return switch (target) {
         // Important: using the alloc_gpa here on purpose because this
         // is the final result that will be returned to the caller.
         .glsl => try glslFromSpv(alloc_gpa, spirv),
         .msl => try mslFromSpv(alloc_gpa, spirv),
+        .hlsl => try hlslFromSpv(alloc_gpa, spirv),
+        .spirv => blk: {
+            validateVulkanSpirv(spirv) catch |err| {
+                log.warn("Vulkan custom shader interface does not match the postprocess pipeline path={s} err={t}", .{ path, err });
+                return err;
+            };
+            break :blk try alloc_gpa.dupeSentinel(u8, spirv, 0);
+        },
     };
 }
 
@@ -147,10 +178,91 @@ pub fn loadFromFile(
 /// will convert the ShaderToy shader into a valid GLSL shader that can be
 /// compiled and linked.
 pub fn glslFromShader(writer: *std.Io.Writer, src: []const u8) !void {
-    const prefix = @embedFile("shaders/shadertoy_prefix.glsl");
-    try writer.writeAll(prefix);
+    return writeGlslSource(writer, src, .glsl);
+}
+
+fn writeGlslSource(writer: *std.Io.Writer, src: []const u8, target: Target) !void {
+    try writer.writeAll("#version 430 core\n");
+    switch (target) {
+        .glsl, .msl => {},
+        // Keep the builtin coordinate for SV_Position and Vulkan FragCoord.
+        .hlsl => try writer.writeAll("#define GHOSTTY_NATIVE_FRAG_COORD\n"),
+        .spirv => try writer.writeAll(
+            "#define GHOSTTY_NATIVE_FRAG_COORD\n#define GHOSTTY_VULKAN_POSTPROCESS\n",
+        ),
+    }
+    try writer.writeAll(@embedFile("shaders/shadertoy_prefix.glsl"));
     try writer.writeAll("\n\n");
     try writer.writeAll(src);
+}
+
+/// Vulkan pipes the compiled fragment module directly into a fixed pipeline.
+/// Restrict its active interface to the resources that pipeline supplies.
+fn validateVulkanSpirv(spirv: []align(@alignOf(u32)) const u8) !void {
+    const c = spvcross.c;
+    var ctx: c.spvc_context = undefined;
+    if (c.spvc_context_create(&ctx) != c.SPVC_SUCCESS) return error.SpvcFailed;
+    defer c.spvc_context_destroy(ctx);
+
+    var ir: c.spvc_parsed_ir = undefined;
+    if (c.spvc_context_parse_spirv(ctx, @ptrCast(spirv.ptr), spirv.len / @sizeOf(u32), &ir) != c.SPVC_SUCCESS)
+        return error.SpvcFailed;
+    var compiler: c.spvc_compiler = undefined;
+    if (c.spvc_context_create_compiler(ctx, c.SPVC_BACKEND_NONE, ir, c.SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &compiler) != c.SPVC_SUCCESS)
+        return error.SpvcFailed;
+    var modes: [*c]const c.SpvExecutionMode = undefined;
+    var mode_count: usize = undefined;
+    if (c.spvc_compiler_get_execution_modes(compiler, &modes, &mode_count) != c.SPVC_SUCCESS)
+        return error.SpvcFailed;
+    if (c.spvc_compiler_get_execution_model(compiler) != c.SpvExecutionModelFragment or
+        std.mem.indexOfScalar(c.SpvExecutionMode, modes[0..mode_count], c.SpvExecutionModeOriginUpperLeft) == null)
+        return error.InvalidVulkanShaderInterface;
+    var active: c.spvc_set = undefined;
+    if (c.spvc_compiler_get_active_interface_variables(compiler, &active) != c.SPVC_SUCCESS)
+        return error.SpvcFailed;
+    var resources: c.spvc_resources = undefined;
+    if (c.spvc_compiler_create_shader_resources_for_active_variables(compiler, &resources, active) != c.SPVC_SUCCESS)
+        return error.SpvcFailed;
+
+    var entries: [*c]const c.spvc_reflected_resource = undefined;
+    var count: usize = undefined;
+    for ([_]c.spvc_resource_type{
+        c.SPVC_RESOURCE_TYPE_UNIFORM_BUFFER,
+        c.SPVC_RESOURCE_TYPE_SAMPLED_IMAGE,
+        c.SPVC_RESOURCE_TYPE_STAGE_INPUT,
+        c.SPVC_RESOURCE_TYPE_STAGE_OUTPUT,
+        c.SPVC_RESOURCE_TYPE_STORAGE_BUFFER,
+        c.SPVC_RESOURCE_TYPE_SUBPASS_INPUT,
+        c.SPVC_RESOURCE_TYPE_STORAGE_IMAGE,
+        c.SPVC_RESOURCE_TYPE_ATOMIC_COUNTER,
+        c.SPVC_RESOURCE_TYPE_PUSH_CONSTANT,
+        c.SPVC_RESOURCE_TYPE_SEPARATE_IMAGE,
+        c.SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS,
+        c.SPVC_RESOURCE_TYPE_ACCELERATION_STRUCTURE,
+        c.SPVC_RESOURCE_TYPE_SHADER_RECORD_BUFFER,
+    }) |kind| {
+        if (c.spvc_resources_get_resource_list_for_type(resources, kind, &entries, &count) != c.SPVC_SUCCESS)
+            return error.SpvcFailed;
+        if (count == 0) continue;
+        if (count > 1) return error.InvalidVulkanShaderInterface;
+        const resource = entries[0];
+        switch (kind) {
+            c.SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, c.SPVC_RESOURCE_TYPE_SAMPLED_IMAGE => {
+                const globals = kind == c.SPVC_RESOURCE_TYPE_UNIFORM_BUFFER;
+                const id = if (globals) resource.base_type_id else resource.id;
+                const name = std.mem.span(c.spvc_compiler_get_name(compiler, id));
+                if (!std.mem.eql(u8, name, if (globals) "Globals" else "iChannel0") or
+                    c.spvc_compiler_get_decoration(compiler, resource.id, c.SpvDecorationDescriptorSet) != 0 or
+                    c.spvc_compiler_get_decoration(compiler, resource.id, c.SpvDecorationBinding) != @intFromBool(!globals))
+                    return error.InvalidVulkanShaderInterface;
+            },
+            c.SPVC_RESOURCE_TYPE_STAGE_OUTPUT => {
+                if (c.spvc_compiler_get_decoration(compiler, resource.id, c.SpvDecorationLocation) != 0)
+                    return error.InvalidVulkanShaderInterface;
+            },
+            else => return error.InvalidVulkanShaderInterface,
+        }
+    }
 }
 
 /// Convert a GLSL shader into SPIR-V assembly.
@@ -243,7 +355,7 @@ pub const SpirvLog = struct {
 pub fn mslFromSpv(alloc: Allocator, spv: []const u8) ![:0]const u8 {
     const c = spvcross.c;
     return try spvCross(alloc, spvcross.c.SPVC_BACKEND_MSL, spv, (struct {
-        fn setOptions(options: c.spvc_compiler_options) error{SpvcFailed}!void {
+        fn setOptions(_: c.spvc_compiler, options: c.spvc_compiler_options) error{SpvcFailed}!void {
             // We enable decoration binding, because we need this
             // to properly locate the uniform block to index 1.
             if (c.spvc_compiler_options_set_bool(
@@ -263,7 +375,7 @@ pub fn glslFromSpv(alloc: Allocator, spv: []const u8) ![:0]const u8 {
 
     const c = spvcross.c;
     return try spvCross(alloc, c.SPVC_BACKEND_GLSL, spv, (struct {
-        fn setOptions(options: c.spvc_compiler_options) error{SpvcFailed}!void {
+        fn setOptions(_: c.spvc_compiler, options: c.spvc_compiler_options) error{SpvcFailed}!void {
             if (c.spvc_compiler_options_set_uint(
                 options,
                 c.SPVC_COMPILER_OPTION_GLSL_VERSION,
@@ -275,11 +387,36 @@ pub fn glslFromSpv(alloc: Allocator, spv: []const u8) ![:0]const u8 {
     }).setOptions);
 }
 
+/// Convert SPIR-V binary to HLSL for the D3D12 postprocess pipeline.
+pub fn hlslFromSpv(alloc: Allocator, spv: []const u8) ![:0]const u8 {
+    const c = spvcross.c;
+    return spvCross(alloc, c.SPVC_BACKEND_HLSL, spv, (struct {
+        fn setOptions(compiler: c.spvc_compiler, options: c.spvc_compiler_options) error{SpvcFailed}!void {
+            if (c.spvc_compiler_options_set_uint(
+                options,
+                c.SPVC_COMPILER_OPTION_HLSL_SHADER_MODEL,
+                60,
+            ) != c.SPVC_SUCCESS) return error.SpvcFailed;
+
+            // The shared GLSL prefix declares Globals at binding 1 and
+            // iChannel0 at binding 0. D3D12 uses b0, t0 and s0.
+            var globals: c.spvc_hlsl_resource_binding = undefined;
+            c.spvc_hlsl_resource_binding_init(&globals);
+            globals.stage = c.SpvExecutionModelFragment;
+            globals.desc_set = 0;
+            globals.binding = 1;
+            globals.cbv = .{ .register_space = 0, .register_binding = 0 };
+            if (c.spvc_compiler_hlsl_add_resource_binding(compiler, &globals) != c.SPVC_SUCCESS)
+                return error.SpvcFailed;
+        }
+    }).setOptions);
+}
+
 fn spvCross(
     alloc: Allocator,
     backend: spvcross.c.spvc_backend,
     spv: []const u8,
-    comptime optionsFn_: ?*const fn (c: spvcross.c.spvc_compiler_options) error{SpvcFailed}!void,
+    comptime optionsFn_: ?*const fn (spvcross.c.spvc_compiler, spvcross.c.spvc_compiler_options) error{SpvcFailed}!void,
 ) ![:0]const u8 {
     // Spir-V is always a multiple of 4 because it is written as a series of words
     if (@mod(spv.len, 4) != 0) return error.SpirvInvalid;
@@ -329,7 +466,7 @@ fn spvCross(
             return error.SpvcFailed;
         }
 
-        try optionsFn(options);
+        try optionsFn(compiler, options);
 
         if (c.spvc_compiler_install_compiler_options(compiler, options) != c.SPVC_SUCCESS) {
             return error.SpvcFailed;
@@ -487,6 +624,78 @@ test "shadertoy to glsl" {
     defer alloc.free(glsl);
 
     // log.warn("glsl={s}", .{glsl});
+}
+
+test "shadertoy to hlsl uses Direct3D bindings and pixel coordinates" {
+    if (@import("../build_config.zig").renderer != .d3d12) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var glsl: std.Io.Writer.Allocating = .init(alloc);
+    defer glsl.deinit();
+    try writeGlslSource(&glsl.writer, test_crt, .hlsl);
+    const source = try glsl.toOwnedSliceSentinel(0);
+    defer alloc.free(source);
+
+    var buf: [4096 * 4]u8 align(4) = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try spirvFromGlsl(&writer, null, source);
+
+    const hlsl = try hlslFromSpv(alloc, writer.buffered());
+    defer alloc.free(hlsl);
+    for ([_][]const u8{ "register(b0, space0)", "register(t0, space0)", "register(s0, space0)", "SV_Position" }) |binding| {
+        try testing.expect(std.mem.indexOf(u8, hlsl, binding) != null);
+    }
+}
+
+test "shadertoy to spirv uses Vulkan bindings and native pixel coordinates" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    const binary = try compileSource(alloc, arena.allocator(), "crt.glsl", test_crt, .spirv);
+    defer alloc.free(binary);
+    try testing.expect(binary.len > 20 and binary.len % @sizeOf(u32) == 0);
+    try testing.expectEqual(@as(u32, 0x07230203), std.mem.readInt(u32, binary[0..4], .little));
+    try testing.expect(std.mem.indexOfScalar(u8, binary, 0) != null);
+    try testing.expectEqual(@as(u8, 0), binary[binary.len]);
+
+    const extra_sampler =
+        \\layout(set = 1, binding = 0) uniform sampler2D source;
+        \\void mainImage(out vec4 color, in vec2 pixel) {
+        \\    color = texture(source, pixel / iResolution.xy);
+        \\}
+    ;
+    try testing.expectError(error.InvalidVulkanShaderInterface, compileSource(
+        alloc,
+        arena.allocator(),
+        "extra-sampler.glsl",
+        extra_sampler,
+        .spirv,
+    ));
+}
+
+test "custom shader parameters reach GLSL and HLSL compilation" {
+    const alloc = std.testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const source =
+        \\#pragma parameter GAIN "Gain" 0.25 0 1 0.05
+        \\const float GAIN = 0.25;
+        \\void mainImage(out vec4 color, in vec2 point) { color = vec4(GAIN, 0.0, 0.0, 1.0); }
+    ;
+    const overrides = [_]shader_parameters.Override{try shader_parameters.parseOverride("1:GAIN:0.75")};
+    const tuned = (try shader_parameters.rewrite(arena.allocator(), source, 1, &overrides)).?;
+    const targets: []const Target = if (@import("../build_config.zig").renderer == .d3d12) &.{ .glsl, .hlsl } else &.{.glsl};
+    for (targets) |target| {
+        const original = try compileSource(alloc, arena.allocator(), "test.glsl", source, target);
+        defer alloc.free(original);
+        const compiled = try compileSource(alloc, arena.allocator(), "test.glsl", tuned, target);
+        defer alloc.free(compiled);
+        try std.testing.expect(std.mem.indexOf(u8, original, "0.25") != null);
+        try std.testing.expect(std.mem.indexOf(u8, compiled, "0.75") != null);
+    }
 }
 
 const test_crt = @embedFile("shaders/test_shadertoy_crt.glsl");

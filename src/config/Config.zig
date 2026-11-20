@@ -138,7 +138,8 @@ language: ?[:0]const u8 = null,
 /// etc.
 ///
 /// Notes on emoji specifically: On macOS, Ghostty by default will always use
-/// Apple Color Emoji and on Linux will always use Noto Emoji. You can
+/// Apple Color Emoji, on Windows it prefers Segoe UI Emoji, and on Linux
+/// it uses Noto Emoji. You can
 /// override this behavior by specifying a font family here that contains
 /// emoji glyphs.
 ///
@@ -1055,6 +1056,38 @@ palette: Palette = .{},
 /// On X11, blur can only be enabled when using the KWin compositor
 /// as a part of KDE Plasma.
 @"background-blur": BackgroundBlur = .false,
+
+/// The background material on Windows.
+///
+///   * `auto` applies window opacity. With blur enabled and opacity below
+///     one, it uses Desktop Acrylic on Windows 11 22H2 and newer so text
+///     stays opaque. Earlier versions use layered-window opacity and blur.
+///   * `solid` draws an opaque terminal background.
+///   * `mica` uses the Windows 11 Mica material.
+///   * `acrylic` uses the Windows 11 Desktop Acrylic material.
+///
+/// With Mica or Acrylic, `background-opacity` controls the terminal color
+/// over the material. Windows may use a solid color based on its transparency
+/// settings, window activation, or system capabilities.
+/// On Vulkan, Auto, Mica, and Acrylic use whole-window opacity. Solid
+/// always keeps the window opaque.
+@"windows-background-material": WindowsBackgroundMaterial = .auto,
+
+/// Installed font family used by Madotty's Windows interface, including
+/// tabs and Settings. An empty value selects the default Windows UI font.
+/// Terminal cells use `font-family`.
+@"windows-ui-font-family": [:0]const u8 = "",
+
+/// The graphics API used by a new Madotty process on Windows. `auto` selects
+/// OpenGL. `d3d12` selects DirectX 12 and `vulkan` selects Vulkan when the matching
+/// executable is installed and initializes successfully. OpenGL is the startup fallback.
+@"windows-renderer": WindowsRenderer = .auto,
+
+/// The stable profile ID for new windows and tabs on Windows. Choose a
+/// profile from Madotty Settings to set this value. An empty value or a
+/// missing profile follows the normal Ghostty command configuration. An
+/// explicit launch command or a profile chosen from the tab menu takes priority.
+@"windows-default-profile": []const u8 = "",
 
 /// The opacity level (opposite of transparency) of an unfocused split.
 /// Unfocused splits by default are slightly faded out to make it easier to see
@@ -2196,7 +2229,7 @@ keybind: Keybinds = .{},
 /// This only applies to terminal windows. This setting will still apply to
 /// non-terminal windows within Ghostty.
 ///
-/// This is currently only supported on macOS and Linux.
+/// This is currently only supported on macOS, Linux, and Windows.
 @"window-theme": WindowTheme = .auto,
 
 /// The color space to use when interpreting terminal colors. "Terminal colors"
@@ -2322,7 +2355,7 @@ keybind: Keybinds = .{},
 ///
 ///    Available since: 1.2.0
 ///
-///  - `auto` *(default)*
+///  - `auto`
 ///
 ///    Automatically show and hide the tab bar. The tab bar is only
 ///    shown when there are two or more tabs present.
@@ -2332,8 +2365,8 @@ keybind: Keybinds = .{},
 ///    Never show the tab bar. Tabs are only accessible via the tab
 ///    overview or by keybind actions.
 ///
-/// Currently only supported on Linux (GTK).
-@"window-show-tab-bar": WindowShowTabBar = .auto,
+/// Supported on GTK and Windows. The default is `always` on Windows and `auto` on GTK.
+@"window-show-tab-bar": WindowShowTabBar = if (builtin.target.os.tag == .windows) .always else .auto,
 
 /// Background color for the window titlebar. This only takes effect if
 /// window-theme is set to ghostty. Currently only supported in the GTK app
@@ -3243,6 +3276,13 @@ keybind: Keybinds = .{},
 ///
 /// This can be changed at runtime and will affect all open terminals.
 @"custom-shader": RepeatablePath = .{},
+
+/// Override a named parameter declared by a custom shader using
+/// `PASS:NAME:VALUE`. Pass numbers start at 1 and follow `custom-shader`
+/// order, including optional paths. The last valid value for a parameter
+/// wins. Repeat the key for multiple parameters or leave its value empty
+/// to clear all overrides. The shader source is not modified.
+@"custom-shader-parameter": RepeatableString = .{},
 
 /// If `true` (default), the focused terminal surface will run an animation
 /// loop when custom shaders are used. This uses slightly more CPU (generally
@@ -4322,7 +4362,7 @@ pub fn loadDefaultFiles(self: *Config, alloc: Allocator) !void {
 /// Load and parse the CLI args.
 pub fn loadCliArgs(self: *Config, alloc_gpa: Allocator) !void {
     switch (builtin.target.os.tag) {
-        .windows => {},
+        .windows => if (try cli.args.isConsoleEmbedding(alloc_gpa, global.args())) return,
 
         // Fast-path if we are Linux/BSD and have no args.
         .linux, .freebsd => if (global.args().vector.len <= 1) return,
@@ -8923,6 +8963,8 @@ pub const RepeatableCommand = struct {
 
     value: std.ArrayListUnmanaged(inputpkg.Command) = .empty,
     value_c: std.ArrayListUnmanaged(inputpkg.Command.C) = .empty,
+    /// The default palette entries precede all user-authored entries.
+    builtin_count: usize = 0,
 
     /// ghostty_config_command_list_s
     pub const C = extern struct {
@@ -8940,6 +8982,7 @@ pub const RepeatableCommand = struct {
     pub fn init(self: *Self, alloc: Allocator) !void {
         self.value = .empty;
         self.value_c = .empty;
+        self.builtin_count = 0;
         errdefer {
             self.value.deinit(alloc);
             self.value_c.deinit(alloc);
@@ -8958,6 +9001,7 @@ pub const RepeatableCommand = struct {
             self.value.appendAssumeCapacity(localized);
             self.value_c.appendAssumeCapacity(try localized.cval(alloc));
         }
+        self.builtin_count = self.value.items.len;
     }
 
     pub fn parseCLI(
@@ -8977,6 +9021,7 @@ pub const RepeatableCommand = struct {
             log.info("config has 'command-palette-entry = clear', all command entries cleared", .{});
             self.value.clearRetainingCapacity();
             self.value_c.clearRetainingCapacity();
+            self.builtin_count = 0;
             return;
         }
 
@@ -9015,11 +9060,13 @@ pub const RepeatableCommand = struct {
         return .{
             .value = value,
             .value_c = value_c,
+            .builtin_count = self.builtin_count,
         };
     }
 
     /// Compare if two of our value are equal. Required by Config.
     pub fn equal(self: RepeatableCommand, other: RepeatableCommand) bool {
+        if (self.builtin_count != other.builtin_count) return false;
         if (self.value.items.len != other.value.items.len) return false;
         for (self.value.items, other.value.items) |a, b| {
             if (!a.equal(b)) return false;
@@ -9101,6 +9148,12 @@ pub const RepeatableCommand = struct {
 
         try list.parseCLI(alloc, "");
         try testing.expectEqual(inputpkg.command.defaults.len, list.value.items.len);
+        try testing.expectEqual(inputpkg.command.defaults.len, list.builtin_count);
+        try list.parseCLI(alloc, "title:New Tab,action:new_tab");
+        const copy = try list.clone(alloc);
+        try testing.expectEqual(copy.value.items.len - 1, copy.builtin_count);
+        try list.parseCLI(alloc, "clear");
+        try testing.expectEqual(@as(usize, 0), list.builtin_count);
     }
 
     test "RepeatableCommand clone rebuilds the C mirror" {
@@ -9949,6 +10002,9 @@ pub const AutoUpdate = enum {
     check,
     download,
 };
+
+pub const WindowsBackgroundMaterial = enum { auto, solid, mica, acrylic };
+pub const WindowsRenderer = enum { auto, opengl, d3d12, vulkan };
 
 /// See background-blur
 pub const BackgroundBlur = union(enum) {

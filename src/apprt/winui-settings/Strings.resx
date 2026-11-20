@@ -1,0 +1,263 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <resheader name="resmimetype"><value>text/microsoft-resx</value></resheader>
+  <resheader name="version"><value>2.0</value></resheader>
+  <resheader name="reader"><value>System.Resources.ResXResourceReader, System.Windows.Forms</value></resheader>
+  <resheader name="writer"><value>System.Resources.ResXResourceWriter, System.Windows.Forms</value></resheader>
+  <data name="Save" xml:space="preserve"><value>Save</value></data>
+  <data name="Cancel" xml:space="preserve"><value>Cancel</value></data>
+  <data name="EditConfig" xml:space="preserve"><value>Edit config file</value></data>
+  <data name="SettingsTitle" xml:space="preserve"><value>Madotty Settings</value></data>
+  <data name="TerminalBackground" xml:space="preserve"><value>Terminal background</value></data>
+  <data name="System" xml:space="preserve"><value>System</value></data>
+  <data name="Light" xml:space="preserve"><value>Light</value></data>
+  <data name="Dark" xml:space="preserve"><value>Dark</value></data>
+  <data name="FollowConfig" xml:space="preserve"><value>Follow Ghostty config</value></data>
+  <data name="Solid" xml:space="preserve"><value>Solid</value></data>
+  <data name="Mica" xml:space="preserve"><value>Mica</value></data>
+  <data name="Acrylic" xml:space="preserve"><value>Acrylic</value></data>
+  <data name="Always" xml:space="preserve"><value>Always</value></data>
+  <data name="MultipleTabs" xml:space="preserve"><value>When multiple tabs are open</value></data>
+  <data name="Never" xml:space="preserve"><value>Never</value></data>
+  <data name="AfterActive" xml:space="preserve"><value>After the active tab</value></data>
+  <data name="AtEnd" xml:space="preserve"><value>At the end</value></data>
+  <data name="Block" xml:space="preserve"><value>Block</value></data>
+  <data name="Bar" xml:space="preserve"><value>Bar</value></data>
+  <data name="Underline" xml:space="preserve"><value>Underline</value></data>
+  <data name="HollowBlock" xml:space="preserve"><value>Hollow block</value></data>
+  <data name="ContextMenu" xml:space="preserve"><value>Show context menu</value></data>
+  <data name="Paste" xml:space="preserve"><value>Paste</value></data>
+  <data name="Copy" xml:space="preserve"><value>Copy</value></data>
+  <data name="CopyOrPaste" xml:space="preserve"><value>Copy or paste</value></data>
+  <data name="DoNothing" xml:space="preserve"><value>Do nothing</value></data>
+  <data name="Typography" xml:space="preserve"><value>Typography</value></data>
+  <data name="InterfaceFont" xml:space="preserve"><value>Interface font</value></data>
+  <data name="TerminalFont" xml:space="preserve"><value>Terminal font</value></data>
+  <data name="TerminalFontSize" xml:space="preserve"><value>Terminal font size (pt)</value></data>
+  <data name="WindowOpacity" xml:space="preserve"><value>Window opacity</value></data>
+  <data name="Window" xml:space="preserve"><value>Window</value></data>
+  <data name="WindowTheme" xml:space="preserve"><value>Window theme</value></data>
+  <data name="BackgroundMaterial" xml:space="preserve"><value>Background material</value></data>
+  <data name="Appearance" xml:space="preserve"><value>Appearance</value></data>
+  <data name="UnavailableProfile" xml:space="preserve"><value>Unavailable profile</value></data>
+  <data name="DefaultProfile" xml:space="preserve"><value>Default profile</value></data>
+  <data name="Startup" xml:space="preserve"><value>Startup</value></data>
+  <data name="Terminal" xml:space="preserve"><value>Terminal</value></data>
+  <data name="Cursor" xml:space="preserve"><value>Cursor</value></data>
+  <data name="DefaultShape" xml:space="preserve"><value>Default shape</value></data>
+  <data name="SelectionMouse" xml:space="preserve"><value>Selection and mouse</value></data>
+  <data name="CopyOnSelect" xml:space="preserve"><value>Copy on select</value></data>
+  <data name="RightClick" xml:space="preserve"><value>Right-click action</value></data>
+  <data name="Tabs" xml:space="preserve"><value>Tabs</value></data>
+  <data name="TabBar" xml:space="preserve"><value>Tab bar</value></data>
+  <data name="Visibility" xml:space="preserve"><value>Visibility</value></data>
+  <data name="NewTabs" xml:space="preserve"><value>New tabs</value></data>
+  <data name="Position" xml:space="preserve"><value>Position</value></data>
+  <data name="InheritDirectory" xml:space="preserve"><value>Inherit working directory</value></data>
+  <data name="ProgressIndicators" xml:space="preserve"><value>Progress indicators</value></data>
+  <data name="ShowProgress" xml:space="preserve"><value>Show in tabs and taskbar</value></data>
+  <data name="Rendering" xml:space="preserve"><value>Rendering</value></data>
+  <data name="GraphicsApi" xml:space="preserve"><value>Graphics API</value></data>
+  <data name="Shaders" xml:space="preserve"><value>Shaders</value></data>
+  <data name="Keybindings" xml:space="preserve"><value>Keybindings</value></data>
+  <data name="Privacy" xml:space="preserve"><value>Privacy</value></data>
+  <data name="SettingsPages" xml:space="preserve"><value>Settings pages</value></data>
+  <data name="TintOpacity" xml:space="preserve"><value>Terminal tint opacity</value></data>
+  <data name="Automatic" xml:space="preserve"><value>Automatic</value></data>
+  <data name="SystemDefault" xml:space="preserve"><value>System default</value></data>
+  <data name="PreviewSaved" xml:space="preserve"><value>Preview saved</value></data>
+  <data name="ChangeFailed" xml:space="preserve"><value>The requested change could not be completed.</value></data>
+  <data name="Waiting" xml:space="preserve"><value>Waiting for Madotty…</value></data>
+  <data name="SavingDisabled" xml:space="preserve"><value>Saving is disabled for this launch.</value></data>
+  <data name="SearchThemes" xml:space="preserve"><value>Search themes</value></data>
+  <data name="Theme" xml:space="preserve"><value>Theme</value></data>
+  <data name="DarkTheme" xml:space="preserve"><value>Dark theme</value></data>
+  <data name="LightTheme" xml:space="preserve"><value>Light theme</value></data>
+  <data name="TerminalColors" xml:space="preserve"><value>Terminal colors</value></data>
+  <data name="SeparateThemes" xml:space="preserve"><value>Use separate light and dark themes</value></data>
+  <data name="LoadThemesFailed" xml:space="preserve"><value>Could not load terminal themes.</value></data>
+  <data name="ThemeListStalled" xml:space="preserve"><value>The terminal theme list did not advance.</value></data>
+  <data name="DefaultTerminal" xml:space="preserve"><value>Default terminal application</value></data>
+  <data name="RequiresWin11" xml:space="preserve"><value>Requires Windows 11.</value></data>
+  <data name="IsDefault" xml:space="preserve"><value>Madotty is the default.</value></data>
+  <data name="ChooseInWindows" xml:space="preserve"><value>Choose in Windows</value></data>
+  <data name="Register" xml:space="preserve"><value>Register Madotty</value></data>
+  <data name="NotRegistered" xml:space="preserve"><value>Registration requires a trusted integration package.</value></data>
+  <data name="RegistrationCheckFailed" xml:space="preserve"><value>Could not check terminal registration.</value></data>
+  <data name="TrustedPackageRequired" xml:space="preserve"><value>A trusted Madotty integration package is required.</value></data>
+  <data name="TerminalNotListed" xml:space="preserve"><value>Windows has not listed Madotty as a terminal.</value></data>
+  <data name="OpenSettingsFailed" xml:space="preserve"><value>Could not open Windows Settings.</value></data>
+  <data name="Ask" xml:space="preserve"><value>Ask</value></data>
+  <data name="Allow" xml:space="preserve"><value>Allow</value></data>
+  <data name="Deny" xml:space="preserve"><value>Deny</value></data>
+  <data name="Clipboard" xml:space="preserve"><value>Clipboard</value></data>
+  <data name="ReadAccess" xml:space="preserve"><value>Read access for terminal programs</value></data>
+  <data name="WriteAccess" xml:space="preserve"><value>Write access for terminal programs</value></data>
+  <data name="ConfirmPaste" xml:space="preserve"><value>Confirm unsafe pastes</value></data>
+  <data name="LinksNotifications" xml:space="preserve"><value>Links and notifications</value></data>
+  <data name="DetectUrls" xml:space="preserve"><value>Detect URLs in terminal text</value></data>
+  <data name="AllowNotifications" xml:space="preserve"><value>Allow desktop notifications</value></data>
+  <data name="SearchActions" xml:space="preserve"><value>Search actions or shortcuts</value></data>
+  <data name="SearchKeybindings" xml:space="preserve"><value>Search keybindings</value></data>
+  <data name="LoadingKeybindings" xml:space="preserve"><value>Loading keybindings…</value></data>
+  <data name="NoKeybindings" xml:space="preserve"><value>No keybindings configured.</value></data>
+  <data name="NoKeybindingMatches" xml:space="preserve"><value>No matching keybindings.</value></data>
+  <data name="LoadKeybindingsFailed" xml:space="preserve"><value>Could not load keybindings.</value></data>
+  <data name="KeybindingListStalled" xml:space="preserve"><value>The keybinding list did not advance.</value></data>
+  <data name="Global" xml:space="preserve"><value>Global</value></data>
+  <data name="AllTerminals" xml:space="preserve"><value>All terminals</value></data>
+  <data name="PassInput" xml:space="preserve"><value>Passes input through</value></data>
+  <data name="WhenAvailable" xml:space="preserve"><value>When action can run</value></data>
+  <data name="AddGlsl" xml:space="preserve"><value>Add GLSL…</value></data>
+  <data name="Remove" xml:space="preserve"><value>Remove</value></data>
+  <data name="MoveUp" xml:space="preserve"><value>Move up</value></data>
+  <data name="MoveDown" xml:space="preserve"><value>Move down</value></data>
+  <data name="OptionalFile" xml:space="preserve"><value>Optional file</value></data>
+  <data name="NoShaders" xml:space="preserve"><value>No shaders added</value></data>
+  <data name="WhenContentChanges" xml:space="preserve"><value>When content changes</value></data>
+  <data name="WhenFocused" xml:space="preserve"><value>When focused</value></data>
+  <data name="AlwaysAnimate" xml:space="preserve"><value>Always</value></data>
+  <data name="ShaderOrder" xml:space="preserve"><value>Shader pass order</value></data>
+  <data name="ShaderPasses" xml:space="preserve"><value>Shader passes</value></data>
+  <data name="Playback" xml:space="preserve"><value>Playback</value></data>
+  <data name="Animation" xml:space="preserve"><value>Animation</value></data>
+  <data name="Parameters" xml:space="preserve"><value>Parameters</value></data>
+  <data name="AddShader" xml:space="preserve"><value>Add GLSL shader</value></data>
+  <data name="LoadShaderFailed" xml:space="preserve"><value>Could not read shader parameters.</value></data>
+  <data name="UnavailableItem" xml:space="preserve"><value>{0} (unavailable)</value></data>
+  <data name="CurrentRenderer" xml:space="preserve"><value>Using {0} now.</value></data>
+  <data name="RendererUnavailable" xml:space="preserve"><value>{0} is unavailable.</value></data>
+  <data name="RendererFailed" xml:space="preserve"><value>{0} could not start.</value></data>
+  <data name="NextLaunch" xml:space="preserve"><value>Takes effect next launch.</value></data>
+  <data name="BindingTable" xml:space="preserve"><value>Table {0}</value></data>
+  <data name="DefaultValue" xml:space="preserve"><value>Default: {0:G}</value></data>
+  <data name="Action_ignore" xml:space="preserve"><value>Ignore</value></data>
+  <data name="Action_unbind" xml:space="preserve"><value>Unbind</value></data>
+  <data name="Action_csi" xml:space="preserve"><value>Csi</value></data>
+  <data name="Action_esc" xml:space="preserve"><value>Esc</value></data>
+  <data name="Action_text" xml:space="preserve"><value>Text</value></data>
+  <data name="Action_cursor_key" xml:space="preserve"><value>Cursor key</value></data>
+  <data name="Action_reset" xml:space="preserve"><value>Reset</value></data>
+  <data name="Action_copy_to_clipboard" xml:space="preserve"><value>Copy to clipboard</value></data>
+  <data name="Action_paste_from_clipboard" xml:space="preserve"><value>Paste from clipboard</value></data>
+  <data name="Action_paste_from_selection" xml:space="preserve"><value>Paste from selection</value></data>
+  <data name="Action_copy_url_to_clipboard" xml:space="preserve"><value>Copy url to clipboard</value></data>
+  <data name="Action_copy_title_to_clipboard" xml:space="preserve"><value>Copy title to clipboard</value></data>
+  <data name="Action_increase_font_size" xml:space="preserve"><value>Increase font size</value></data>
+  <data name="Action_decrease_font_size" xml:space="preserve"><value>Decrease font size</value></data>
+  <data name="Action_reset_font_size" xml:space="preserve"><value>Reset font size</value></data>
+  <data name="Action_set_font_size" xml:space="preserve"><value>Set font size</value></data>
+  <data name="Action_search" xml:space="preserve"><value>Search</value></data>
+  <data name="Action_search_selection" xml:space="preserve"><value>Search selection</value></data>
+  <data name="Action_navigate_search" xml:space="preserve"><value>Navigate search</value></data>
+  <data name="Action_start_search" xml:space="preserve"><value>Start search</value></data>
+  <data name="Action_end_search" xml:space="preserve"><value>End search</value></data>
+  <data name="Action_clear_screen" xml:space="preserve"><value>Clear screen</value></data>
+  <data name="Action_select_all" xml:space="preserve"><value>Select all</value></data>
+  <data name="Action_scroll_to_top" xml:space="preserve"><value>Scroll to top</value></data>
+  <data name="Action_scroll_to_bottom" xml:space="preserve"><value>Scroll to bottom</value></data>
+  <data name="Action_scroll_to_selection" xml:space="preserve"><value>Scroll to selection</value></data>
+  <data name="Action_scroll_to_row" xml:space="preserve"><value>Scroll to row</value></data>
+  <data name="Action_scroll_page_up" xml:space="preserve"><value>Scroll page up</value></data>
+  <data name="Action_scroll_page_down" xml:space="preserve"><value>Scroll page down</value></data>
+  <data name="Action_scroll_page_fractional" xml:space="preserve"><value>Scroll page fractional</value></data>
+  <data name="Action_scroll_page_lines" xml:space="preserve"><value>Scroll page lines</value></data>
+  <data name="Action_adjust_selection" xml:space="preserve"><value>Adjust selection</value></data>
+  <data name="Action_jump_to_prompt" xml:space="preserve"><value>Jump to prompt</value></data>
+  <data name="Action_write_scrollback_file" xml:space="preserve"><value>Write scrollback file</value></data>
+  <data name="Action_write_screen_file" xml:space="preserve"><value>Write screen file</value></data>
+  <data name="Action_write_selection_file" xml:space="preserve"><value>Write selection file</value></data>
+  <data name="Action_new_window" xml:space="preserve"><value>New window</value></data>
+  <data name="Action_new_tab" xml:space="preserve"><value>New tab</value></data>
+  <data name="Action_previous_tab" xml:space="preserve"><value>Previous tab</value></data>
+  <data name="Action_next_tab" xml:space="preserve"><value>Next tab</value></data>
+  <data name="Action_last_tab" xml:space="preserve"><value>Last tab</value></data>
+  <data name="Action_goto_tab" xml:space="preserve"><value>Goto tab</value></data>
+  <data name="Action_move_tab" xml:space="preserve"><value>Move tab</value></data>
+  <data name="Action_move_tab_to_new_window" xml:space="preserve"><value>Move tab to new window</value></data>
+  <data name="Action_toggle_tab_overview" xml:space="preserve"><value>Toggle tab overview</value></data>
+  <data name="Action_prompt_surface_title" xml:space="preserve"><value>Prompt surface title</value></data>
+  <data name="Action_prompt_tab_title" xml:space="preserve"><value>Prompt tab title</value></data>
+  <data name="Action_prompt_window_title" xml:space="preserve"><value>Prompt window title</value></data>
+  <data name="Action_set_surface_title" xml:space="preserve"><value>Set surface title</value></data>
+  <data name="Action_set_tab_title" xml:space="preserve"><value>Set tab title</value></data>
+  <data name="Action_set_window_title" xml:space="preserve"><value>Set window title</value></data>
+  <data name="Action_new_split" xml:space="preserve"><value>New split</value></data>
+  <data name="Action_goto_split" xml:space="preserve"><value>Goto split</value></data>
+  <data name="Action_goto_window" xml:space="preserve"><value>Goto window</value></data>
+  <data name="Action_toggle_split_zoom" xml:space="preserve"><value>Toggle split zoom</value></data>
+  <data name="Action_toggle_readonly" xml:space="preserve"><value>Toggle readonly</value></data>
+  <data name="Action_resize_split" xml:space="preserve"><value>Resize split</value></data>
+  <data name="Action_equalize_splits" xml:space="preserve"><value>Equalize splits</value></data>
+  <data name="Action_reset_window_size" xml:space="preserve"><value>Reset window size</value></data>
+  <data name="Action_inspector" xml:space="preserve"><value>Inspector</value></data>
+  <data name="Action_show_gtk_inspector" xml:space="preserve"><value>Show gtk inspector</value></data>
+  <data name="Action_show_on_screen_keyboard" xml:space="preserve"><value>Show on screen keyboard</value></data>
+  <data name="Action_open_config" xml:space="preserve"><value>Open config</value></data>
+  <data name="Action_reload_config" xml:space="preserve"><value>Reload config</value></data>
+  <data name="Action_close_surface" xml:space="preserve"><value>Close surface</value></data>
+  <data name="Action_close_tab" xml:space="preserve"><value>Close tab</value></data>
+  <data name="Action_close_window" xml:space="preserve"><value>Close window</value></data>
+  <data name="Action_close_all_windows" xml:space="preserve"><value>Close all windows</value></data>
+  <data name="Action_toggle_maximize" xml:space="preserve"><value>Toggle maximize</value></data>
+  <data name="Action_toggle_fullscreen" xml:space="preserve"><value>Toggle fullscreen</value></data>
+  <data name="Action_toggle_window_decorations" xml:space="preserve"><value>Toggle window decorations</value></data>
+  <data name="Action_toggle_window_float_on_top" xml:space="preserve"><value>Toggle window float on top</value></data>
+  <data name="Action_toggle_secure_input" xml:space="preserve"><value>Toggle secure input</value></data>
+  <data name="Action_toggle_mouse_reporting" xml:space="preserve"><value>Toggle mouse reporting</value></data>
+  <data name="Action_reset_mouse_reporting" xml:space="preserve"><value>Reset mouse reporting</value></data>
+  <data name="Action_toggle_command_palette" xml:space="preserve"><value>Toggle command palette</value></data>
+  <data name="Action_toggle_quick_terminal" xml:space="preserve"><value>Toggle quick terminal</value></data>
+  <data name="Action_toggle_visibility" xml:space="preserve"><value>Toggle visibility</value></data>
+  <data name="Action_toggle_background_opacity" xml:space="preserve"><value>Toggle background opacity</value></data>
+  <data name="Action_check_for_updates" xml:space="preserve"><value>Check for updates</value></data>
+  <data name="Action_undo" xml:space="preserve"><value>Undo</value></data>
+  <data name="Action_redo" xml:space="preserve"><value>Redo</value></data>
+  <data name="Action_end_key_sequence" xml:space="preserve"><value>End key sequence</value></data>
+  <data name="Action_activate_key_table" xml:space="preserve"><value>Activate key table</value></data>
+  <data name="Action_activate_key_table_once" xml:space="preserve"><value>Activate key table once</value></data>
+  <data name="Action_deactivate_key_table" xml:space="preserve"><value>Deactivate key table</value></data>
+  <data name="Action_deactivate_all_key_tables" xml:space="preserve"><value>Deactivate all key tables</value></data>
+  <data name="Action_quit" xml:space="preserve"><value>Quit</value></data>
+  <data name="Action_crash" xml:space="preserve"><value>Crash</value></data>
+  <data name="On" xml:space="preserve"><value>On</value></data>
+  <data name="Off" xml:space="preserve"><value>Off</value></data>
+  <data name="SettingsDataMissing" xml:space="preserve"><value>Settings data was not provided.</value></data>
+  <data name="SettingsDataInvalid" xml:space="preserve"><value>Settings data contains an invalid value.</value></data>
+  <data name="ClipboardPolicyUnknown" xml:space="preserve"><value>Unknown clipboard permission.</value></data>
+  <data name="TerminalColorInvalid" xml:space="preserve"><value>Invalid terminal color.</value></data>
+  <data name="ProfileIdMissing" xml:space="preserve"><value>Missing profile ID.</value></data>
+  <data name="ProfileNameMissing" xml:space="preserve"><value>Missing profile name.</value></data>
+  <data name="GraphicsApiInvalid" xml:space="preserve"><value>Settings data contains an invalid graphics API.</value></data>
+  <data name="ShaderAnimationInvalid" xml:space="preserve"><value>Settings data contains an invalid shader animation mode.</value></data>
+  <data name="ShaderRangeInvalid" xml:space="preserve"><value>A shader parameter has an invalid range.</value></data>
+  <data name="ShaderPassInvalid" xml:space="preserve"><value>A shader parameter has an invalid pass number.</value></data>
+  <data name="ShaderFieldString" xml:space="preserve"><value>Shader field '{0}' must be a string.</value></data>
+  <data name="ShaderFieldFinite" xml:space="preserve"><value>Shader field '{0}' must be finite.</value></data>
+  <data name="ConnectionUnavailable" xml:space="preserve"><value>The settings connection is unavailable.</value></data>
+  <data name="SettingsMessageTooLarge" xml:space="preserve"><value>Settings message is too large.</value></data>
+  <data name="ConnectionClosed" xml:space="preserve"><value>The settings connection was closed.</value></data>
+  <data name="InvalidKeybinding" xml:space="preserve"><value>Invalid keybinding entry.</value></data>
+  <data name="Option_left" xml:space="preserve"><value>left</value></data>
+  <data name="Option_right" xml:space="preserve"><value>right</value></data>
+  <data name="Option_up" xml:space="preserve"><value>up</value></data>
+  <data name="Option_down" xml:space="preserve"><value>down</value></data>
+  <data name="Option_previous" xml:space="preserve"><value>previous</value></data>
+  <data name="Option_next" xml:space="preserve"><value>next</value></data>
+  <data name="Option_top" xml:space="preserve"><value>top</value></data>
+  <data name="Option_bottom" xml:space="preserve"><value>bottom</value></data>
+  <data name="Option_page_up" xml:space="preserve"><value>page_up</value></data>
+  <data name="Option_page_down" xml:space="preserve"><value>page_down</value></data>
+  <data name="Option_home" xml:space="preserve"><value>home</value></data>
+  <data name="Option_end" xml:space="preserve"><value>end</value></data>
+  <data name="Option_beginning_of_line" xml:space="preserve"><value>beginning_of_line</value></data>
+  <data name="Option_end_of_line" xml:space="preserve"><value>end_of_line</value></data>
+  <data name="Option_auto" xml:space="preserve"><value>auto</value></data>
+  <data name="Option_plain" xml:space="preserve"><value>plain</value></data>
+  <data name="Option_html" xml:space="preserve"><value>html</value></data>
+  <data name="Option_vt" xml:space="preserve"><value>vt</value></data>
+  <data name="Option_mixed" xml:space="preserve"><value>mixed</value></data>
+  <data name="Option_toggle" xml:space="preserve"><value>toggle</value></data>
+  <data name="Option_show" xml:space="preserve"><value>show</value></data>
+  <data name="Option_hide" xml:space="preserve"><value>hide</value></data>
+</root>

@@ -4,6 +4,7 @@ const translate_c = @import("translate_c");
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const hlsl = b.option(bool, "hlsl", "Include the HLSL shader conversion backend") orelse false;
 
     const module = b.addModule("spirv_cross", .{
         .root_source_file = b.path("main.zig"),
@@ -31,7 +32,7 @@ pub fn build(b: *std.Build) !void {
     } = if (b.systemIntegrationOption("spirv-cross", .{}))
         .system
     else
-        .{ .static = try buildSpirvCross(b, module, target, optimize) };
+        .{ .static = try buildSpirvCross(b, module, target, optimize, hlsl) };
 
     try translate_c.addImportToModule(b, "spirv_cross_c", module, .{
         .source = .{ .includes = .{
@@ -49,6 +50,7 @@ fn buildSpirvCross(
     module: *std.Build.Module,
     target: std.Build.ResolvedTarget,
     optimize: std.lang.Optimize,
+    hlsl: bool,
 ) !*std.Build.Step.Compile {
     const lib = b.addLibrary(.{
         .name = "spirv_cross",
@@ -79,6 +81,7 @@ fn buildSpirvCross(
         "-fno-sanitize=undefined",
         "-fno-sanitize-trap=undefined",
     });
+    if (hlsl) try flags.append(b.allocator, "-DSPIRV_CROSS_C_API_HLSL=1");
 
     if (target.result.os.tag == .freebsd or target.result.abi == .musl) {
         try flags.append(b.allocator, "-fPIC");
@@ -106,6 +109,10 @@ fn buildSpirvCross(
                 // MSL
                 "spirv_msl.cpp",
             },
+        });
+        if (hlsl) lib.root_module.addCSourceFile(.{
+            .file = upstream.path("spirv_hlsl.cpp"),
+            .flags = flags.items,
         });
 
         lib.installHeadersDirectory(

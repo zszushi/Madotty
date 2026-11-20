@@ -561,6 +561,16 @@ pub fn init(
     );
     errdefer app.font_grid_set.deref(font_grid_key);
 
+    const cell_size = font_grid.cellSize();
+    const explicit_padding = derived_config.scaledPadding(x_dpi, y_dpi);
+    const attachment_geometry = if (comptime @hasDecl(apprt.Surface, "prepareAttachmentGeometry"))
+        try rt_surface.prepareAttachmentGeometry(if (derived_config.window_width > 0 and derived_config.window_height > 0) .{
+            .width = @max(derived_config.window_width, min_window_width_cells) *| cell_size.width +| explicit_padding.left +| explicit_padding.right,
+            .height = @max(derived_config.window_height, min_window_height_cells) *| cell_size.height +| explicit_padding.top +| explicit_padding.bottom,
+        } else null)
+    else
+        false;
+
     // Build our size struct which has all the sizes we need.
     const size: rendererpkg.Size = size: {
         var size: rendererpkg.Size = .{
@@ -572,18 +582,15 @@ pub fn init(
                 };
             },
 
-            .cell = font_grid.cellSize(),
+            .cell = cell_size,
             .padding = .{},
+            .pixels_per_point = content_scale.y,
         };
 
-        const explicit: rendererpkg.Padding = derived_config.scaledPadding(
-            x_dpi,
-            y_dpi,
-        );
         if (derived_config.window_padding_balance != .false) {
-            size.balancePadding(explicit, derived_config.window_padding_balance);
+            size.balancePadding(explicit_padding, derived_config.window_padding_balance);
         } else {
-            size.padding = explicit;
+            size.padding = explicit_padding;
         }
 
         break :size size;
@@ -694,43 +701,49 @@ pub fn init(
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
     {
-        // Exec.init takes ownership of the env even if it fails, so the
-        // errdefer for it must not reach past the call.
-        const env = termio_env: {
-            var env = rt_surface.defaultTermioEnv() catch |err| env: {
-                // If an error occurs, we don't want to block surface startup.
-                log.warn("error getting env map for surface err={}", .{err});
-                break :env global.environMap() catch std.process.Environ.Map.init(alloc);
+        var io_exec = io: {
+            if (comptime @hasDecl(apprt.Surface, "takeConsoleAttachment")) {
+                if (rt_surface.takeConsoleAttachment()) |attachment|
+                    break :io termio.Exec.initAttached(alloc, attachment);
+            }
+
+            // Exec.init takes ownership of the env even if it fails, so the
+            // errdefer for it must not reach past the call.
+            const env = termio_env: {
+                var env = rt_surface.defaultTermioEnv() catch |err| env: {
+                    // If an error occurs, we don't want to block surface startup.
+                    log.warn("error getting env map for surface err={}", .{err});
+                    break :env global.environMap() catch std.process.Environ.Map.init(alloc);
+                };
+                errdefer env.deinit();
+
+                // don't leak GHOSTTY_LOG to any subprocesses
+                _ = env.orderedRemove("GHOSTTY_LOG");
+
+                var buf: [18]u8 = undefined;
+                try env.put(
+                    "GHOSTTY_SURFACE_ID",
+                    std.mem.print(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
+                );
+
+                break :termio_env env;
             };
-            errdefer env.deinit();
 
-            // don't leak GHOSTTY_LOG to any subprocesses
-            _ = env.orderedRemove("GHOSTTY_LOG");
-
-            var buf: [18]u8 = undefined;
-            try env.put(
-                "GHOSTTY_SURFACE_ID",
-                std.mem.print(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
-            );
-
-            break :termio_env env;
+            log.debug("creating IO exec...", .{});
+            break :io try termio.Exec.init(alloc, .{
+                .command = command,
+                .env = env,
+                .env_override = config.env,
+                .shell_integration = config.@"shell-integration",
+                .shell_integration_features = config.@"shell-integration-features",
+                .cursor_blink = config.@"cursor-style-blink",
+                .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+                .resources_dir = global.resourcesDir().host(),
+                .term = config.term,
+                .rt_pre_exec_info = .init(config),
+                .rt_post_fork_info = .init(config),
+            });
         };
-
-        // Initialize our IO backend
-        log.debug("creating IO exec...", .{});
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
-            .resources_dir = global.resourcesDir().host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
         errdefer io_exec.deinit();
 
         // Initialize our IO mailbox
@@ -787,7 +800,12 @@ pub fn init(
     // init stuff we should get rid of this. But this is required because
     // sizeCallback does retina-aware stuff we don't do here and don't want
     // to duplicate.
-    try self.resize(self.size.screen);
+    if (attachment_geometry) {
+        // Termio already sized the attached ConPTY using this geometry.
+        self.notifyRendererSize();
+    } else {
+        try self.resize(self.size.screen);
+    }
 
     // Start our renderer thread
     self.renderer_thr = try std.Thread.spawn(
@@ -814,7 +832,7 @@ pub fn init(
     // Note: it is important to do this after the renderer is setup above.
     // This allows the apprt to fully initialize the surface before we
     // start messing with the window.
-    self.recomputeInitialSize() catch |err| {
+    if (!attachment_geometry) self.recomputeInitialSize() catch |err| {
         // We don't treat this as a fatal error because not setting
         // an initial size shouldn't stop our terminal from working.
         log.warn("unable to set initial window size: {}", .{err});
@@ -2861,7 +2879,11 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
     // Mail the IO thread
     self.queueIo(.{ .resize = self.size }, .unlocked);
 
-    // Mail the render thread so it updates its padding and screen size.
+    self.notifyRendererSize();
+}
+
+/// Update the renderer's viewport and padding.
+fn notifyRendererSize(self: *Surface) void {
     _ = self.renderer_thread.mailbox.push(
         global.io(),
         .{ .resize = self.size },
@@ -4011,10 +4033,15 @@ pub fn contentScaleCallback(self: *Surface, content_scale: apprt.ContentScale) !
 
     // If our DPI didn't actually change, save a lot of work by doing nothing.
     if (size.xdpi == self.font_size.xdpi and size.ydpi == self.font_size.ydpi) {
+        if (self.size.pixels_per_point != content_scale.y) {
+            self.size.pixels_per_point = content_scale.y;
+            self.queueIo(.{ .resize = self.size }, .unlocked);
+        }
         return;
     }
 
     try self.setFontSize(size);
+    self.size.pixels_per_point = content_scale.y;
 
     // Update our padding which is dependent on DPI. We only do this for
     // unbalanced padding since balanced padding is not dependent on DPI.

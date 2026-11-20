@@ -21,6 +21,9 @@ pub const color = parsers.color;
 pub const semantic_prompt = parsers.semantic_prompt;
 pub const program_status = parsers.program_status;
 pub const hierarchical_context = parsers.hierarchical_context;
+pub const ITermInlineImage = parsers.iterm2.InlineImage;
+pub const ITermImageOptions = parsers.iterm2.ImageOptions;
+pub const ITermImageDimension = parsers.iterm2.ImageDimension;
 
 const log = std.log.scoped(.osc);
 
@@ -178,6 +181,9 @@ pub const Command = union(Key) {
     /// terminal supports the protocol. See `ProgramStatus`.
     program_status: ProgramStatus,
 
+    iterm_report_cell_size: Terminator,
+    iterm_inline_image: ITermInlineImage,
+
     pub const SemanticPrompt = parsers.semantic_prompt.Command;
     pub const HierarchicalContext = parsers.hierarchical_context.Command;
 
@@ -186,6 +192,8 @@ pub const Command = union(Key) {
     pub const KittyDndProtocol = parsers.kitty_dnd_protocol.OSC;
 
     pub const KittyDesktopNotification = parsers.kitty_desktop_notification.OSC;
+
+    pub const KittyTextSizing = parsers.kitty_text_sizing.OSC;
 
     pub const ProgramStatus = parsers.program_status.Command;
 
@@ -222,6 +230,8 @@ pub const Command = union(Key) {
             "kitty_desktop_notification",
             "unknown",
             "program_status",
+            "iterm_report_cell_size",
+            "iterm_inline_image",
         },
     );
 
@@ -430,6 +440,10 @@ pub const Parser = struct {
         /// are dropped and the command is returned with `truncated` set.
         unknown_truncated,
 
+        /// An iTerm2 image was truncated. Drop its bytes and cancel the
+        /// pending multipart transfer when this OSC ends.
+        iterm2_image_discard,
+
         // OSC command prefixes. Not all of these are valid OSCs, but may be
         // needed to "bridge" to a valid OSC (e.g. to support OSC 777 we need to
         // have a state "77" even though there is no OSC 77).
@@ -556,6 +570,8 @@ pub const Parser = struct {
             .hierarchical_context,
             .unknown,
             .program_status,
+            .iterm_report_cell_size,
+            .iterm_inline_image,
             => {},
         }
 
@@ -756,7 +772,7 @@ pub const Parser = struct {
         assert(self.capture == null);
         const prefix: []const u8 = switch (self.state) {
             .start => "",
-            .invalid, .unknown, .unknown_truncated => unreachable,
+            .invalid, .unknown, .unknown_truncated, .iterm2_image_discard => unreachable,
             inline else => |s| @tagName(s),
         };
         self.state = .unknown;
@@ -797,8 +813,27 @@ pub const Parser = struct {
             // Already truncated: the write failed at the first bounds
             // check and there is nothing more to do.
             .unknown_truncated => {},
+            .@"1337" => self.state = if (parsers.iterm2.isImage(self.capture.?.trailing()))
+                .iterm2_image_discard
+            else
+                .invalid,
             else => self.state = .invalid,
         }
+    }
+
+    /// Keep the common OSC 1337 clipboard, cwd, and query paths in the fixed
+    /// buffer. Promote only recognized image data packets when they fill it.
+    fn growITermImageCapture(self: *Parser) bool {
+        if (self.state != .@"1337") return false;
+        const alloc = self.alloc orelse return false;
+        const cap = &self.capture.?;
+        if (cap.backing != .fixed) return false;
+        const prefix = cap.trailing();
+        const limit = parsers.iterm2.largeCaptureLimit(prefix, self.max_allocating_bytes);
+        if (limit <= cap.max_bytes) return false;
+        Capture.allocating(&self.capture, alloc, limit) catch return false;
+        self.capture.?.writeSlice(prefix) catch return false;
+        return true;
     }
 
     /// Consume a slice of bytes, advancing the parser state. This is
@@ -806,7 +841,7 @@ pub const Parser = struct {
     /// faster once a data capture is active because the remaining bytes
     /// are appended to the capture in bulk.
     pub fn nextSlice(self: *Parser, input: []const u8) void {
-        if (self.state == .invalid) return;
+        if (self.state == .invalid or self.state == .iterm2_image_discard) return;
 
         // Run the state machine byte-at-a-time until a capture begins.
         // The command prefix before a capture starts is only a handful
@@ -821,10 +856,15 @@ pub const Parser = struct {
 
         const rem = input[offset..];
         if (rem.len == 0) return;
-        self.capture.?.writeSlice(rem) catch |err| switch (err) {
-            // We have overflowed our buffer or had some other error.
-            // Discard any further input.
-            error.WriteFailed => self.captureFailed(),
+        const cap = &self.capture.?;
+        const before = cap.trailing().len;
+        cap.writeSlice(rem) catch {
+            const retained = cap.trailing().len - before;
+            if (self.growITermImageCapture()) {
+                self.capture.?.writeSlice(rem[retained..]) catch self.captureFailed();
+            } else {
+                self.captureFailed();
+            }
         };
     }
 
@@ -832,22 +872,24 @@ pub const Parser = struct {
     pub fn next(self: *Parser, c: u8) void {
         // If the state becomes invalid for any reason, just discard
         // any further input.
-        if (self.state == .invalid) return;
+        if (self.state == .invalid or self.state == .iterm2_image_discard) return;
 
         // If a writer has been initialized, we just accumulate the rest of the
         // OSC sequence in the writer's buffer and skip the state machine.
         if (self.capture) |*cap| {
-            cap.writeByte(c) catch |err| switch (err) {
-                // We have overflowed our buffer or had some other error.
-                // Discard any further input.
-                error.WriteFailed => self.captureFailed(),
+            cap.writeByte(c) catch {
+                if (self.growITermImageCapture()) {
+                    self.capture.?.writeByte(c) catch self.captureFailed();
+                } else {
+                    self.captureFailed();
+                }
             };
             return;
         }
 
         switch (self.state) {
             // handled above, so should never be here
-            .invalid => unreachable,
+            .invalid, .iterm2_image_discard => unreachable,
 
             // unknown states always have an active capture
             .unknown, .unknown_truncated => unreachable,
@@ -1089,11 +1131,18 @@ pub const Parser = struct {
     ///
     /// The returned pointer is only valid until the next call to the parser.
     /// Copy out any data you need to keep.
+    /// A canceled iTerm2 image returns a cleanup command for the VT stream.
     pub fn end(self: *Parser, terminator_ch: ?u8) ?*Command {
         if (terminator_ch) |ch| switch (ch) {
             std.ascii.control_code.can,
             std.ascii.control_code.sub,
-            => return null,
+            => {
+                if (self.state == .iterm2_image_discard or
+                    (self.state == .@"1337" and self.capture != null and
+                        parsers.iterm2.isImage(self.capture.?.trailing())))
+                    return parsers.iterm2.cancelImage(self);
+                return null;
+            },
             else => {},
         };
 
@@ -1101,6 +1150,8 @@ pub const Parser = struct {
             .start => null,
 
             .invalid => null,
+
+            .iterm2_image_discard => parsers.iterm2.cancelImage(self),
 
             .unknown,
             .unknown_truncated,

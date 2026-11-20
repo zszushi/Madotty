@@ -333,42 +333,46 @@ fn collection(
         },
     );
 
-    // On macOS, always search for and add the Apple Emoji font
-    // as our preferred emoji font for fallback. We do this in case
-    // people add other emoji fonts to their system, we always want to
-    // prefer the official one. Users can override this by explicitly
-    // specifying a font-family for emoji.
-    if (comptime builtin.target.os.tag.isDarwin() and Discover != void) apple_emoji: {
-        const disco = try self.discover() orelse break :apple_emoji;
+    // Prefer the platform emoji face after explicit families, before bundled emoji.
+    if (comptime (builtin.target.os.tag.isDarwin() or builtin.target.os.tag == .windows) and Discover != void) system_emoji: {
+        const family = if (builtin.target.os.tag == .windows) "Segoe UI Emoji" else "Apple Color Emoji";
+        const disco = try self.discover() orelse break :system_emoji;
 
         // Fast path: we know the exact name of the font we want so we
         // can look it up directly, which is sometimes significantly faster than
         // full discovery (e.g. CoreText).
         if (@hasDecl(Discover, "discoverExactFamily")) {
-            if (try disco.discoverExactFamily(
-                "Apple Color Emoji",
-            )) |face| {
+            if (try disco.discoverExactFamily(family)) |face| {
                 _ = try c.addDeferred(self.alloc, face, .{
                     .style = .regular,
                     .fallback = true,
                     // No size adjustment for emojis.
                     .size_adjustment = .none,
                 });
-                break :apple_emoji;
+                break :system_emoji;
             }
         }
 
         var disco_it = try disco.discover(self.alloc, .{
-            .family = "Apple Color Emoji",
+            .family = family,
         });
         defer disco_it.deinit();
-        if (try disco_it.next()) |face| {
-            _ = try c.addDeferred(self.alloc, face, .{
-                .style = .regular,
-                .fallback = true,
-                // No size adjustment for emojis.
-                .size_adjustment = .none,
-            });
+        if (try disco_it.next()) |found| {
+            const opts: Collection.AddOptions = .{ .style = .regular, .fallback = true, .size_adjustment = .none };
+            if (comptime builtin.target.os.tag == .windows) {
+                // DirectWrite's deferred cmap query cannot distinguish text and
+                // color glyphs. Let FreeType check the requested presentation.
+                var deferred = found;
+                defer deferred.deinit();
+                var face = deferred.load(self.font_lib, load_options.faceOptions()) catch |err| {
+                    log.warn("could not load the system emoji font: {}", .{err});
+                    break :system_emoji;
+                };
+                errdefer face.deinit();
+                _ = try c.add(self.alloc, face, opts);
+            } else {
+                _ = try c.addDeferred(self.alloc, found, opts);
+            }
         }
     }
 
@@ -763,6 +767,37 @@ pub const Key = struct {
         return hasher.final();
     }
 };
+
+test "Windows system emoji precedes the bundled color fallback" {
+    if (comptime builtin.os.tag != .windows or font.options.backend != .freetype) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var set = try SharedGridSet.init(alloc);
+    defer set.deinit();
+    const disco = (try set.discover()).?;
+    var available = try disco.discover(alloc, .{ .family = "Segoe UI Emoji", .codepoint = 0x1F47B });
+    defer available.deinit();
+    if (available.results.len == 0) return error.SkipZigTest;
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    var derived = try DerivedConfig.init(alloc, &cfg);
+    defer derived.deinit();
+    const key, const grid = try set.ref(&derived, .{ .points = 14, .xdpi = 96, .ydpi = 96 });
+    defer set.deref(key);
+    const idx = grid.resolver.getIndex(alloc, 0x1F47B, .regular, .emoji) orelse return error.MissingGlyph;
+    const face = try grid.resolver.collection.getFace(idx);
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("Segoe UI Emoji", try face.name(&buf));
+    var atlas = try font.Atlas.init(alloc, 128, .bgra);
+    defer atlas.deinit(alloc);
+    const glyph = try face.renderGlyph(alloc, &atlas, face.glyphIndex(0x1F47B).?, .{
+        .grid_metrics = font.Metrics.calc(face.getMetrics()),
+    });
+    try std.testing.expect(glyph.width > 0 and glyph.height > 0);
+    for (0..atlas.data.len / 4) |i| {
+        const bgra = atlas.data[4 * i ..][0..4];
+        if (bgra[3] != 0 and bgra[0] != bgra[2]) break;
+    } else return error.ExpectedColorPixels;
+}
 
 test "Key" {
     const testing = std.testing;

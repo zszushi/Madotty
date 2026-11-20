@@ -43,7 +43,7 @@ layout(binding = 1, std430) readonly buffer bg_cells {
 void main() {
     uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
     uvec2 cursor_pos = unpack2u16(cursor_pos_packed_2u16);
-    bool cursor_wide = (bools & CURSOR_WIDE) != 0;
+    uint cursor_width = (bools >> CURSOR_WIDTH_SHIFT) & 7u;
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
 
     // Convert the grid x, y into world space x, y by accounting for cell size
@@ -136,7 +136,8 @@ void main() {
     }
 
     // Check if current position is under cursor (including wide cursor)
-    bool is_cursor_pos = ((grid_pos.x == cursor_pos.x) || (cursor_wide && (grid_pos.x == (cursor_pos.x + 1)))) && (grid_pos.y == cursor_pos.y);
+    bool is_cursor_pos = grid_pos.y == cursor_pos.y &&
+        grid_pos.x >= cursor_pos.x && grid_pos.x < cursor_pos.x + cursor_width;
 
     // If this cell is the cursor cell, but we're not processing
     // the cursor glyph itself, then we need to change the color.

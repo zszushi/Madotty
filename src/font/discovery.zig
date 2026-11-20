@@ -386,6 +386,18 @@ pub const DirectWrite = struct {
         results: *std.ArrayList(FontResult),
     ) !void {
         const collection = self.collection orelse return;
+        // Explicit families have already been tried by the codepoint resolver.
+        // Prefer a Gothic face for kana, CJK punctuation and ideographs before
+        // enumerating every installed family (whose order is unspecified).
+        switch (desc.codepoint) {
+            0x3000...0x30ff, 0x31f0...0x31ff, 0x3400...0x4dbf, 0x4e00...0x9fff, 0xf900...0xfaff, 0xff61...0xff9f, 0x20000...0x2fa1f => {
+                for ([_][:0]const u8{ "Yu Gothic", "Meiryo", "MS Gothic" }) |family| {
+                    try self.findFamily(alloc, family, desc, results);
+                    if (results.items.len != 0) return;
+                }
+            },
+            else => {},
+        }
         const family_count = collection.getFontFamilyCount();
 
         for (0..family_count) |fi| {
@@ -1706,6 +1718,25 @@ test "coretext sorting" {
         const name = try res.name(&buf);
         try testing.expectEqualStrings("SF Pro Bold Italic", name);
     }
+}
+
+test "Windows Japanese fallback prefers Yu Gothic when installed" {
+    if (comptime builtin.os.tag != .windows or options.backend != .freetype) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+    var win = DirectWrite.init(lib);
+    defer win.deinit();
+    const desc: Descriptor = .{ .codepoint = '日', .size = 12 };
+    var preferred = desc;
+    preferred.family = "Yu Gothic";
+    var available = try win.discover(alloc, preferred);
+    defer available.deinit();
+    if (available.results.len == 0) return error.SkipZigTest;
+    var fallback = try win.discover(alloc, desc);
+    defer fallback.deinit();
+    try std.testing.expect(fallback.results.len > 0);
+    try std.testing.expectEqualStrings(available.results[0].path, fallback.results[0].path);
 }
 
 test "windows" {

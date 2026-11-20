@@ -51,7 +51,7 @@ pub const RenderOptions = struct {
 
     /// The number of grid cells this glyph will take up. This can be used
     /// optionally by the rasterizer to better layout the glyph.
-    cell_width: ?u2 = null,
+    cell_width: ?u3 = null,
 
     /// Constraint and alignment properties for the glyph. The rasterizer
     /// should call the `constrain` function on this with the original size

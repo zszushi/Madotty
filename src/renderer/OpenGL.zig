@@ -306,10 +306,10 @@ pub fn initShaders(
 
 /// Initialize a new render target which can be presented by this API.
 pub fn initTarget(self: *const OpenGL, width: usize, height: usize) !Target {
-    _ = self;
     return Target.init(.{
         .width = width,
         .height = height,
+        .srgb = !is_wgl or self.blending.isLinear(),
     });
 }
 
@@ -328,6 +328,10 @@ pub fn present(
         defer binding.unbind();
         // RenderPass restores the draw framebuffer to the window (zero).
         // Present directly; Windows does not consume exported EGL frames.
+        // The target already holds display-encoded RGB bytes in either mode.
+        try gl.disable(gl.c.GL_FRAMEBUFFER_SRGB);
+        defer gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch |err|
+            log.err("restoring sRGB framebuffer conversion failed: {}", .{err});
         try gl.blitFramebuffer(
             0,
             0,
@@ -405,10 +409,9 @@ pub const bgImageBufferOptions = bufferOptions;
 
 /// Returns the options to use when constructing textures.
 pub inline fn textureOptions(self: OpenGL) Texture.Options {
-    _ = self;
     return .{
         .format = .rgba,
-        .internal_format = .srgba,
+        .internal_format = if (!is_wgl or self.blending.isLinear()) .srgba else .rgba,
         .target = .@"2d",
         .min_filter = .linear,
         .mag_filter = .linear,

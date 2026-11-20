@@ -260,8 +260,8 @@ fn genTable() Table {
         // indistinguishable from a UTF-8 continuation byte ("Ü" is
         // 0xC3 0x9C), and Ghostty doesn't honor 8-bit C1 controls in
         // the ground state either (they go through UTF-8 decoding).
-        // DCS strings terminate via 7-bit ST (ESC \) and abort via
-        // CAN/SUB, which are unaffected here.
+        // Text DCS strings terminate via 7-bit ST (ESC \) and abort via
+        // CAN/SUB. Parser.next also accepts raw ST within ASCII Sixel.
         range(&result, 0x80, 0xFF, source, source, .put);
     }
 

@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+         xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+         xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+         xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+         xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
+         xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+         IgnorableNamespaces="uap uap3 uap10 com rescap">
+  <Identity Name="Madotty.TerminalHandoff" Publisher="CN=Madotty" Version="1.0.0.0" ProcessorArchitecture="x64" />
+  <Properties>
+    <DisplayName>Madotty</DisplayName>
+    <PublisherDisplayName>Madotty</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
+  </Properties>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22000.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+  <Applications>
+    <Application Id="Madotty" Executable="ghostty.exe" uap10:RuntimeBehavior="win32App" uap10:TrustLevel="mediumIL">
+      <uap:VisualElements AppListEntry="none" DisplayName="Madotty" Description="Madotty"
+                          BackgroundColor="transparent" Square44x44Logo="Assets\Square44x44Logo.png"
+                          Square150x150Logo="Assets\Square150x150Logo.png" />
+      <Extensions>
+        <uap3:Extension Category="windows.appExtension">
+          <uap3:AppExtension Name="com.microsoft.windows.console.host" Id="Console" DisplayName="Madotty">
+            <uap3:Properties>
+              <Clsid>{DA74EFEB-11F3-4B6A-8944-E5021D6E02FF}</Clsid>
+            </uap3:Properties>
+          </uap3:AppExtension>
+        </uap3:Extension>
+        <uap3:Extension Category="windows.appExtension">
+          <uap3:AppExtension Name="com.microsoft.windows.terminal.host" Id="Terminal" DisplayName="Madotty">
+            <uap3:Properties>
+              <Clsid>{A3A39CB0-46F7-4D5D-954E-F311DAE8EB6A}</Clsid>
+            </uap3:Properties>
+          </uap3:AppExtension>
+        </uap3:Extension>
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:ExeServer DisplayName="Madotty OpenConsole" Executable="Madotty.OpenConsole.exe">
+              <com:Class Id="DA74EFEB-11F3-4B6A-8944-E5021D6E02FF" />
+            </com:ExeServer>
+            <com:ExeServer DisplayName="Madotty" Executable="ghostty.exe">
+              <com:Class Id="A3A39CB0-46F7-4D5D-954E-F311DAE8EB6A" />
+            </com:ExeServer>
+          </com:ComServer>
+        </com:Extension>
+        <com:Extension Category="windows.comInterface">
+          <com:ComInterface>
+            <com:ProxyStub Id="9C11CDBC-C14F-4C6D-AC73-3110BAD9DCA6"
+                           DisplayName="Madotty Console Handoff Proxy" Path="Madotty.TerminalHandoffProxy.dll" />
+            <com:Interface Id="E686C757-9A35-4A1C-B3CE-0BCC8B5C69F4" ProxyStubClsid="9C11CDBC-C14F-4C6D-AC73-3110BAD9DCA6" />
+            <com:Interface Id="6F23DA90-15C5-4203-9DB0-64E73F1B1B00" ProxyStubClsid="9C11CDBC-C14F-4C6D-AC73-3110BAD9DCA6" />
+            <com:Interface Id="746E6BC0-AB05-4E38-AB14-71E86763141F" ProxyStubClsid="9C11CDBC-C14F-4C6D-AC73-3110BAD9DCA6" />
+          </com:ComInterface>
+        </com:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <rescap:Capability Name="unvirtualizedResources" />
+  </Capabilities>
+</Package>

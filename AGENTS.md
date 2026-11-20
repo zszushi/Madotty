@@ -75,7 +75,7 @@ A file for [guiding coding agents](https://agents.md/).
 - Launch automated tests from a local Windows path such as `%TEMP%`, not a
   WSL UNC path. The test harness handles this for the main executable.
 - Standalone Zig test binaries also need a local Windows working directory
-  and snapshot/font fixtures. See `README.md` for the staging procedure.
+  and snapshot/font fixtures. See `docs/development.md` for the staging procedure.
 - Test PowerShell integration without GUI/input using
   `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File test/win32/test_shell_integration.ps1`;
   repeat with `pwsh.exe`. Keep the integration script compatible with Windows

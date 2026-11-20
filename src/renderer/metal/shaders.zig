@@ -233,8 +233,8 @@ pub const Uniforms = extern struct {
     ///
     /// TODO: Maybe put these in a packed struct, like for OpenGL.
     bools: extern struct {
-        /// Whether the cursor is 2 cells wide.
-        cursor_wide: bool align(1),
+        /// Number of grid cells occupied by the cursor.
+        cursor_width: u8 align(1) = 1,
 
         /// Indicates that colors provided to the shader are already in
         /// the P3 color space, so they don't need to be converted from

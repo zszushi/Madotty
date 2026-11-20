@@ -1,8 +1,9 @@
-//! Win32 Surface. Each Surface corresponds to one HWND (window) and
-//! owns an OpenGL (WGL) context for rendering.
+//! Win32 terminal pane backed by a child HWND.
 const Surface = @This();
 
 const std = @import("std");
+const lang = @import("UiLanguage.zig");
+const build_config = @import("../../build_config.zig");
 const Allocator = std.mem.Allocator;
 const apprt = @import("../../apprt.zig");
 const configpkg = @import("../../config.zig");
@@ -15,10 +16,14 @@ const global = @import("../../global.zig");
 
 const App = @import("App.zig");
 const Window = @import("Window.zig");
+const Progress = @import("Progress.zig");
+const Profiles = @import("Profiles.zig");
 const w32 = @import("win32.zig");
 const Scrollbar = @import("Scrollbar.zig").Scrollbar;
 
 const log = std.log.scoped(.win32);
+const uses_wgl = build_config.renderer == .opengl;
+pub const wm_vulkan_draw = w32.WM_APP + 7;
 
 /// The Win32 window handle.
 hwnd: ?w32.HWND = null,
@@ -43,6 +48,20 @@ app: *App,
 /// The parent Window that contains this Surface as a tab.
 parent_window: *Window = undefined,
 
+/// Progress reported by this pane, accessed only on the Win32 thread.
+progress: Progress = .{},
+tab_shell: ?Profiles.Shell = null,
+profile_id: ?u64 = null,
+plain_profile: bool = false,
+launch_exe: ?u64 = null,
+launch_title: [255]u16 = undefined,
+launch_title_len: usize = 0,
+reported_directory: []const u16 = &.{},
+
+/// Written by the UI thread, read by the renderer. Per-surface storage lets
+/// a tab change windows without a renderer thread accessing its Win32 parent.
+force_opaque_background: std.atomic.Value(bool) = .init(false),
+
 /// Last title reported by the core for getTitle/copy-title consumers.
 title_len: usize = 0,
 title: [4096]u8 = std.mem.zeroes([4096]u8),
@@ -59,6 +78,9 @@ core_surface_ready: bool = false,
 /// Whether core_surface.init() completed successfully (ever).
 /// Different from core_surface_ready which is cleared during shutdown.
 core_surface_initialized: bool = false,
+
+/// Borrowed only while constructing the core surface.
+pending_attachment: ?*?termio.Exec.Attachment = null,
 
 /// Buffered high surrogate from WM_CHAR for supplementary plane characters.
 /// Win32 delivers codepoints > U+FFFF as two WM_CHAR messages (surrogate pair).
@@ -96,6 +118,8 @@ in_live_resize: bool = false,
 /// a frame. The main thread waits on this during live resize to
 /// synchronize rendering with the DWM compositor.
 frame_event: ?w32.HANDLE = null,
+vulkan_draw_queued: if (build_config.renderer == .vulkan) std.atomic.Value(bool) else void =
+    if (build_config.renderer == .vulkan) .init(false) else {},
 
 /// Themed scrollbar (custom layered-popup overlay).
 /// Created lazily after the surface HWND exists.
@@ -157,8 +181,8 @@ palette_hwnd: ?w32.HWND = null,
 palette_edit: ?w32.HWND = null,
 /// Font handle for the palette edit (must be deleted on cleanup).
 palette_font: ?*anyopaque = null,
-/// Cached paint-time font for the palette list (14pt Segoe UI). The
-/// edit control uses palette_font (16pt); this is for FillRect/DrawText
+/// Cached paint-time font for the palette list (14 logical pixels). The
+/// edit control uses palette_font (16 logical pixels); this is for FillRect/DrawText
 /// in paintPalette. Cached so we don't allocate a new HFONT on every
 /// keystroke-driven repaint.
 palette_paint_font: ?*anyopaque = null,
@@ -171,7 +195,7 @@ palette_selected: u16 = 0,
 /// Number of items currently in the filtered list.
 palette_count: u16 = 0,
 /// Indices into palette_entries for the current filter.
-palette_filtered: [palette_entries.len + MAX_USER_PALETTE_ENTRIES]u16 = undefined,
+palette_filtered: [palette_entries.len + input.command.defaults.len + MAX_USER_PALETTE_ENTRIES]u16 = undefined,
 
 /// Reference count for SplitTree ownership. Starts at 0 because
 /// SplitTree.init() calls ref() to take initial ownership.
@@ -220,7 +244,23 @@ pub const InitOptions = struct {
     context: apprt.surface.NewSurfaceContext,
     command: ?*const configpkg.Command = null,
     title: ?[:0]const u8 = null,
+    working_directory: ?[]const u8 = null,
+    preserve_command: bool = false,
+    profile: ?Profiles.Profile = null,
+    attachment: ?*?termio.Exec.Attachment = null,
+    initial_cells: ?struct { columns: u16, rows: u16 } = null,
+    initial_show: i32 = w32.SW_SHOW,
 };
+
+/// Take the attachment once termio is ready to own it. If window creation
+/// fails earlier, the attachment remains with the caller.
+pub fn takeConsoleAttachment(self: *Surface) ?termio.Exec.Attachment {
+    const pending = self.pending_attachment orelse return null;
+    self.pending_attachment = null;
+    const attachment = pending.*;
+    pending.* = null;
+    return attachment;
+}
 
 /// Initialize a surface with optional per-surface config overrides. The
 /// overrides are cloned into the surface config arena before this function
@@ -234,11 +274,17 @@ pub fn initWithOptions(
     self.* = .{
         .app = app,
         .parent_window = parent,
+        .force_opaque_background = .init(parent.opaqueSurfaceBackground()),
+        .pending_attachment = options.attachment,
     };
 
     // Create a manual-reset event for synchronizing resize with the
     // renderer thread. Manual-reset so we control exactly when it's reset.
     self.frame_event = w32.CreateEventW(null, 1, 0, null);
+    errdefer if (self.frame_event) |event| {
+        _ = w32.CloseHandle(event);
+        self.frame_event = null;
+    };
 
     // Create a WS_CHILD window inside the parent Window container.
     const parent_hwnd = parent.hwnd orelse return error.Win32Error;
@@ -271,26 +317,8 @@ pub fn initWithOptions(
     // the WndProc can retrieve it.
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
-    // Get the device context. With CS_OWNDC, this DC is valid for
-    // the lifetime of the window.
-    self.hdc = w32.GetDC(hwnd);
-    if (self.hdc == null) return error.Win32Error;
-    errdefer {
-        _ = w32.ReleaseDC(hwnd, self.hdc.?);
-        self.hdc = null;
-    }
-
-    // Set up the pixel format for OpenGL
-    try self.setupPixelFormat();
-
-    // Create the WGL context
-    self.hglrc = w32.wglCreateContext(self.hdc.?);
-    if (self.hglrc == null) return error.Win32Error;
-    errdefer {
-        _ = w32.wglMakeCurrent(null, null);
-        _ = w32.wglDeleteContext(self.hglrc.?);
-        self.hglrc = null;
-    }
+    if (comptime uses_wgl) try self.initGLContext(hwnd);
+    errdefer if (comptime uses_wgl) self.deinitGLContext();
 
     // Query the initial DPI and size
     self.updateDpiScale();
@@ -336,13 +364,40 @@ pub fn initWithOptions(
     var config = try apprt.surface.newConfig(app.core_app, &app.config, options.context);
     defer config.deinit();
 
+    if (options.initial_cells) |cells| {
+        config.@"window-width" = cells.columns;
+        config.@"window-height" = cells.rows;
+    }
+
     if (options.command) |command| {
         config.command = try command.clone(config.arenaAlloc());
-        config.@"shell-integration" = .detect;
+        config.@"shell-integration" = if (options.preserve_command) .none else .detect;
     }
     if (options.title) |title| {
         config.title = try config.arenaAlloc().dupeSentinel(u8, title, 0);
     }
+    if (options.working_directory) |dir| {
+        config.@"working-directory" = .{ .path = try config.arenaAlloc().dupe(u8, dir) };
+    }
+
+    const launch_command = if (app.core_app.first) config.@"initial-command" orelse config.command else config.command;
+    const exe = if (options.attachment) |pending|
+        if (pending.*) |attached| Profiles.clientExecutable(config.arenaAlloc(), attached.client) else null
+    else if (launch_command) |cmd|
+        Profiles.commandExecutable(config.arenaAlloc(), cmd) catch null
+    else
+        null;
+    if (options.profile) |profile| {
+        self.profile_id = std.hash.Wyhash.hash(0, profile.id);
+        self.plain_profile = profile.argv.len == 1;
+    }
+    if (exe) |path| {
+        self.tab_shell = app.shell_icons.lookup(alloc, config.arenaAlloc(), path, options.profile) catch null;
+        const lower = try std.ascii.allocLowerString(config.arenaAlloc(), path);
+        self.launch_exe = std.hash.Wyhash.hash(0, lower);
+    }
+    const label = if (options.profile) |p| p.name else if (exe) |path| Profiles.executableLabel(path) else null;
+    if (label) |name| self.launch_title_len = Window.encodeTitle(&self.launch_title, name);
 
     // Initialize the core surface. This sets up fonts, the renderer, PTY,
     // and spawns the renderer + IO threads.
@@ -353,6 +408,15 @@ pub fn initWithOptions(
         app,
         self,
     );
+    // A direct command seeds argv[0] as its title during core initialization.
+    // A named profile supplies a more useful initial label for the same launch.
+    if ((options.profile != null or options.attachment != null) and config.title == null and self.launch_title_len != 0) {
+        if (launch_command) |cmd| if (cmd == .direct and cmd.direct.len > 0 and
+            std.mem.eql(u8, self.title[0..self.title_len], cmd.direct[0]))
+        {
+            self.title_len = 0;
+        };
+    }
 
     // Mark the surface as ready. Before this point, Win32 messages
     // (triggered by ShowWindow, wglCreateContext, etc.) must be ignored.
@@ -360,10 +424,18 @@ pub fn initWithOptions(
     self.core_surface_initialized = true;
 }
 
+pub fn setOpaqueBackground(self: *Surface, force_opaque: bool) void {
+    const previous = self.force_opaque_background.swap(force_opaque, .monotonic);
+    if (previous != force_opaque and self.core_surface_ready) {
+        self.core_surface.renderer_thread.wakeup.notify() catch {};
+    }
+}
+
 pub fn deinit(self: *Surface) void {
     log.debug("surface deinit: start addr={x}", .{@intFromPtr(self)});
 
     if (self.core_surface_initialized) {
+        if (comptime build_config.renderer == .vulkan) self.core_surface_ready = false;
         log.debug("surface deinit: core_surface.deinit start", .{});
         self.core_surface.deinit();
         log.debug("surface deinit: core_surface.deinit done", .{});
@@ -388,23 +460,7 @@ pub fn deinit(self: *Surface) void {
     }
     log.debug("surface deinit: frame_event closed", .{});
 
-    if (self.hglrc) |hglrc| {
-        log.debug("surface deinit: wglMakeCurrent(null)", .{});
-        _ = w32.wglMakeCurrent(null, null);
-        log.debug("surface deinit: wglDeleteContext", .{});
-        _ = w32.wglDeleteContext(hglrc);
-        self.hglrc = null;
-    }
-    log.debug("surface deinit: GL context cleaned up", .{});
-
-    if (self.hdc) |hdc| {
-        if (self.hwnd) |hwnd| {
-            log.debug("surface deinit: ReleaseDC", .{});
-            _ = w32.ReleaseDC(hwnd, hdc);
-        }
-        self.hdc = null;
-    }
-    log.debug("surface deinit: DC released", .{});
+    if (comptime uses_wgl) self.deinitGLContext();
 
     self.deinitGui();
 }
@@ -414,6 +470,8 @@ pub fn deinit(self: *Surface) void {
 /// both the normal deinit path and the leak path (wedged surface thread),
 /// where everything the renderer/IO threads can reach must stay alive.
 fn deinitGui(self: *Surface) void {
+    if (self.reported_directory.len != 0) self.app.core_app.alloc.free(self.reported_directory);
+    self.reported_directory = &.{};
     // Destroy the themed scrollbar before the surface HWND is gone.
     if (self.scrollbar) |sb| {
         sb.destroy();
@@ -514,9 +572,28 @@ pub fn popupDestroyed(self: *Surface, hwnd: w32.HWND) void {
     }
 }
 
-/// WGL contexts are per-surface; the shared renderer device has no options.
+/// The Win32 renderer device is shared across panes.
 pub fn renderDeviceOptions(_: *Surface) !@import("../../renderer.zig").Device.Options {
     return .{};
+}
+
+fn initGLContext(self: *Surface, hwnd: w32.HWND) !void {
+    self.hdc = w32.GetDC(hwnd) orelse return error.Win32Error;
+    errdefer self.deinitGLContext();
+    try self.setupPixelFormat();
+    self.hglrc = w32.wglCreateContext(self.hdc.?) orelse return error.Win32Error;
+}
+
+fn deinitGLContext(self: *Surface) void {
+    if (self.hglrc) |hglrc| {
+        _ = w32.wglMakeCurrent(null, null);
+        _ = w32.wglDeleteContext(hglrc);
+        self.hglrc = null;
+    }
+    if (self.hdc) |hdc| {
+        if (self.hwnd) |hwnd| _ = w32.ReleaseDC(hwnd, hdc);
+        self.hdc = null;
+    }
 }
 
 /// Recreate the WGL context after GPU context loss (driver reset/TDR)
@@ -610,6 +687,26 @@ pub fn getSize(self: *const Surface) !apprt.SurfaceSize {
     return .{ .width = self.width, .height = self.height };
 }
 
+/// A delegated console needs the initial grid before its pipe handoff
+/// returns. Lay out the child now while the first tab is still being created.
+pub fn prepareAttachmentGeometry(self: *Surface, size: ?apprt.SurfaceSize) !bool {
+    if (self.pending_attachment == null) return false;
+    const hwnd = self.hwnd orelse return error.Win32Error;
+    if (size) |requested| {
+        const reserved: u32 = if (self.scrollbar) |sb| @intCast(sb.reservedWidth()) else 0;
+        try self.parent_window.resizeBeforeFirstTab(.{ .width = requested.width +| reserved, .height = requested.height });
+        const rect = self.parent_window.surfaceRect();
+        if (w32.MoveWindow(hwnd, rect.left, rect.top, @max(1, rect.right - rect.left), @max(1, rect.bottom - rect.top), 0) == 0)
+            return error.Win32Error;
+    }
+
+    // WM_SIZE can be suppressed if the child was already the desired size.
+    var rect: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &rect) == 0) return error.Win32Error;
+    self.handleResize(@intCast(rect.right - rect.left), @intCast(rect.bottom - rect.top));
+    return true;
+}
+
 pub fn getCursorPos(self: *const Surface) !apprt.CursorPos {
     if (self.hwnd) |hwnd| {
         var point: w32.POINT = undefined;
@@ -625,6 +722,18 @@ pub fn getCursorPos(self: *const Surface) !apprt.CursorPos {
     // core skips the mouse computation instead of resolving it against the
     // top-left cell (which produced spurious hover/selection at 0,0).
     return error.GetCursorPosFailed;
+}
+
+pub fn setReportedDirectory(self: *Surface, path: []const u8) !void {
+    const alloc = self.app.core_app.alloc;
+    const dir = try std.unicode.utf8ToUtf16LeAlloc(alloc, path);
+    if (std.mem.eql(u16, self.reported_directory, dir)) {
+        alloc.free(dir);
+        return;
+    }
+    alloc.free(self.reported_directory);
+    self.reported_directory = dir;
+    self.parent_window.invalidateTabBar();
 }
 
 pub fn getTitle(self: *const Surface) ?[:0]const u8 {
@@ -679,10 +788,8 @@ fn closeWithNative(self: *Surface, process_active: bool, comptime native: type) 
         const parent_hwnd = self.parent_window.hwnd;
         const result = native.MessageBoxW(
             parent_hwnd,
-            std.unicode.utf8ToUtf16LeStringLiteral(
-                "A process is still running in this terminal.\nClose anyway?",
-            ),
-            std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
+            lang.wide("A process is still running in this terminal.\nClose anyway?"),
+            std.unicode.utf8ToUtf16LeStringLiteral("Madotty"),
             w32.MB_OKCANCEL | w32.MB_ICONWARNING | w32.MB_DEFBUTTON2,
         );
         if (result != w32.IDOK) return;
@@ -819,8 +926,8 @@ fn confirmClipboard(
 ) bool {
     const result = w32.MessageBoxW(
         self.parent_window.hwnd,
-        std.unicode.utf8ToUtf16LeStringLiteral(message),
-        std.unicode.utf8ToUtf16LeStringLiteral(title),
+        lang.wide(message),
+        lang.wide(title),
         // Default to Cancel so an accidental Enter does not approve.
         w32.MB_OKCANCEL | w32.MB_ICONWARNING | w32.MB_DEFBUTTON2,
     );
@@ -976,16 +1083,16 @@ fn completeClipboardRequestWithConfirmation(
             error.UnsafePaste => self.confirmClipboard(
                 "The text being pasted contains characters that could run " ++
                     "commands unexpectedly (for example, newlines).\n\nPaste anyway?",
-                "Ghostty \u{2014} Potentially Unsafe Paste",
+                "Madotty \u{2014} Potentially Unsafe Paste",
             ),
             error.UnauthorizedPaste => switch (state) {
                 .kitty_write, .osc_52_write => self.confirmClipboard(
                     "An application is requesting to write to the system clipboard.\n\nAllow this?",
-                    "Ghostty \u{2014} Authorize Clipboard Access",
+                    "Madotty \u{2014} Authorize Clipboard Access",
                 ),
                 else => self.confirmClipboard(
                     "An application is requesting access to read the clipboard.\n\nAllow this?",
-                    "Ghostty \u{2014} Authorize Clipboard Access",
+                    "Madotty \u{2014} Authorize Clipboard Access",
                 ),
             },
             else => {
@@ -1041,7 +1148,7 @@ pub fn setClipboard(
     if (confirm) {
         if (!self.confirmClipboard(
             "An application is requesting to write to the system clipboard.\n\nAllow this?",
-            "Ghostty \u{2014} Authorize Clipboard Access",
+            "Madotty \u{2014} Authorize Clipboard Access",
         )) return;
     }
 
@@ -1197,33 +1304,56 @@ pub fn setTitle(self: *Surface, title: [:0]const u8) void {
     self.parent_window.onTabTitleChanged(self, title);
 }
 
+pub fn reportProgress(self: *Surface, report: Progress.Report) void {
+    if (!self.app.config.@"progress-style" or self.parent_window.is_quick_terminal) return;
+    if (self.progress.apply(report) or
+        (self.parent_window.taskbar_ready and self.parent_window.taskbar_progress == null))
+        self.parent_window.queueProgressRefresh();
+}
+
 /// Toggle fullscreen mode. Delegates to the parent Window.
 pub fn toggleFullscreen(self: *Surface) void {
     self.parent_window.toggleFullscreen();
 }
 
-/// Set the mouse cursor shape. Caches the handle so WM_SETCURSOR can
-/// restore it (Windows resets the cursor on every mouse move otherwise).
-pub fn setMouseShape(self: *Surface, shape: terminal.MouseShape) void {
-    const cursor = switch (shape) {
-        .text => w32.LoadCursorW(null, w32.IDC_IBEAM),
-        .pointer => w32.LoadCursorW(null, w32.IDC_HAND),
-        .crosshair => w32.LoadCursorW(null, w32.IDC_CROSS),
-        .e_resize, .w_resize, .ew_resize => w32.LoadCursorW(null, w32.IDC_SIZEWE),
-        .n_resize, .s_resize, .ns_resize => w32.LoadCursorW(null, w32.IDC_SIZENS),
-        .nwse_resize, .nw_resize, .se_resize => w32.LoadCursorW(null, w32.IDC_SIZENWSE),
-        .nesw_resize, .ne_resize, .sw_resize => w32.LoadCursorW(null, w32.IDC_SIZENESW),
-        .not_allowed => w32.LoadCursorW(null, w32.IDC_NO),
-        .progress => w32.LoadCursorW(null, w32.IDC_APPSTARTING),
-        .wait => w32.LoadCursorW(null, w32.IDC_WAIT),
-        else => w32.LoadCursorW(null, w32.IDC_ARROW),
+fn systemMouseCursor(shape: terminal.MouseShape) ?usize {
+    return switch (shape) {
+        .default => w32.IDC_ARROW,
+        .text => w32.IDC_IBEAM,
+        .pointer => w32.IDC_HAND,
+        .crosshair => w32.IDC_CROSS,
+        .e_resize, .w_resize, .ew_resize, .col_resize => w32.IDC_SIZEWE,
+        .n_resize, .s_resize, .ns_resize, .row_resize => w32.IDC_SIZENS,
+        .nwse_resize, .nw_resize, .se_resize => w32.IDC_SIZENWSE,
+        .nesw_resize, .ne_resize, .sw_resize => w32.IDC_SIZENESW,
+        .move, .all_scroll => w32.IDC_SIZEALL,
+        .not_allowed, .no_drop => w32.IDC_NO,
+        .progress => w32.IDC_APPSTARTING,
+        .wait => w32.IDC_WAIT,
+        .help => w32.IDC_HELP,
+        else => null,
     };
-    self.current_cursor = cursor;
-    if (cursor) |c| _ = w32.SetCursor(c);
 }
 
-/// Handle WM_SETCURSOR — restore our cached cursor so Windows doesn't
-/// reset it to the class cursor (IDC_ARROW) on every mouse move.
+pub fn supportsMouseShape(shape: terminal.MouseShape) bool {
+    return systemMouseCursor(shape) != null;
+}
+
+/// Cache the cursor handle so WM_SETCURSOR can restore it on mouse moves.
+pub fn setMouseShape(self: *Surface, shape: terminal.MouseShape) void {
+    const cursor = w32.LoadCursorW(null, systemMouseCursor(shape) orelse w32.IDC_ARROW);
+    self.current_cursor = cursor;
+    // A hidden tab may change its own cursor without affecting the one
+    // currently over a different pane or application.
+    if (!self.mouse_visible) return;
+    const hwnd = self.hwnd orelse return;
+    const handle = cursor orelse return;
+    var point: w32.POINT = undefined;
+    if (w32.GetCursorPos_(&point) != 0 and w32.WindowFromPoint(point) == hwnd)
+        _ = w32.SetCursor(handle);
+}
+
+/// Handle WM_SETCURSOR by restoring the cached cursor on each mouse move.
 /// Returns true if we handled it (caller should return TRUE).
 pub fn handleSetCursor(self: *Surface) bool {
     // Hidden cursor: pass NULL.
@@ -1268,50 +1398,36 @@ pub fn setMouseOverLink(self: *Surface, url: []const u8) void {
             self.app.hinstance,
             null,
         );
-        if (self.link_preview_hwnd) |h| {
-            if (self.link_font == null) {
-                self.link_font = w32.CreateFontW(
-                    -@as(i32, @intFromFloat(@round(13.0 * s))),
-                    0,
-                    0,
-                    0,
-                    400,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
-                );
-            }
-            if (self.link_font) |f| {
-                _ = w32.SendMessageW(h, w32.WM_SETFONT, @intFromPtr(f), 1);
-            }
-        }
+        if (self.link_preview_hwnd != null) self.parent_window.ui_font.replace(&self.link_font, 13, s, &.{self.link_preview_hwnd});
     }
     const preview = self.link_preview_hwnd orelse return;
 
     var buf16: [512]u16 = undefined;
-    const truncated = if (url.len > 480) url[0..480] else url;
-    const len16 = std.unicode.utf8ToUtf16Le(&buf16, truncated) catch return;
-    buf16[@min(len16, buf16.len - 1)] = 0;
+    var end = @min(url.len, 480);
+    while (end > 0 and end < url.len and url[end] & 0xC0 == 0x80) end -= 1;
+    const len16 = std.unicode.utf8ToUtf16Le(&buf16, url[0..end]) catch return;
+    buf16[len16] = 0;
     _ = w32.SetWindowTextW(preview, @ptrCast(&buf16));
+    self.positionLinkPreview(hwnd, preview, buf16[0..len16]);
+    _ = w32.ShowWindow(preview, w32.SW_SHOWNOACTIVATE);
+}
 
-    // Rough width from character count, capped to the surface width.
-    const char_w: i32 = @intFromFloat(@round(7.0 * s));
+fn positionLinkPreview(self: *Surface, hwnd: w32.HWND, preview: w32.HWND, text: []const u16) void {
+    const s = self.scale;
     const pad: i32 = @intFromFloat(@round(12.0 * s));
-    const pw: i32 = @min(
-        @as(i32, @intCast(self.width)),
-        @as(i32, @intCast(len16)) * char_w + pad,
-    );
+    const dc = w32.GetDC(preview) orelse return;
+    defer _ = w32.ReleaseDC(preview, dc);
+    const old = if (self.link_font) |font| w32.SelectObject(dc, font) else null;
+    defer if (old) |font| {
+        _ = w32.SelectObject(dc, font);
+    };
+    var measured = std.mem.zeroes(w32.RECT);
+    _ = w32.DrawTextW(dc, text.ptr, @intCast(text.len), &measured, w32.DT_CALCRECT | w32.DT_SINGLELINE | w32.DT_NOPREFIX);
+    const pw: i32 = @min(@as(i32, @intCast(self.width)), measured.right + pad);
     const ph: i32 = @intFromFloat(@round(22.0 * s));
     var pt = w32.POINT{ .x = 0, .y = @as(i32, @intCast(self.height)) - ph };
     _ = w32.ClientToScreen(hwnd, &pt);
     _ = w32.SetWindowPos(preview, null, pt.x, pt.y, pw, ph, w32.SWP_NOACTIVATE | w32.SWP_NOZORDER);
-    _ = w32.ShowWindow(preview, w32.SW_SHOWNOACTIVATE);
 }
 
 /// Store the total match count from the search_total action and refresh
@@ -1472,29 +1588,7 @@ fn ensureSearchBar(self: *Surface) void {
         null,
     );
 
-    // Set a readable font (DPI-scaled)
-    self.search_font = w32.CreateFontW(
-        -@as(i32, @intFromFloat(@round(16.0 * s))),
-        0,
-        0,
-        0,
-        400,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
-    );
-    if (self.search_font) |f| {
-        _ = w32.SendMessageW(edit, w32.WM_SETFONT, @intFromPtr(f), 1);
-        if (self.search_count_label) |label| {
-            _ = w32.SendMessageW(label, w32.WM_SETFONT, @intFromPtr(f), 1);
-        }
-    }
+    self.parent_window.ui_font.replace(&self.search_font, 16, s, &.{ edit, self.search_count_label });
 
     // Set GWLP_USERDATA on the popup so surfaceWndProc can route
     // WM_COMMAND (EN_CHANGE) and WM_CTLCOLOREDIT to this Surface.
@@ -1502,6 +1596,22 @@ fn ensureSearchBar(self: *Surface) void {
 
     self.search_hwnd = popup;
     self.search_edit = edit;
+}
+
+/// Keep the popup's controls at the pane's current DPI. The popup's own
+/// WM_SIZE must never resize the terminal grid.
+pub fn layoutPopupControls(self: *Surface, popup: w32.HWND, width: i32, height: i32) void {
+    if (popup == self.search_hwnd) {
+        const pad: i32 = @intFromFloat(@round(4 * self.scale));
+        const count: i32 = @intFromFloat(@round(64 * self.scale));
+        const h = @max(1, height - 2 * pad);
+        if (self.search_edit) |edit| _ = w32.MoveWindow(edit, pad, pad, @max(1, width - 2 * pad - count), h, 1);
+        if (self.search_count_label) |label| _ = w32.MoveWindow(label, width - count - pad, pad, count, h, 1);
+    } else if (popup == self.palette_hwnd) {
+        const pad: i32 = @intFromFloat(@round(8 * self.scale));
+        const h: i32 = @intFromFloat(@round(24 * self.scale));
+        if (self.palette_edit) |edit| _ = w32.MoveWindow(edit, pad, pad, @max(1, width - 2 * pad), h, 1);
+    }
 }
 
 /// Position the search popup at the top-right corner of the parent window.
@@ -1584,20 +1694,41 @@ pub fn handleSearchKey(self: *Surface, vk: u16) bool {
 /// A command palette entry: display name + the binding action to execute.
 const PaletteEntry = struct {
     name: []const u8,
+    name_ja: []const u8,
     action: input.Binding.Action,
+
+    fn init(comptime name: [:0]const u8, action: input.Binding.Action) PaletteEntry {
+        return .{ .name = name, .name_ja = lang.japanese(name), .action = action };
+    }
 };
 
 /// Cap on user-configured command-palette-entry commands shown in the
 /// palette (bounds the fixed-size palette_filtered index array).
 pub const MAX_USER_PALETTE_ENTRIES = 64;
 
+const shared_palette = entries: {
+    @setEvalBranchQuota(1_000_000);
+    var entries: [input.command.defaults.len]struct { ja: []const u8, native: bool } = undefined;
+    for (input.command.defaults, 0..) |cmd, i| {
+        entries[i] = .{
+            .ja = lang.japanese(cmd.title),
+            .native = for (palette_entries) |native| {
+                if (native.action.equal(cmd.action)) break true;
+            } else false,
+        };
+    }
+    break :entries entries;
+};
+
 /// Palette indexes >= palette_entries.len refer to user-configured
 /// command-palette-entry commands from the config, in order.
 fn paletteEntryName(self: *const Surface, idx: u16) []const u8 {
-    if (idx < palette_entries.len) return palette_entries[idx].name;
-    const user = self.app.config.@"command-palette-entry".value.items;
+    if (idx < palette_entries.len) return if (lang.isJapanese()) palette_entries[idx].name_ja else palette_entries[idx].name;
+    const commands = &self.app.config.@"command-palette-entry";
+    const user = commands.value.items;
     const uidx = idx - palette_entries.len;
     if (uidx >= user.len) return "";
+    if (uidx < commands.builtin_count and lang.isJapanese()) return shared_palette[uidx].ja;
     return user[uidx].title;
 }
 
@@ -1618,54 +1749,54 @@ pub const PALETTE_ITEM_HEIGHT: f32 = 28.0;
 
 /// Static list of commands shown in the palette.
 const palette_entries = [_]PaletteEntry{
-    .{ .name = "New Window", .action = .new_window },
-    .{ .name = "New Tab", .action = .new_tab },
-    .{ .name = "Tab Overview", .action = .toggle_tab_overview },
-    .{ .name = "Close Surface", .action = .close_surface },
-    .{ .name = "Close Tab", .action = .{ .close_tab = .this } },
-    .{ .name = "Close Window", .action = .close_window },
-    .{ .name = "Previous Tab", .action = .previous_tab },
-    .{ .name = "Next Tab", .action = .next_tab },
-    .{ .name = "Last Tab", .action = .last_tab },
-    .{ .name = "Split Right", .action = .{ .new_split = .right } },
-    .{ .name = "Split Down", .action = .{ .new_split = .down } },
-    .{ .name = "Split Left", .action = .{ .new_split = .left } },
-    .{ .name = "Split Up", .action = .{ .new_split = .up } },
-    .{ .name = "Focus Split Right", .action = .{ .goto_split = .right } },
-    .{ .name = "Focus Split Down", .action = .{ .goto_split = .down } },
-    .{ .name = "Focus Split Left", .action = .{ .goto_split = .left } },
-    .{ .name = "Focus Split Up", .action = .{ .goto_split = .up } },
-    .{ .name = "Focus Previous Split", .action = .{ .goto_split = .previous } },
-    .{ .name = "Focus Next Split", .action = .{ .goto_split = .next } },
-    .{ .name = "Toggle Split Zoom", .action = .toggle_split_zoom },
-    .{ .name = "Equalize Splits", .action = .equalize_splits },
-    .{ .name = "Toggle Fullscreen", .action = .toggle_fullscreen },
-    .{ .name = "Toggle Maximize", .action = .toggle_maximize },
-    .{ .name = "Toggle Window Decorations", .action = .toggle_window_decorations },
-    .{ .name = "Toggle Background Opacity", .action = .toggle_background_opacity },
-    .{ .name = "Toggle Quick Terminal", .action = .toggle_quick_terminal },
-    .{ .name = "Toggle Read-Only", .action = .toggle_readonly },
-    .{ .name = "Toggle Mouse Reporting", .action = .toggle_mouse_reporting },
-    .{ .name = "Reset Mouse Reporting", .action = .reset_mouse_reporting },
-    .{ .name = "Copy to Clipboard", .action = .{ .copy_to_clipboard = .mixed } },
-    .{ .name = "Paste from Clipboard", .action = .paste_from_clipboard },
-    .{ .name = "Copy URL to Clipboard", .action = .copy_url_to_clipboard },
-    .{ .name = "Copy Title to Clipboard", .action = .copy_title_to_clipboard },
-    .{ .name = "Select All", .action = .select_all },
-    .{ .name = "Find", .action = .start_search },
-    .{ .name = "Search Selection", .action = .search_selection },
-    .{ .name = "Increase Font Size", .action = .{ .increase_font_size = 1 } },
-    .{ .name = "Decrease Font Size", .action = .{ .decrease_font_size = 1 } },
-    .{ .name = "Reset Font Size", .action = .reset_font_size },
-    .{ .name = "Scroll Page Up", .action = .scroll_page_up },
-    .{ .name = "Scroll Page Down", .action = .scroll_page_down },
-    .{ .name = "Scroll to Top", .action = .scroll_to_top },
-    .{ .name = "Scroll to Bottom", .action = .scroll_to_bottom },
-    .{ .name = "Clear Screen", .action = .clear_screen },
-    .{ .name = "Reset Terminal", .action = .reset },
-    .{ .name = "Open Config", .action = .{ .open_config = .default } },
-    .{ .name = "Reload Config", .action = .reload_config },
-    .{ .name = "Quit", .action = .quit },
+    PaletteEntry.init("New Window", .new_window),
+    PaletteEntry.init("New Tab", .new_tab),
+    PaletteEntry.init("Tab Overview", .toggle_tab_overview),
+    PaletteEntry.init("Close Surface", .close_surface),
+    PaletteEntry.init("Close Tab", .{ .close_tab = .this }),
+    PaletteEntry.init("Close Window", .close_window),
+    PaletteEntry.init("Previous Tab", .previous_tab),
+    PaletteEntry.init("Next Tab", .next_tab),
+    PaletteEntry.init("Last Tab", .last_tab),
+    PaletteEntry.init("Split Right", .{ .new_split = .right }),
+    PaletteEntry.init("Split Down", .{ .new_split = .down }),
+    PaletteEntry.init("Split Left", .{ .new_split = .left }),
+    PaletteEntry.init("Split Up", .{ .new_split = .up }),
+    PaletteEntry.init("Focus Split Right", .{ .goto_split = .right }),
+    PaletteEntry.init("Focus Split Down", .{ .goto_split = .down }),
+    PaletteEntry.init("Focus Split Left", .{ .goto_split = .left }),
+    PaletteEntry.init("Focus Split Up", .{ .goto_split = .up }),
+    PaletteEntry.init("Focus Previous Split", .{ .goto_split = .previous }),
+    PaletteEntry.init("Focus Next Split", .{ .goto_split = .next }),
+    PaletteEntry.init("Toggle Split Zoom", .toggle_split_zoom),
+    PaletteEntry.init("Equalize Splits", .equalize_splits),
+    PaletteEntry.init("Toggle Fullscreen", .toggle_fullscreen),
+    PaletteEntry.init("Toggle Maximize", .toggle_maximize),
+    PaletteEntry.init("Toggle Window Decorations", .toggle_window_decorations),
+    PaletteEntry.init("Toggle Background Opacity", .toggle_background_opacity),
+    PaletteEntry.init("Toggle Quick Terminal", .toggle_quick_terminal),
+    PaletteEntry.init("Toggle Read-Only", .toggle_readonly),
+    PaletteEntry.init("Toggle Mouse Reporting", .toggle_mouse_reporting),
+    PaletteEntry.init("Reset Mouse Reporting", .reset_mouse_reporting),
+    PaletteEntry.init("Copy to Clipboard", .{ .copy_to_clipboard = .mixed }),
+    PaletteEntry.init("Paste from Clipboard", .paste_from_clipboard),
+    PaletteEntry.init("Copy URL to Clipboard", .copy_url_to_clipboard),
+    PaletteEntry.init("Copy Title to Clipboard", .copy_title_to_clipboard),
+    PaletteEntry.init("Select All", .select_all),
+    PaletteEntry.init("Find", .start_search),
+    PaletteEntry.init("Search Selection", .search_selection),
+    PaletteEntry.init("Increase Font Size", .{ .increase_font_size = 1 }),
+    PaletteEntry.init("Decrease Font Size", .{ .decrease_font_size = 1 }),
+    PaletteEntry.init("Reset Font Size", .reset_font_size),
+    PaletteEntry.init("Scroll Page Up", .scroll_page_up),
+    PaletteEntry.init("Scroll Page Down", .scroll_page_down),
+    PaletteEntry.init("Scroll to Top", .scroll_to_top),
+    PaletteEntry.init("Scroll to Bottom", .scroll_to_bottom),
+    PaletteEntry.init("Clear Screen", .clear_screen),
+    PaletteEntry.init("Reset Terminal", .reset),
+    PaletteEntry.init("Open Config", .{ .open_config = .default }),
+    PaletteEntry.init("Reload Config", .reload_config),
+    PaletteEntry.init("Quit", .quit),
 };
 
 /// Toggle the command palette visibility.
@@ -1755,33 +1886,14 @@ fn ensureCommandPalette(self: *Surface) void {
         return;
     };
 
-    // Set font (DPI-scaled) — stored for cleanup in deinit
-    self.palette_font = w32.CreateFontW(
-        -@as(i32, @intFromFloat(@round(16.0 * s))),
-        0,
-        0,
-        0,
-        400,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
-    );
-    if (self.palette_font) |f| {
-        _ = w32.SendMessageW(edit, w32.WM_SETFONT, @intFromPtr(f), 1);
-    }
+    self.parent_window.ui_font.replace(&self.palette_font, 16, s, &.{edit});
 
     // Create cached brush for WM_CTLCOLOREDIT (avoids leak on every repaint)
     self.palette_brush = w32.CreateSolidBrush(w32.RGB(30, 30, 30));
 
     // Set placeholder text via EM_SETCUEBANNER
-    const placeholder = std.unicode.utf8ToUtf16LeStringLiteral("Type a command...");
-    _ = w32.SendMessageW(edit, 0x1501, 1, @bitCast(@intFromPtr(placeholder))); // EM_SETCUEBANNER
+    const placeholder = lang.wide("Type a command...");
+    _ = w32.SendMessageW(edit, 0x1501, 1, @bitCast(@intFromPtr(placeholder.ptr))); // EM_SETCUEBANNER
 
     // Store surface pointer for message routing
     _ = w32.SetWindowLongPtrW(popup, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
@@ -1810,18 +1922,26 @@ fn positionCommandPalette(self: *Surface) void {
 /// Filter palette entries by a case-insensitive substring match.
 fn filterPaletteEntries(self: *Surface, filter: []const u8) void {
     var count: u16 = 0;
+    const ja = lang.isJapanese();
     for (palette_entries, 0..) |entry, i| {
-        if (filter.len == 0 or std.ascii.findIgnoreCase(entry.name, filter) != null) {
+        if (filter.len == 0 or std.ascii.findIgnoreCase(entry.name, filter) != null or
+            (ja and std.mem.indexOf(u8, entry.name_ja, filter) != null))
+        {
             self.palette_filtered[count] = @intCast(i);
             count += 1;
         }
     }
     // User-configured command-palette-entry commands, appended after the
     // built-in entries.
-    const user = self.app.config.@"command-palette-entry".value.items;
-    const user_len = @min(user.len, MAX_USER_PALETTE_ENTRIES);
+    const commands = &self.app.config.@"command-palette-entry";
+    const user = commands.value.items;
+    const user_len = @min(user.len, commands.builtin_count + MAX_USER_PALETTE_ENTRIES);
     for (user[0..user_len], 0..) |entry, i| {
-        if (filter.len == 0 or std.ascii.findIgnoreCase(entry.title, filter) != null) {
+        const builtin = i < commands.builtin_count;
+        if (builtin and shared_palette[i].native) continue;
+        if (filter.len == 0 or std.ascii.findIgnoreCase(entry.title, filter) != null or
+            (builtin and ja and std.mem.indexOf(u8, shared_palette[i].ja, filter) != null))
+        {
             self.palette_filtered[count] = @intCast(palette_entries.len + i);
             count += 1;
         }
@@ -1919,22 +2039,7 @@ pub fn paintPalette(self: *Surface, hwnd: w32.HWND) void {
     // the lifetime of this popup. Rebuilt by handleDpiChange.
     const s = self.scale;
     if (self.palette_paint_font == null) {
-        self.palette_paint_font = w32.CreateFontW(
-            -@as(i32, @intFromFloat(@round(14.0 * s))),
-            0,
-            0,
-            0,
-            400,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
-        );
+        self.palette_paint_font = self.parent_window.ui_font.create(14, s);
     }
     const old_font = if (self.palette_paint_font) |f| w32.SelectObject(hdc, f) else null;
     defer {
@@ -1995,7 +2100,7 @@ pub fn paintPalette(self: *Surface, hwnd: w32.HWND) void {
         // buffer (N UTF-8 bytes ≤ N UTF-16 units) on a codepoint boundary so
         // a long title truncates instead of overflowing the stack buffer.
         var name_len = @min(entry_name.len, wname_buf.len);
-        while (name_len > 0 and entry_name[name_len - 1] & 0xC0 == 0x80) name_len -= 1;
+        while (name_len < entry_name.len and name_len > 0 and entry_name[name_len] & 0xC0 == 0x80) name_len -= 1;
         const wname_len = std.unicode.utf8ToUtf16Le(&wname_buf, entry_name[0..name_len]) catch 0;
         _ = w32.DrawTextW(hdc, @ptrCast(&wname_buf), @intCast(wname_len), &name_rect, 0);
 
@@ -2019,7 +2124,7 @@ pub fn paintPalette(self: *Surface, hwnd: w32.HWND) void {
 }
 
 /// Format a keybinding trigger as a human-readable string (e.g. "Ctrl+Shift+T").
-fn formatTrigger(trigger: input.Binding.Trigger, buf: []u8) usize {
+pub fn formatTrigger(trigger: input.Binding.Trigger, buf: *[64]u8) usize {
     var pos: usize = 0;
 
     if (trigger.mods.super) {
@@ -2049,19 +2154,19 @@ fn formatTrigger(trigger: input.Binding.Trigger, buf: []u8) usize {
             if (cp >= 'a' and cp <= 'z') {
                 buf[pos] = @intCast(cp - 32);
                 pos += 1;
-            } else if (cp >= ' ' and cp <= '~') {
-                buf[pos] = @intCast(cp);
-                pos += 1;
+            } else if (cp >= ' ' and cp != 0x7f) {
+                pos += std.unicode.utf8Encode(cp, buf[pos..]) catch return 0;
+            } else {
+                return 0;
             }
         },
         .physical => |k| {
             const name = keyName(k);
-            if (name.len > 0 and pos + name.len <= buf.len) {
-                @memcpy(buf[pos..][0..name.len], name);
-                pos += name.len;
-            }
+            if (name.len == 0 or pos + name.len > buf.len) return 0;
+            @memcpy(buf[pos..][0..name.len], name);
+            pos += name.len;
         },
-        .catch_all => {},
+        .catch_all => return 0,
     }
 
     return pos;
@@ -2208,7 +2313,7 @@ pub fn handleResize(self: *Surface, width: u32, height: u32) void {
     // renderer has presented one frame at the new size. This prevents
     // the DWM from stretching stale framebuffer content to fill the
     // new window area, which causes visible flicker.
-    if (self.in_live_resize) {
+    if (self.in_live_resize and build_config.renderer != .vulkan) {
         if (self.frame_event) |event| {
             // Reset the event before waking the renderer, so we
             // wait for a NEW frame, not a previously drawn one.
@@ -2230,76 +2335,59 @@ pub fn handleResize(self: *Surface, width: u32, height: u32) void {
     }
 }
 
+/// Replace fonts in already-created popups, including hidden popups that
+/// will be reused next time. Controls must release the old HFONT first.
+pub fn refreshUiFonts(self: *Surface) void {
+    if (self.search_edit != null)
+        self.parent_window.ui_font.replace(&self.search_font, 16, self.scale, &.{ self.search_edit, self.search_count_label });
+    if (self.link_preview_hwnd) |preview| {
+        self.parent_window.ui_font.replace(&self.link_font, 13, self.scale, &.{self.link_preview_hwnd});
+        if (self.hwnd) |hwnd| if (w32.IsWindowVisible_(preview) != 0) {
+            var text: [512]u16 = undefined;
+            const count = w32.GetWindowTextW(preview, &text, text.len);
+            if (count > 0) self.positionLinkPreview(hwnd, preview, text[0..@intCast(count)]);
+        };
+    }
+    if (self.palette_edit != null)
+        self.parent_window.ui_font.replace(&self.palette_font, 16, self.scale, &.{self.palette_edit});
+    if (self.palette_hwnd) |popup| {
+        self.parent_window.ui_font.replace(&self.palette_paint_font, 14, self.scale, &.{});
+        _ = w32.InvalidateRect(popup, null, 0);
+    }
+}
+
 /// Handle WM_DPICHANGED.
 pub fn handleDpiChange(self: *Surface) void {
-    self.updateDpiScale();
+    const hwnd = self.hwnd orelse return;
+    // SetParent can dispatch messages before a tab transfer is committed.
+    // Wait for the Window to update its ownership before touching core.
+    if (self.core_surface_ready and w32.GetParent(hwnd) != self.parent_window.hwnd) return;
+    const dpi = w32.GetDpiForWindow(hwnd);
+    if (dpi != 0) self.applyDpiScale(@as(f32, @floatFromInt(dpi)) / 96.0);
+}
 
-    // Popup fonts were created at the previous DPI. Rebuild them at
-    // the new scale so search-bar / palette text doesn't render
-    // tiny/huge after dragging the window between monitors.
-    const s = self.scale;
-    if (self.search_font) |old| {
-        _ = w32.DeleteObject(old);
-        self.search_font = null;
-    }
-    if (self.palette_font) |old| {
-        _ = w32.DeleteObject(old);
-        self.palette_font = null;
-    }
-    if (self.palette_paint_font) |old| {
-        _ = w32.DeleteObject(old);
-        self.palette_paint_font = null;
-    }
-    if (self.search_edit) |edit| {
-        self.search_font = w32.CreateFontW(
-            -@as(i32, @intFromFloat(@round(16.0 * s))),
-            0,
-            0,
-            0,
-            400,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
-        );
-        if (self.search_font) |f| {
-            _ = w32.SendMessageW(edit, w32.WM_SETFONT, @intFromPtr(f), 1);
-            // The count label shares the search font; re-send it too or the
-            // label keeps a handle to the just-deleted HFONT.
-            if (self.search_count_label) |label| {
-                _ = w32.SendMessageW(label, w32.WM_SETFONT, @intFromPtr(f), 1);
-            }
-        }
-    }
-    if (self.palette_edit) |edit| {
-        self.palette_font = w32.CreateFontW(
-            -@as(i32, @intFromFloat(@round(16.0 * s))),
-            0,
-            0,
-            0,
-            400,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
-        );
-        if (self.palette_font) |f| {
-            _ = w32.SendMessageW(edit, w32.WM_SETFONT, @intFromPtr(f), 1);
-        }
-    }
+/// Update this pane's native chrome and terminal at its owner's DPI.
+pub fn applyDpiScale(self: *Surface, scale: f32) void {
+    if (self.scale == scale) return;
+    self.scale = scale;
+
+    self.refreshUiFonts();
+    if (self.search_active) self.positionSearchBar();
+    if (self.palette_active) self.positionCommandPalette();
 
     // Notify the scrollbar of the new DPI.
     if (self.scrollbar) |sb| sb.onDpiChanged(@intFromFloat(self.scale * 96.0));
+
+    if (self.core_surface_ready) {
+        self.core_surface.contentScaleCallback(.{ .x = scale, .y = scale }) catch |err|
+            log.err("failed to update surface DPI: {}", .{err});
+    }
+}
+
+test "win32 tab detach can set destination DPI before core initialization" {
+    var surface: Surface = .{ .app = undefined };
+    surface.applyDpiScale(1.5);
+    try std.testing.expectEqual(apprt.ContentScale{ .x = 1.5, .y = 1.5 }, try surface.getContentScale());
 }
 
 /// Handle WM_KEYDOWN / WM_SYSKEYDOWN / WM_KEYUP / WM_SYSKEYUP.
@@ -2617,15 +2705,15 @@ fn showContextMenu(self: *Surface, lparam: isize) void {
     defer _ = w32.DestroyMenu(menu);
 
     const has_sel = self.core_surface.hasSelection();
-    _ = w32.AppendMenuW(menu, if (has_sel) w32.MF_STRING else w32.MF_GRAYED, CTX_COPY, std.unicode.utf8ToUtf16LeStringLiteral("Copy"));
-    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_PASTE, std.unicode.utf8ToUtf16LeStringLiteral("Paste"));
+    _ = w32.AppendMenuW(menu, if (has_sel) w32.MF_STRING else w32.MF_GRAYED, CTX_COPY, lang.wide("Copy"));
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_PASTE, lang.wide("Paste"));
     _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
-    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_SELECT_ALL, std.unicode.utf8ToUtf16LeStringLiteral("Select All"));
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_SELECT_ALL, lang.wide("Select All"));
     _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
-    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_SPLIT_RIGHT, std.unicode.utf8ToUtf16LeStringLiteral("Split Right"));
-    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_SPLIT_DOWN, std.unicode.utf8ToUtf16LeStringLiteral("Split Down"));
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_SPLIT_RIGHT, lang.wide("Split Right"));
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_SPLIT_DOWN, lang.wide("Split Down"));
     _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
-    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_RESET, std.unicode.utf8ToUtf16LeStringLiteral("Reset Terminal"));
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_RESET, lang.wide("Reset Terminal"));
 
     var pt = w32.POINT{
         .x = @intCast(@as(i16, @truncate(@as(isize, lparam & 0xFFFF)))),
@@ -3129,6 +3217,18 @@ fn writeWin32InputSequence(
         seq,
     ) catch return;
     self.core_surface.io.queueMessage(msg, .unlocked);
+    if (kd != 0 and self.core_surface_ready and !mapVirtualKey(vk, cs & 0x100 != 0).modifier() and
+        self.core_surface.config.scroll_to_bottom.keystroke)
+    {
+        const surface = &self.core_surface;
+        surface.renderer_state.mutex.lockUncancelable(global.io());
+        const at_bottom = surface.io.terminal.screens.active.viewportIsBottom();
+        if (!at_bottom) surface.io.terminal.scrollViewport(.bottom);
+        surface.renderer_state.mutex.unlock(global.io());
+        if (!at_bottom) surface.renderer_thread.wakeup.notify() catch |err| {
+            log.warn("could not redraw after scrolling to input: {}", .{err});
+        };
+    }
 }
 
 test "Win32 Input Mode preserves translated text without replaying physical keys" {
@@ -3320,6 +3420,31 @@ pub fn signalFrameDrawn(self: *Surface) void {
     if (self.frame_event) |event| {
         _ = w32.SetEvent(event);
     }
+}
+
+/// Vulkan WSI calls can send synchronous messages to the HWND owner.
+/// The render worker prepares cells, while the window thread presents them.
+pub fn requestVulkanDraw(self: *Surface) void {
+    const hwnd = self.hwnd orelse return;
+    if (self.vulkan_draw_queued.swap(true, .acq_rel)) return;
+    if (w32.PostMessageW(hwnd, wm_vulkan_draw, 0, 0) == 0) {
+        self.vulkan_draw_queued.store(false, .release);
+    }
+}
+
+pub fn handleVulkanDraw(self: *Surface) void {
+    self.vulkan_draw_queued.store(false, .release);
+    if (!self.core_surface_ready or w32.IsWindowVisible_(self.hwnd orelse return) == 0) return;
+    const renderer = &self.core_surface.renderer;
+    const shaders_active = renderer.has_custom_shaders.load(.monotonic);
+    defer if (shaders_active != renderer.has_custom_shaders.load(.monotonic)) {
+        // Pipeline creation happens on the window thread. Recheck the shader
+        // animation timer on the worker when shaders become active or inactive.
+        self.core_surface.renderer_thread.wakeup.notify() catch {};
+    };
+    renderer.drawFrame(false) catch |err| {
+        log.warn("Vulkan frame draw failed: {t}", .{err});
+    };
 }
 
 /// Handle WM_SETFOCUS / WM_KILLFOCUS.
@@ -3730,6 +3855,25 @@ test "read-only blocks native keyboard character and IME input" {
     core_surface.renderer_state.mutex = &mutex;
     core_surface.io.mailbox = try termio.Mailbox.initSPSC(testing.allocator);
     defer core_surface.io.mailbox.deinit(testing.allocator);
+
+    core_surface.config.scroll_to_bottom = .default;
+    core_surface.renderer_thread.wakeup = try .init();
+    defer core_surface.renderer_thread.wakeup.deinit();
+
+    // A modifier and its release leave scrollback alone. An IME commit or
+    // ordinary key should follow the current scroll-to-bottom setting.
+    core_surface.readonly = false;
+    for (0..5) |_| try core_surface.io.terminal.index();
+    for ([_]bool{ false, true }) |enabled| {
+        core_surface.config.scroll_to_bottom.keystroke = enabled;
+        core_surface.io.terminal.scrollViewport(.top);
+        surface.writeWin32InputSequence(w32.VK_SHIFT, 0, 0, 1, 0, 1);
+        surface.writeWin32InputSequence(0, 0, 'x', 0, 0, 1);
+        try testing.expect(!core_surface.io.terminal.screens.active.viewportIsBottom());
+        surface.sendWin32CharEvent('日');
+        try testing.expectEqual(enabled, core_surface.io.terminal.screens.active.viewportIsBottom());
+        while (core_surface.io.mailbox.spsc.queue.pop(global.io())) |packet| packet.deinit();
+    }
 
     // Only this thread's keyboard state changes. The real native emitters
     // run without an HWND, renderer, child process, or global input.

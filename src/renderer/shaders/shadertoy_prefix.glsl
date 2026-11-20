@@ -1,6 +1,9 @@
-#version 430 core
-
-layout(binding = 1, std140) uniform Globals {
+#ifdef GHOSTTY_VULKAN_POSTPROCESS
+layout(set = 0, binding = 0, std140)
+#else
+layout(binding = 1, std140)
+#endif
+uniform Globals {
     uniform vec3  iResolution;
     uniform float iTime;
     uniform float iTimeDelta;
@@ -36,16 +39,24 @@ layout(binding = 1, std140) uniform Globals {
 #define CURSORSTYLE_UNDERLINE    3
 #define CURSORSTYLE_LOCK         4
 
+#ifdef GHOSTTY_VULKAN_POSTPROCESS
+layout(set = 0, binding = 1) uniform sampler2D iChannel0;
+#else
 layout(binding = 0) uniform sampler2D iChannel0;
+#endif
 
 // These are unused currently by Ghostty:
 // layout(binding = 1) uniform sampler2D iChannel1;
 // layout(binding = 2) uniform sampler2D iChannel2;
 // layout(binding = 3) uniform sampler2D iChannel3;
 
+#ifndef GHOSTTY_NATIVE_FRAG_COORD
 layout(location = 0) in vec4 gl_FragCoord;
+#endif
 layout(location = 0) out vec4 _fragColor;
 
+#undef GHOSTTY_VULKAN_POSTPROCESS
+#undef GHOSTTY_NATIVE_FRAG_COORD
 #define texture2D texture
 
 void mainImage( out vec4 fragColor, in vec2 fragCoord );

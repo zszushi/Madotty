@@ -66,6 +66,8 @@ enums:
   kitty_placement_tag:
     0: internal
     1: external
+    128: internal_pixels
+    129: external_pixels
   kitty_location:
     0: pin
     1: virtual
@@ -428,13 +430,13 @@ types:
       Each named instance exposes one bit from the little-endian integer.
       Arithmetic division is used instead of bitwise operations because the
       JavaScript target implements those operations with signed 32-bit values.
-      All values remain exact because the registry occupies only 44 bits,
+      All values remain exact because the registry occupies only 46 bits,
       within JavaScript's 53-bit safe integer range.
     seq:
       - id: raw
         type: u8
         valid:
-          max: 17592186044415
+          max: 70368744177663
     instances:
       disable_keyboard:
         value: (raw / 1) % 2 != 0
@@ -524,6 +526,10 @@ types:
         value: (raw / 4398046511104) % 2 != 0
       win32_input:
         value: (raw / 8796093022208) % 2 != 0
+      sixel_display_mode:
+        value: (raw / 17592186044416) % 2 != 0
+      sixel_cursor_right:
+        value: (raw / 35184372088832) % 2 != 0
 
   tab_stops:
     params:
@@ -1087,15 +1093,23 @@ types:
         value: hi / 65536
 
   grapheme_entry:
+    doc: |
+      Row 0xffff marks optional horizontal OSC 66 metadata rather than a
+      grapheme. In that entry, col is the actual grid row. Each payload word
+      has tag 0x66a in bits 20–31, a padding flag in bit 19, a span width in
+      bits 16–18, and the start column in bits 0–15. A padding marker has
+      width zero and extends to the end of the wrapped row. The base grid
+      stores sized cells as narrow cells for older readers, which skip the
+      optional entry because its row is outside the grid.
     seq:
       - id: row
         type: u2
         valid:
-          expr: _ < num_rows
+          expr: _ < num_rows or _ == 0xffff
       - id: col
         type: u2
         valid:
-          expr: _ < columns
+          expr: (row == 0xffff and _ < num_rows) or (row != 0xffff and _ < columns)
       - id: num_codepoints
         type: u2
         valid:
@@ -1105,7 +1119,7 @@ types:
         repeat: expr
         repeat-expr: num_codepoints
         valid:
-          expr: _ <= 0x10ffff and not (_ >= 0xd800 and _ <= 0xdfff)
+          expr: (row == 0xffff and _ / 1048576 == 0x66a) or (row != 0xffff and _ <= 0x10ffff and not (_ >= 0xd800 and _ <= 0xdfff))
     params:
       - id: num_rows
         type: u2
@@ -1224,6 +1238,7 @@ types:
         type: u8
 
   kitty_placement:
+    doc: For pixel placement tags, columns and rows encode physical width and height.
     params:
       - id: in_storage
         type: bool

@@ -41,6 +41,19 @@ pub fn build(b: *std.Build) !void {
         file_version orelse app_zon_version,
         lib_version,
     );
+    const vulkan_smoke = b.option(
+        bool,
+        "windows-vulkan-smoke",
+        "Enable the Win32 Vulkan presentation test build",
+    ) orelse false;
+    if (vulkan_smoke) {
+        if (config.target.result.os.tag != .windows) {
+            const step = b.step("vulkan-smoke", "Build the Win32 Vulkan presentation test");
+            step.dependOn(&b.addFail("Vulkan presentation test requires a Windows target").step);
+        } else {
+            try @import("src/build/Vulkan.zig").addSmoke(b, &config);
+        }
+    }
     const test_filters = b.option(
         [][]const u8,
         "test-filter",
@@ -212,6 +225,8 @@ pub fn build(b: *std.Build) !void {
     if (config.app_runtime != .none) {
         if (config.emit_exe) {
             exe.install();
+            if (config.emit_windows_d3d12) try buildpkg.GhosttyExe.installWindowsRenderer(b, &deps, .d3d12);
+            if (config.emit_windows_vulkan) try buildpkg.GhosttyExe.installWindowsRenderer(b, &deps, .vulkan);
             resources.install();
             if (i18n) |v| v.install();
         }

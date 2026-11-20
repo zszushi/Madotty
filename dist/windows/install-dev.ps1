@@ -14,10 +14,42 @@ if ($InstallRoot.StartsWith('\\')) {
 }
 
 $requiredFiles = @(
-    'bin\ghostty.exe', 'bin\conpty.dll', 'bin\OpenConsole.exe',
+    'bin\ghostty.exe', 'bin\ghostty.com', 'bin\conpty.dll', 'bin\OpenConsole.exe',
     'share\terminfo\ghostty.terminfo', 'share\licenses\conpty\LICENSE.txt'
 )
+foreach ($relativePath in @('bin\ghostty-d3d12.exe', 'bin\ghostty-vulkan.exe', 'bin\Madotty.TerminalHandoffProxy.dll')) {
+    $optional = Get-Item -LiteralPath (Join-Path $BuildDir $relativePath) -Force -ErrorAction SilentlyContinue
+    if (-not $optional) { continue }
+    if ($optional.PSIsContainer -or $optional.Length -eq 0 -or
+        ($optional.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw "Expected a regular, nonempty file at $($optional.FullName)"
+    }
+    $requiredFiles += $relativePath
+}
+$compilerFiles = @('bin\dxcompiler.dll', 'bin\dxil.dll')
+foreach ($relativePath in $compilerFiles) {
+    if (Test-Path -LiteralPath (Join-Path $BuildDir $relativePath)) {
+        $requiredFiles += $compilerFiles
+        break
+    }
+}
 $resourceDirs = @('share\ghostty\themes', 'share\ghostty\shell-integration')
+$settingsDir = 'bin\settings'
+$settingsPath = Join-Path $BuildDir $settingsDir
+if (Test-Path -LiteralPath $settingsPath) {
+    $settings = Get-Item -LiteralPath $settingsPath -Force
+    if (-not $settings.PSIsContainer -or ($settings.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw "Expected a regular settings directory at $settingsPath"
+    }
+    foreach ($file in @('Madotty.Settings.exe', 'Madotty.Settings.dll', 'Madotty.Settings.deps.json',
+            'Madotty.Settings.runtimeconfig.json', 'coreclr.dll', 'Microsoft.UI.Xaml.dll', 'resources.pri')) {
+        $relativePath = Join-Path $settingsDir $file
+        if (-not (Test-Path -LiteralPath (Join-Path $BuildDir $relativePath) -PathType Leaf)) {
+            throw "Incomplete settings publication: missing $relativePath"
+        }
+    }
+    $resourceDirs += $settingsDir
+}
 foreach ($relativePath in $requiredFiles) {
     if (-not (Test-Path -LiteralPath (Join-Path $BuildDir $relativePath) -PathType Leaf)) {
         throw "Incomplete build: missing $relativePath"

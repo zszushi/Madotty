@@ -335,19 +335,103 @@ const WindowsPty = struct {
 
     out_pipe: windows.HANDLE,
     in_pipe: windows.HANDLE,
-    out_pipe_pty: windows.HANDLE,
-    in_pipe_pty: windows.HANDLE,
+    out_pipe_pty: ?windows.HANDLE,
+    in_pipe_pty: ?windows.HANDLE,
     pseudo_console: windows.HPCON,
     conpty: Conpty,
     size: winsize,
 
     pub const OpenError = Conpty.Error;
+    pub const HandoffHandles = Conpty.HandoffHandles;
+    pub const ConsolePipes = struct {
+        input: windows.HANDLE,
+        output: windows.HANDLE,
+    };
+
+    const Pipes = struct {
+        read: windows.HANDLE,
+        write: windows.HANDLE,
+        console: ConsolePipes,
+
+        fn deinit(self: Pipes) void {
+            _ = windows.exp.kernel32.CloseHandle(self.console.input);
+            _ = windows.exp.kernel32.CloseHandle(self.console.output);
+            _ = windows.exp.kernel32.CloseHandle(self.write);
+            _ = windows.exp.kernel32.CloseHandle(self.read);
+        }
+    };
 
     /// Open a new PTY with the given initial size.
     pub fn open(size: winsize) OpenError!Pty {
-        var pty: Pty = undefined;
-        pty.conpty = try .init();
-        errdefer pty.conpty.deinit();
+        var conpty: Conpty = try .init();
+        errdefer conpty.deinit();
+        const pipes = try openPipes();
+        errdefer pipes.deinit();
+
+        // ConPTY uses the active codepage at creation time for translating
+        // between VT (UTF-8) I/O and the Win32 console.
+        _ = windows.exp.kernel32.SetConsoleCP(65001);
+        _ = windows.exp.kernel32.SetConsoleOutputCP(65001);
+
+        var pseudo_console: windows.HPCON = undefined;
+        const result = conpty.create(
+            .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
+            pipes.console.input,
+            pipes.console.output,
+            0,
+            &pseudo_console,
+        );
+        if (result != windows.S_OK) {
+            log.err("pseudoconsole creation failed hresult=0x{x}", .{@as(u32, @bitCast(result))});
+            return error.Unexpected;
+        }
+        return fromPipes(size, conpty, pipes, pseudo_console);
+    }
+
+    /// Prepare local I/O for an existing console. The handoff caller keeps
+    /// ownership of all three input handles. `size` is remembered without
+    /// signalling the remote console before it accepts the pipe endpoints.
+    pub fn adopt(size: winsize, handles: HandoffHandles) OpenError!Pty {
+        var conpty: Conpty = try .init();
+        errdefer conpty.deinit();
+        const pipes = try openPipes();
+        errdefer pipes.deinit();
+        const pseudo_console = try conpty.packHandoff(handles);
+        return fromPipes(size, conpty, pipes, pseudo_console);
+    }
+
+    fn fromPipes(size: winsize, conpty: Conpty, pipes: Pipes, pseudo_console: windows.HPCON) Pty {
+        return .{
+            .out_pipe = pipes.read,
+            .in_pipe = pipes.write,
+            .out_pipe_pty = pipes.console.output,
+            .in_pipe_pty = pipes.console.input,
+            .pseudo_console = pseudo_console,
+            .conpty = conpty,
+            .size = size,
+        };
+    }
+
+    /// Move the console-side reader and writer out of this PTY once. The
+    /// caller must return them to the console delegate, or close them.
+    pub fn takeConsolePipes(self: *Pty) ConsolePipes {
+        const result: ConsolePipes = .{
+            .input = self.in_pipe_pty.?,
+            .output = self.out_pipe_pty.?,
+        };
+        self.in_pipe_pty = null;
+        self.out_pipe_pty = null;
+        return result;
+    }
+
+    /// Call after a handoff succeeds so the original console client can
+    /// end the session by detaching, even if its process stays alive.
+    pub fn releaseConsoleReference(self: *Pty) OpenError!void {
+        try self.conpty.releaseReference(self.pseudo_console);
+    }
+
+    fn openPipes() OpenError!Pipes {
+        var pipes: Pipes = undefined;
 
         var pipe_path_buf: [128]u8 = undefined;
         var pipe_path_buf_w: [128]u16 = undefined;
@@ -374,7 +458,8 @@ const WindowsPty = struct {
             .lpSecurityDescriptor = null,
         };
 
-        pty.in_pipe = windows.exp.kernel32.CreateNamedPipeW(
+        // libxev writes with IOCP, so the terminal's write end is overlapped.
+        pipes.write = windows.exp.kernel32.CreateNamedPipeW(
             pipe_path_w.ptr,
             windows.PIPE_ACCESS_OUTBOUND |
                 windows.FILE_FLAG_FIRST_PIPE_INSTANCE |
@@ -386,13 +471,13 @@ const WindowsPty = struct {
             0,
             &security_attributes,
         );
-        if (pty.in_pipe == windows.INVALID_HANDLE_VALUE) {
+        if (pipes.write == windows.INVALID_HANDLE_VALUE) {
             return windows.unexpectedError(windows.GetLastError());
         }
-        errdefer _ = windows.exp.kernel32.CloseHandle(pty.in_pipe);
+        errdefer _ = windows.exp.kernel32.CloseHandle(pipes.write);
 
         var security_attributes_read = security_attributes;
-        pty.in_pipe_pty = windows.exp.kernel32.CreateFileW(
+        pipes.console.input = windows.exp.kernel32.CreateFileW(
             pipe_path_w.ptr,
             windows.GENERIC_READ,
             0,
@@ -401,32 +486,19 @@ const WindowsPty = struct {
             windows.FILE_ATTRIBUTE_NORMAL,
             null,
         );
-        if (pty.in_pipe_pty == windows.INVALID_HANDLE_VALUE) {
+        if (pipes.console.input == windows.INVALID_HANDLE_VALUE) {
             return windows.unexpectedError(windows.GetLastError());
         }
-        errdefer _ = windows.exp.kernel32.CloseHandle(pty.in_pipe_pty);
+        errdefer _ = windows.exp.kernel32.CloseHandle(pipes.console.input);
 
-        // The in_pipe needs to be created as a named pipe, since anonymous
-        // pipes created with CreatePipe do not support overlapped operations,
-        // and the IOCP backend of libxev only uses overlapped operations on files.
-        //
-        // It would be ideal to use CreatePipe here, so that our pipe isn't
-        // visible to any other processes.
-
-        // if (windows.exp.kernel32.CreatePipe(&pty.in_pipe_pty, &pty.in_pipe, null, 0) == 0) {
-        //     return windows.unexpectedError(windows.kernel32.GetLastError());
-        // }
-        // errdefer {
-        //     _ = windows.CloseHandle(pty.in_pipe_pty);
-        //     _ = windows.CloseHandle(pty.in_pipe);
-        // }
-
-        if (windows.exp.kernel32.CreatePipe(&pty.out_pipe, &pty.out_pipe_pty, null, 0) == windows.FALSE) {
+        // Buffer bursts from ConPTY while the read thread parses the last
+        // chunk. ReadFile still returns as soon as output is available.
+        if (windows.exp.kernel32.CreatePipe(&pipes.read, &pipes.console.output, null, 128 * 1024) == windows.FALSE) {
             return windows.unexpectedError(windows.GetLastError());
         }
         errdefer {
-            _ = windows.exp.kernel32.CloseHandle(pty.out_pipe);
-            _ = windows.exp.kernel32.CloseHandle(pty.out_pipe_pty);
+            _ = windows.exp.kernel32.CloseHandle(pipes.read);
+            _ = windows.exp.kernel32.CloseHandle(pipes.console.output);
         }
 
         const SetHandleInformation = struct {
@@ -441,37 +513,17 @@ const WindowsPty = struct {
             }
         };
 
-        try SetHandleInformation.f(pty.in_pipe);
-        try SetHandleInformation.f(pty.in_pipe_pty);
-        try SetHandleInformation.f(pty.out_pipe);
-        try SetHandleInformation.f(pty.out_pipe_pty);
-
-        // Set the console codepage to UTF-8 before creating the pseudo
-        // console. ConPTY uses the active codepage at creation time for
-        // translating between VT (UTF-8) I/O and the Win32 console.
-        _ = windows.exp.kernel32.SetConsoleCP(65001);
-        _ = windows.exp.kernel32.SetConsoleOutputCP(65001);
-
-        const result = pty.conpty.create(
-            .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
-            pty.in_pipe_pty,
-            pty.out_pipe_pty,
-            0,
-            &pty.pseudo_console,
-        );
-        if (result != windows.S_OK) {
-            log.err("pseudoconsole creation failed hresult=0x{x}", .{@as(u32, @bitCast(result))});
-            return error.Unexpected;
-        }
-
-        pty.size = size;
-        return pty;
+        try SetHandleInformation.f(pipes.write);
+        try SetHandleInformation.f(pipes.console.input);
+        try SetHandleInformation.f(pipes.read);
+        try SetHandleInformation.f(pipes.console.output);
+        return pipes;
     }
 
     pub fn deinit(self: *Pty) void {
-        _ = windows.exp.kernel32.CloseHandle(self.in_pipe_pty);
+        if (self.in_pipe_pty) |handle| _ = windows.exp.kernel32.CloseHandle(handle);
         _ = windows.exp.kernel32.CloseHandle(self.in_pipe);
-        _ = windows.exp.kernel32.CloseHandle(self.out_pipe_pty);
+        if (self.out_pipe_pty) |handle| _ = windows.exp.kernel32.CloseHandle(handle);
         _ = windows.exp.kernel32.CloseHandle(self.out_pipe);
         self.conpty.close(self.pseudo_console);
         self.conpty.deinit();

@@ -17,12 +17,13 @@ pub fn isLocal(hostname: []const u8) LocalHostnameValidationError!bool {
     // If hostname is not "localhost" it must match our hostname.
     switch (builtin.target.os.tag) {
         .windows => {
+            if (std.ascii.eqlIgnoreCase("localhost", hostname)) return true;
             const windows = @import("windows.zig");
             var buf: [256:0]u8 = undefined;
             var nSize: windows.DWORD = buf.len;
             if (windows.exp.kernel32.GetComputerNameA(&buf, &nSize) == windows.FALSE) return false;
             const ourHostname = buf[0..nSize];
-            return std.mem.eql(u8, hostname, ourHostname);
+            return std.ascii.eqlIgnoreCase(hostname, ourHostname);
         },
         else => {
             var buf: [posix.HOST_NAME_MAX]u8 = undefined;
@@ -46,6 +47,8 @@ test "isLocal returns true when hostname is local" {
                 return error.GetComputerNameFailed;
             const localHostname = buf[0..nSize];
             try std.testing.expect(try isLocal(localHostname));
+            var lower: [256]u8 = undefined;
+            try std.testing.expect(try isLocal(std.ascii.lowerString(&lower, localHostname)));
         },
         else => {
             var buf: [posix.HOST_NAME_MAX]u8 = undefined;

@@ -7,10 +7,11 @@
 //!
 //! We use two textures:
 //!
-//!   - `texture`: `GL_SRGB8_ALPHA8`. We render to this. With
+//!   - `texture`: `GL_SRGB8_ALPHA8` for linear rendering. With
 //!     `GL_FRAMEBUFFER_SRGB` enabled, the GPU automatically converts linear
 //!     shader output to sRGB on write. This is required for the
-//!     linear-blending color pipeline to produce correct output.
+//!     linear-blending color pipeline to produce correct output. WGL uses
+//!     `GL_RGBA8` for native blending, whose shaders already emit sRGB values.
 //!
 //!   - `export_texture`: `GL_RGBA8`. This is the texture we actually export
 //!     as a dma-buf. Mesa cannot export `GL_SRGB8_ALPHA8` textures to
@@ -33,6 +34,7 @@ pub const Options = struct {
     width: usize,
     /// Desired height
     height: usize,
+    srgb: bool = true,
 };
 
 /// The framebuffer we render to.
@@ -64,7 +66,7 @@ pub fn init(opts: Options) !Self {
         try bound_tex.parameter(.wrap_t, .clamp_to_edge);
         try bound_tex.image2D(
             0,
-            .srgba,
+            if (opts.srgb) .srgba else .rgba,
             @intCast(opts.width),
             @intCast(opts.height),
             .rgba,

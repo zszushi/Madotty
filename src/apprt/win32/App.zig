@@ -3,6 +3,7 @@
 const App = @This();
 
 const std = @import("std");
+const lang = @import("UiLanguage.zig");
 const Allocator = std.mem.Allocator;
 const apprt = @import("../../apprt.zig");
 const configpkg = @import("../../config.zig");
@@ -16,6 +17,15 @@ const QuickTerminal = @import("QuickTerminal.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const TabOverview = @import("TabOverview.zig");
+const Icons = @import("Icons.zig");
+const Settings = @import("Settings.zig");
+const Profiles = @import("Profiles.zig");
+const Progress = @import("Progress.zig");
+const RendererStartup = @import("RendererStartup.zig");
+const TerminalHandoff = @import("TerminalHandoff.zig");
+const Pty = @import("../../pty.zig").Pty;
+const Exec = @import("../../termio/Exec.zig");
+const cli = @import("../../cli.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const w32 = @import("win32.zig");
 const UntrustedUrl = @import("UntrustedUrl.zig");
@@ -38,6 +48,7 @@ const input = @import("../../input.zig");
 const GlobalHotkey = struct { id: i32, action: input.Binding.Action };
 
 const log = std.log.scoped(.win32);
+extern "user32" fn RegisterWindowMessageW([*:0]const u16) callconv(.winapi) u32;
 
 /// OpenGL draws happen on the renderer thread, not the app thread.
 pub const must_draw_from_app_thread = false;
@@ -50,8 +61,12 @@ const WM_APP_WAKEUP: u32 = w32.WM_APP + 1;
 /// messages whose handlers take that lock, so the URL is opened later.
 const WM_APP_OPEN_URL: u32 = w32.WM_APP + 4;
 
+/// Recheck light/dark outside the system's synchronous settings broadcast.
+const WM_APP_COLOR_SCHEME: u32 = w32.WM_APP + 9;
+
 /// Timer ID for the quit-after-last-window-closed delay.
 const QUIT_TIMER_ID: usize = 1;
+const console_server_idle_ms = 30_000;
 
 /// Window class for the top-level container (GDI painting, no CS_OWNDC).
 pub const WINDOW_CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyWindow");
@@ -68,10 +83,15 @@ core_app: *CoreApp,
 /// The configuration for the application. Loaded during init and
 /// updated in response to config_change actions.
 config: Config,
+renderer_startup: RendererStartup.Status = .{},
+cli_command: bool = false,
+console_server: bool = false,
+received_console: bool = false,
 
 /// A message-only window used to receive WM_APP_WAKEUP.
 /// This is not a visible window; it just participates in the message loop.
 msg_hwnd: ?w32.HWND = null,
+color_scheme_pending: bool = false,
 
 /// The HINSTANCE for this module.
 hinstance: w32.HINSTANCE,
@@ -89,6 +109,12 @@ windows: std.ArrayList(*Window) = .empty,
 /// Used by WM_ERASEBKGND to fill exposed areas during resize,
 /// matching the terminal background so the flash is invisible.
 bg_brush: ?w32.HBRUSH = null,
+
+tab_icon_renderer: ?usize = null,
+tab_text: @import("TabText.zig") = .{},
+shell_icons: Profiles.ShellIcons = .{},
+
+settings_session: ?Settings.Session = null,
 
 /// Quit timer state, mirroring GTK's three-state approach:
 /// - off: no quit pending
@@ -110,6 +136,7 @@ global_hotkeys: std.ArrayList(GlobalHotkey) = .empty,
 /// Cached ITaskbarList3 for taskbar-button progress (OSC 9;4), created lazily
 /// on first progress_report. Null until then / if COM creation fails.
 taskbar: ?*w32.ITaskbarList3 = null,
+taskbar_created_message: u32 = 0,
 
 /// Core surface id of the surface that produced the current desktop
 /// notification balloon; a balloon click focuses it. 0 = app-targeted.
@@ -131,6 +158,12 @@ pub fn init(
 
     // Load the configuration for this application.
     const alloc = core_app.alloc;
+    const console_server = try cli.args.isConsoleEmbedding(alloc, global.args());
+    const cli_command = if (console_server) false else cli_command: {
+        var args = try cli.args.argsIterator(alloc, global.args());
+        defer args.deinit();
+        break :cli_command hasCliCommand(&args);
+    };
     var config = Config.load(alloc) catch |err| err: {
         log.err("failed to load config: {}", .{err});
         var def: Config = try .default(alloc);
@@ -143,6 +176,25 @@ pub fn init(
     };
     errdefer config.deinit();
 
+    // Apply the conditional theme before selecting the renderer or creating a
+    // window. New core surfaces inherit this state from the core app.
+    core_app.config_conditional_state.theme = conditionalTheme(colorScheme(
+        config.@"window-theme",
+        Window.systemUsesLightTheme(),
+    ));
+    if (config.changeConditionalState(core_app.config_conditional_state) catch |err| fallback: {
+        log.warn("failed to apply the initial Windows color scheme err={}", .{err});
+        break :fallback null;
+    }) |themed| {
+        config.deinit();
+        config = themed;
+    }
+
+    // COM activates an exact executable. A renderer relaunch would let that
+    // process exit before the class it was started for has been registered.
+    var renderer_startup = try RendererStartup.select(core_app, if (console_server) .opengl else config.@"windows-renderer");
+    errdefer renderer_startup.deinit();
+
     // Create a brush matching the configured background color so that
     // any exposed window area during resize matches the terminal
     // background, making the flash invisible.
@@ -152,8 +204,12 @@ pub fn init(
     self.* = .{
         .core_app = core_app,
         .config = config,
+        .renderer_startup = renderer_startup,
+        .cli_command = cli_command,
+        .console_server = console_server,
         .hinstance = hinstance,
         .bg_brush = bg_brush,
+        .taskbar_created_message = RegisterWindowMessageW(std.unicode.utf8ToUtf16LeStringLiteral("TaskbarButtonCreated")),
     };
 
     // Register the window container class (GDI painting, no CS_OWNDC).
@@ -194,7 +250,7 @@ pub fn init(
         .cbWndExtra = 0,
         .hInstance = hinstance,
         .hIcon = app_icon,
-        .hCursor = w32.LoadCursorW(null, w32.IDC_ARROW),
+        .hCursor = w32.LoadCursorW(null, w32.IDC_IBEAM),
         .hbrBackground = null,
         .lpszMenuName = null,
         .lpszClassName = TERMINAL_CLASS_NAME,
@@ -250,25 +306,85 @@ pub fn init(
     );
     if (self.msg_hwnd == null) return error.Win32Error;
 
+    self.tab_icon_renderer = Icons.startup();
+    if (self.tab_icon_renderer == null) log.warn("failed to initialize tab icon drawing", .{});
+
     // Store self pointer in msg_hwnd's GWLP_USERDATA for msgWndProc access
     _ = w32.SetWindowLongPtrW(self.msg_hwnd.?, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
-    // Register global hotkey for quick terminal (if configured).
-    self.registerGlobalHotkey();
+    if (!console_server) {
+        self.registerGlobalHotkey();
+        self.startUpdateCheck(false);
+    }
+}
 
-    // Check for updates in the background (non-blocking).
-    self.startUpdateCheck(false);
+fn colorScheme(policy: Config.WindowTheme, system_light: bool) apprt.ColorScheme {
+    return switch (policy) {
+        .light => .light,
+        .dark => .dark,
+        .auto, .ghostty, .system => if (system_light) .light else .dark,
+    };
+}
+
+fn conditionalTheme(scheme: apprt.ColorScheme) configpkg.ConditionalState.Theme {
+    return switch (scheme) {
+        .light => .light,
+        .dark => .dark,
+    };
+}
+
+pub fn queueColorSchemeCheck(self: *App) void {
+    if (self.color_scheme_pending or self.quit_requested) return;
+    const hwnd = self.msg_hwnd orelse return;
+    self.color_scheme_pending = w32.PostMessageW(hwnd, WM_APP_COLOR_SCHEME, 0, 0) != 0;
+}
+
+fn refreshColorScheme(self: *App) void {
+    const scheme = colorScheme(self.config.@"window-theme", Window.systemUsesLightTheme());
+    if (self.core_app.config_conditional_state.theme == conditionalTheme(scheme)) return;
+    self.core_app.colorSchemeEvent(self, scheme) catch |err| {
+        log.warn("failed to update the Windows app color scheme err={}", .{err});
+    };
+    for (self.core_app.surfaces.items) |surface| {
+        surface.core().colorSchemeCallback(scheme) catch |err| {
+            log.warn("failed to update a Windows terminal color scheme err={}", .{err});
+        };
+    }
+}
+
+pub fn applyConfig(self: *App, config: *const Config) !void {
+    try self.core_app.updateConfig(self, config);
+    self.refreshColorScheme();
+}
+
+test "win32 color scheme follows Windows unless pinned by window-theme" {
+    for ([_]Config.WindowTheme{ .auto, .system, .ghostty }) |policy| {
+        try std.testing.expectEqual(apprt.ColorScheme.light, colorScheme(policy, true));
+        try std.testing.expectEqual(apprt.ColorScheme.dark, colorScheme(policy, false));
+    }
+    try std.testing.expectEqual(apprt.ColorScheme.light, colorScheme(.light, false));
+    try std.testing.expectEqual(apprt.ColorScheme.dark, colorScheme(.dark, true));
 }
 
 pub fn run(self: *App) !void {
-    // Create the initial Window container with one tab.
     const alloc = self.core_app.alloc;
-    const window = try alloc.create(Window);
-    errdefer alloc.destroy(window);
-    try window.init(self, .{});
-    try self.windows.append(alloc, window);
-    _ = try window.addTab();
+    if (self.console_server) {
+        if (!self.ensureCom()) return error.ConsoleHandoffComInitFailed;
+        var proxy = try TerminalHandoff.Proxy.register(alloc);
+        defer proxy.deinit();
+        var listener = try TerminalHandoff.register(std.heap.c_allocator, .{
+            .context = self,
+            .accept = acceptConsoleHandoff,
+        });
+        defer listener.deinit();
+        try self.runMessageLoop();
+    } else {
+        _ = try self.openWindow(.{}, .{ .context = .tab });
+        try self.runMessageLoop();
+    }
+}
 
+fn runMessageLoop(self: *App) !void {
     // Enter the Win32 message loop
     var msg: w32.MSG = undefined;
     loop: while (true) {
@@ -334,6 +450,12 @@ pub fn run(self: *App) !void {
         // Enter/Escape/Arrow keys can be handled by our code.
         if (msg.message == w32.WM_KEYDOWN and msg.hwnd != null) {
             const vk: u16 = @intCast(msg.wParam & 0xFFFF);
+            if (vk == w32.VK_ESCAPE) {
+                for (self.windows.items) |win| if (win.drag_tab >= 0) {
+                    win.cancelTabDrag();
+                    continue :loop;
+                };
+            }
 
             // Check if this edit is a tab rename edit
             if (vk == w32.VK_RETURN or vk == w32.VK_ESCAPE) {
@@ -426,8 +548,113 @@ pub fn run(self: *App) !void {
     }
 }
 
+fn openWindow(self: *App, options: Window.InitOptions, tab_options: Window.AddTabOptions) !*Surface {
+    // An idle COM receiver has no top-level window for settings broadcasts.
+    if (self.console_server and self.windows.items.len == 0) self.refreshColorScheme();
+    const alloc = self.core_app.alloc;
+    const window = try alloc.create(Window);
+    errdefer alloc.destroy(window);
+    try window.init(self, options);
+    errdefer window.deinit();
+    try self.windows.append(alloc, window);
+    errdefer if (std.mem.indexOfScalar(*Window, self.windows.items, window)) |index| {
+        _ = self.windows.orderedRemove(index);
+    };
+    return try self.addDefaultTab(window, tab_options);
+}
+
+fn hasCliCommand(args: anytype) bool {
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-e")) break;
+        if (std.mem.startsWith(u8, arg, "--command=")) return true;
+    }
+    return false;
+}
+
+test "win32 default profile leaves explicit CLI commands alone" {
+    var command = cli.args.sliceIterator(&.{ "--font-size=12", "--command=cmd.exe" });
+    try std.testing.expect(hasCliCommand(&command));
+    var child_args = cli.args.sliceIterator(&.{ "-e", "cmd.exe", "--command=child-argument" });
+    try std.testing.expect(!hasCliCommand(&child_args));
+}
+
+/// Apply the selected Windows profile only to implicit shell launches.
+pub fn addDefaultTab(self: *App, window: *Window, options: Window.AddTabOptions) !*Surface {
+    const id = self.config.@"windows-default-profile";
+    if (id.len == 0 or options.command != null or options.attachment != null or self.cli_command or
+        (self.core_app.first and self.config.@"initial-command" != null))
+        return window.addTabWithOptions(options);
+
+    var arena: std.heap.ArenaAllocator = .init(self.core_app.alloc);
+    defer arena.deinit();
+    const profile = (Profiles.resolve(arena.allocator(), id) catch |err| result: {
+        log.warn("could not resolve the default Windows profile: {t}", .{err});
+        break :result null;
+    }) orelse return window.addTabWithOptions(options);
+    const command: Config.Command = .{ .direct = profile.argv };
+    var selected = options;
+    selected.command = &command;
+    selected.profile = profile;
+    selected.working_directory = profile.directory orelse options.working_directory;
+    selected.preserve_command = profile.argv.len > 1;
+    return window.addTabWithOptions(selected);
+}
+
+fn acceptConsoleHandoff(context: ?*anyopaque, request: TerminalHandoff.Request) !TerminalHandoff.Pipes {
+    const self: *App = @ptrCast(@alignCast(context.?));
+    if (self.quit_requested) return error.ConsoleHandoffShuttingDown;
+    const alloc = self.core_app.alloc;
+    const startup = request.startup_info;
+    const title = TerminalHandoff.bstr(startup.title);
+    const initial_title = std.unicode.utf16LeToUtf8AllocZ(alloc, std.mem.sliceTo(title, 0)) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => null,
+    };
+    defer if (initial_title) |value| alloc.free(value);
+
+    var attachment: ?Exec.Attachment = create: {
+        const client = try TerminalHandoff.duplicateClient(request.client);
+        errdefer _ = w32.CloseHandle(client);
+        const pty = try Pty.adopt(.{}, .{
+            .signal = request.signal,
+            .reference = request.reference,
+            .server = request.server,
+        });
+        break :create .{ .pty = pty, .client = client };
+    };
+    defer if (attachment) |*value| value.deinit();
+    const pipes = attachment.?.pty.takeConsolePipes();
+    errdefer {
+        _ = w32.CloseHandle(pipes.input);
+        _ = w32.CloseHandle(pipes.output);
+    }
+
+    const use_count_chars = 8;
+    const columns = std.math.cast(i16, startup.x_count_chars) orelse 0;
+    const rows = std.math.cast(i16, startup.y_count_chars) orelse 0;
+    const surface = try self.openWindow(.{}, .{
+        .context = .window,
+        .attachment = &attachment,
+        .initial_show = switch (startup.show_window) {
+            0...9, 11 => @intCast(startup.show_window),
+            else => w32.SW_SHOW,
+        },
+        .initial_cells = if (startup.flags & use_count_chars != 0 and columns > 0 and rows > 0)
+            .{ .columns = @intCast(columns), .rows = @intCast(rows) }
+        else
+            null,
+    });
+    if (initial_title) |value| {
+        if (value.len != 0 and self.config.title == null) surface.setTitle(value);
+    }
+    self.received_console = true;
+    return .{ .input = pipes.input, .output = pipes.output };
+}
+
 pub fn terminate(self: *App) void {
+    self.renderer_startup.deinit();
     self.stopQuitTimer();
+    Settings.closeCompanion(self);
 
     // Unregister all global hotkeys.
     for (self.global_hotkeys.items) |hk| _ = w32.UnregisterHotKey(null, hk.id);
@@ -462,6 +689,9 @@ pub fn terminate(self: *App) void {
         alloc.destroy(window);
     }
     self.windows.deinit(alloc);
+    self.shell_icons.deinit(alloc);
+    if (self.tab_icon_renderer) |token| Icons.shutdown(token);
+    self.tab_text.deinit();
 
     if (self.bg_brush) |brush| {
         _ = w32.DeleteObject(@ptrCast(brush));
@@ -486,6 +716,7 @@ pub fn terminate(self: *App) void {
     }
 
     self.config.deinit();
+    if (self.com_initialized) w32.CoUninitialize();
 }
 
 /// Wake up the message loop from any thread by posting a message
@@ -526,32 +757,11 @@ pub fn performAction(
             // from upstream e5c31e8b3 (#11583).
             const force_opaque: bool = switch (target) {
                 .app => false,
-                .surface => |cs| blk: {
-                    if (self.config.@"background-opacity" >= 1.0) break :blk false;
-                    const h = cs.rt_surface.parent_window.hwnd orelse break :blk false;
-                    const ex = w32.GetWindowLongW(h, w32.GWL_EXSTYLE);
-                    break :blk (ex & w32.WS_EX_LAYERED) == 0;
-                },
+                .surface => |cs| cs.rt_surface.parent_window.force_opaque,
             };
 
-            const alloc = self.core_app.alloc;
-            const window = alloc.create(Window) catch |err| {
-                log.err("failed to allocate new window err={}", .{err});
-                return true;
-            };
-            window.init(self, .{ .force_opaque = force_opaque }) catch |err| {
-                log.err("failed to init new window err={}", .{err});
-                alloc.destroy(window);
-                return true;
-            };
-            self.windows.append(alloc, window) catch |err| {
-                log.err("failed to track new window err={}", .{err});
-                window.deinit();
-                alloc.destroy(window);
-                return true;
-            };
-            _ = window.addTab() catch |err| {
-                log.err("failed to add tab to new window err={}", .{err});
+            _ = self.openWindow(.{ .force_opaque = force_opaque }, .{ .context = .tab }) catch |err| {
+                log.err("failed to create new window err={}", .{err});
                 return true;
             };
             return true;
@@ -605,6 +815,9 @@ pub fn performAction(
         .config_change => {
             // Update our stored config with the new one.
             if (value.config.clone(self.core_app.alloc)) |new_config| {
+                const background_changed = self.config.@"background-opacity" != new_config.@"background-opacity" or
+                    self.config.@"windows-background-material" != new_config.@"windows-background-material";
+                const ui_font_changed = !std.mem.eql(u8, self.config.@"windows-ui-font-family", new_config.@"windows-ui-font-family");
                 self.config.deinit();
                 self.config = new_config;
 
@@ -618,16 +831,17 @@ pub fn performAction(
                 // Refresh DWM chrome (dark/light, caption color) on
                 // every live window so a config reload that changes
                 // the background color updates the title bar.
-                for (self.windows.items) |w| w.onConfigChange();
+                for (self.windows.items) |w| w.onConfigChange(background_changed, ui_font_changed);
 
                 // Re-register global hotkeys against the new keybinds.
                 for (self.global_hotkeys.items) |hk| _ = w32.UnregisterHotKey(null, hk.id);
                 self.global_hotkeys.clearRetainingCapacity();
-                self.registerGlobalHotkey();
+                if (!self.console_server) self.registerGlobalHotkey();
 
                 // Update quick terminal config.
                 if (self.quick_terminal) |qt| {
                     qt.onConfigChange(&self.config);
+                    qt.window.onConfigChange(background_changed, ui_font_changed);
                 }
             } else |err| {
                 log.err("error updating app config err={}", .{err});
@@ -828,7 +1042,7 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    core_surface.rt_surface.parent_window.onTabTitleChanged(
+                    core_surface.rt_surface.parent_window.setTabTitle(
                         core_surface.rt_surface,
                         value.title,
                     );
@@ -876,24 +1090,35 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    if (core_surface.rt_surface.parent_window.hwnd) |h| {
-                        // Convert client size to window size (accounts for
-                        // title bar, borders, scrollbar).
+                    const window = core_surface.rt_surface.parent_window;
+                    if (window.hwnd) |h| {
+                        // The core requests the terminal size. Reserve the
+                        // frontend tab strip before adding the system frame.
+                        const terminal_height: i32 = @intCast(value.height);
                         var rect = w32.RECT{
                             .left = 0,
                             .top = 0,
                             .right = @intCast(value.width),
-                            .bottom = @intCast(value.height),
+                            .bottom = terminal_height +| window.tabBarHeight(),
                         };
                         _ = w32.AdjustWindowRectEx(&rect, w32.WS_OVERLAPPEDWINDOW, 0, 0);
+                        var width = rect.right - rect.left;
+                        var height = rect.bottom - rect.top;
+                        if (self.console_server) {
+                            var monitor: w32.MONITORINFO = .{ .cbSize = @sizeOf(w32.MONITORINFO), .rcMonitor = undefined, .rcWork = undefined, .dwFlags = 0 };
+                            if (w32.GetMonitorInfoW(w32.MonitorFromWindow(h, w32.MONITOR_DEFAULTTONEAREST), &monitor) != 0) {
+                                width = @min(width, monitor.rcWork.right - monitor.rcWork.left);
+                                height = @min(height, monitor.rcWork.bottom - monitor.rcWork.top);
+                            }
+                        }
                         _ = w32.SetWindowPos(
                             h,
                             null,
                             0,
                             0,
-                            rect.right - rect.left,
-                            rect.bottom - rect.top,
-                            w32.SWP_NOZORDER | w32.SWP_NOMOVE,
+                            width,
+                            height,
+                            w32.SWP_NOZORDER | w32.SWP_NOMOVE | (if (self.console_server) w32.SWP_NOACTIVATE else 0),
                         );
                     }
                 },
@@ -913,8 +1138,13 @@ pub fn performAction(
             // config_change actions on all surfaces.
             const alloc = self.core_app.alloc;
             if (value.soft) {
-                // Soft reload: re-apply existing config (for conditional state changes)
-                self.core_app.updateConfig(self, &self.config) catch |err| {
+                // A surface which changed its conditional state can update
+                // independently without reloading every other surface.
+                const result = switch (target) {
+                    .app => self.core_app.updateConfig(self, &self.config),
+                    .surface => |core| core.updateConfig(&self.config),
+                };
+                result catch |err| {
                     log.err("soft config reload error: {}", .{err});
                 };
             } else {
@@ -924,7 +1154,7 @@ pub fn performAction(
                     return true;
                 };
                 defer new_config.deinit();
-                self.core_app.updateConfig(self, &new_config) catch |err| {
+                self.applyConfig(&new_config) catch |err| {
                     log.err("config update error: {}", .{err});
                 };
             }
@@ -935,23 +1165,24 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
+                    core_surface.rt_surface.reportProgress(.{ .state = .remove });
                     const exit_code = value.exit_code;
                     if (exit_code != 0) {
                         // Show a message box including the actual exit code.
                         const hwnd_val = core_surface.rt_surface.parent_window.hwnd;
                         var utf8_buf: [128]u8 = undefined;
-                        const msg_utf8 = std.mem.print(
+                        const msg_utf8 = lang.print(
                             &utf8_buf,
                             "The shell process exited with code {d}.",
                             .{exit_code},
-                        ) catch "The shell process exited unexpectedly.";
+                        ) catch lang.text("The shell process exited unexpectedly.");
 
                         var utf16_buf: [256]u16 = undefined;
                         const utf16_len = std.unicode.utf8ToUtf16Le(&utf16_buf, msg_utf8) catch {
                             _ = w32.MessageBoxW(
                                 hwnd_val,
-                                std.unicode.utf8ToUtf16LeStringLiteral("The shell process exited unexpectedly."),
-                                std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
+                                lang.wide("The shell process exited unexpectedly."),
+                                std.unicode.utf8ToUtf16LeStringLiteral("Madotty"),
                                 w32.MB_ICONWARNING,
                             );
                             return true;
@@ -960,7 +1191,7 @@ pub fn performAction(
                         _ = w32.MessageBoxW(
                             hwnd_val,
                             @ptrCast(&utf16_buf),
-                            std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
+                            std.unicode.utf8ToUtf16LeStringLiteral("Madotty"),
                             w32.MB_ICONWARNING,
                         );
                     }
@@ -990,30 +1221,7 @@ pub fn performAction(
         .toggle_background_opacity => {
             switch (target) {
                 .app => {},
-                .surface => |core_surface| {
-                    if (core_surface.rt_surface.parent_window.hwnd) |h| {
-                        const current_ex = w32.GetWindowLongW(h, w32.GWL_EXSTYLE);
-                        if (current_ex & w32.WS_EX_LAYERED != 0) {
-                            // Remove layered style (restore full opacity).
-                            // Clearing WS_EX_LAYERED is not repainted
-                            // automatically — without an explicit redraw the
-                            // window stays translucent until the next
-                            // repaint (e.g. a later focus change).
-                            _ = w32.SetWindowLongW(h, w32.GWL_EXSTYLE, current_ex & ~w32.WS_EX_LAYERED);
-                            _ = w32.RedrawWindow(
-                                h,
-                                null,
-                                null,
-                                w32.RDW_ERASE | w32.RDW_INVALIDATE | w32.RDW_FRAME | w32.RDW_ALLCHILDREN,
-                            );
-                        } else {
-                            // Apply opacity from config
-                            _ = w32.SetWindowLongW(h, w32.GWL_EXSTYLE, current_ex | w32.WS_EX_LAYERED);
-                            const alpha: u8 = @intFromFloat(@round(self.config.@"background-opacity" * 255.0));
-                            _ = w32.SetLayeredWindowAttributes(h, 0, alpha, w32.LWA_ALPHA);
-                        }
-                    }
-                },
+                .surface => |core_surface| core_surface.rt_surface.parent_window.toggleBackgroundOpacity(),
             }
             return true;
         },
@@ -1095,11 +1303,18 @@ pub fn performAction(
             return true;
         },
 
+        .pwd => {
+            switch (target) {
+                .surface => |core| try core.rt_surface.setReportedDirectory(value.pwd),
+                .app => return false,
+            }
+            return true;
+        },
+
         // Acknowledge actions that don't need Win32-specific handling.
         // The core handles the logic; we just confirm receipt.
         .key_sequence,
         .key_table,
-        .pwd,
         .cell_size,
         .readonly,
         // Platform-specific actions that don't apply on Windows:
@@ -1120,8 +1335,8 @@ pub fn performAction(
                 .unhealthy => {
                     self.notif_desktop_surface_id = 0;
                     self.showDesktopNotificationText(
-                        "Renderer Unhealthy",
-                        "The GPU renderer is in an unhealthy state; terminal output may stop updating.",
+                        lang.text("Renderer Unhealthy"),
+                        lang.text("The GPU renderer is in an unhealthy state; terminal output may stop updating."),
                     );
                 },
             }
@@ -1129,33 +1344,9 @@ pub fn performAction(
         },
 
         .progress_report => {
-            // Reflect shell/TUI progress (OSC 9;4) on the taskbar button, the
-            // Windows equivalent of the macOS Dock progress. Gated on
-            // progress-style; the win32 apprt has no progress bar of its own.
-            if (!self.config.@"progress-style") return true;
             switch (target) {
                 .app => {},
-                .surface => |core_surface| {
-                    const hwnd = core_surface.rt_surface.parent_window.hwnd orelse
-                        return true;
-                    const tb = self.taskbarList() orelse return true;
-                    switch (value.state) {
-                        .remove => tb.SetProgressState(hwnd, w32.TBPF_NOPROGRESS),
-                        .indeterminate => tb.SetProgressState(hwnd, w32.TBPF_INDETERMINATE),
-                        .set => {
-                            tb.SetProgressState(hwnd, w32.TBPF_NORMAL);
-                            if (value.progress) |p| tb.SetProgressValue(hwnd, p, 100);
-                        },
-                        .@"error" => {
-                            tb.SetProgressState(hwnd, w32.TBPF_ERROR);
-                            if (value.progress) |p| tb.SetProgressValue(hwnd, p, 100);
-                        },
-                        .pause => {
-                            tb.SetProgressState(hwnd, w32.TBPF_PAUSED);
-                            if (value.progress) |p| tb.SetProgressValue(hwnd, p, 100);
-                        },
-                    }
-                },
+                .surface => |core_surface| if (!core_surface.child_exited) core_surface.rt_surface.reportProgress(value),
             }
             return true;
         },
@@ -1291,22 +1482,22 @@ pub fn performAction(
                     }
                     if (act.notify) {
                         const title: []const u8 = if (value.exit_code) |code|
-                            (if (code == 0) "Command Succeeded" else "Command Failed")
+                            (if (code == 0) lang.text("Command Succeeded") else lang.text("Command Failed"))
                         else
-                            "Command Finished";
+                            lang.text("Command Finished");
                         var body_buf: [128]u8 = undefined;
                         const body: []const u8 = if (value.exit_code) |code|
-                            std.mem.print(
+                            lang.print(
                                 &body_buf,
                                 "Command took {f} and exited with code {d}.",
                                 .{ value.duration.round(std.time.ns_per_ms), code },
-                            ) catch "Command finished."
+                            ) catch lang.text("Command finished.")
                         else
-                            std.mem.print(
+                            lang.print(
                                 &body_buf,
                                 "Command took {f}.",
                                 .{value.duration.round(std.time.ns_per_ms)},
-                            ) catch "Command finished.";
+                            ) catch lang.text("Command finished.");
                         self.notif_desktop_surface_id = core_surface.id;
                         self.showDesktopNotificationText(title, body);
                     }
@@ -1556,9 +1747,7 @@ fn exportTerminalIo(self: *App, target: apprt.Target, contents: []const u8) bool
 
     // The common-dialog filter is a sequence of NUL-terminated label/pattern
     // pairs followed by an additional NUL.
-    const filter = std.unicode.utf8ToUtf16LeStringLiteral(
-        "Text files (*.txt)\x00*.txt\x00All files (*.*)\x00*.*\x00",
-    );
+    const filter = lang.wide("Text files (*.txt)\x00*.txt\x00All files (*.*)\x00*.*\x00");
     var dialog: w32.OPENFILENAMEW = std.mem.zeroes(w32.OPENFILENAMEW);
     dialog.lStructSize = @sizeOf(w32.OPENFILENAMEW);
     dialog.hwndOwner = owner;
@@ -1566,7 +1755,7 @@ fn exportTerminalIo(self: *App, target: apprt.Target, contents: []const u8) bool
     dialog.nFilterIndex = 1;
     dialog.lpstrFile = &file_buf;
     dialog.nMaxFile = file_buf.len;
-    dialog.lpstrTitle = std.unicode.utf8ToUtf16LeStringLiteral("Export Terminal IO Events");
+    dialog.lpstrTitle = lang.wide("Export Terminal IO Events");
     dialog.lpstrDefExt = std.unicode.utf8ToUtf16LeStringLiteral("txt");
     dialog.Flags = w32.OFN_EXPLORER |
         w32.OFN_NOCHANGEDIR |
@@ -1625,19 +1814,81 @@ fn popupSurface(self: *const App, child: w32.HWND) ?*Surface {
     return @ptrFromInt(@as(usize, @bitCast(userdata)));
 }
 
-/// Register a system-wide hotkey for toggle_quick_terminal.
-/// Scans keybinds for entries with the `global` flag.
+/// Publish a window's combined progress once its taskbar button exists.
+pub fn setTaskbarProgress(self: *App, hwnd: w32.HWND, previous: ?Progress, next: Progress) bool {
+    const tb = self.taskbarList() orelse return false;
+    return submitTaskbarProgress(tb, hwnd, previous, next);
+}
+
+fn submitTaskbarProgress(tb: *w32.ITaskbarList3, hwnd: w32.HWND, previous: ?Progress, next: Progress) bool {
+    const previous_state = if (previous) |progress| progress.state else null;
+    if (previous_state != next.state) {
+        // Clear the previous value or Explorer can retain the determinate
+        // display when transitioning to its marquee.
+        if (next.state == .indeterminate and previous_state != .remove and
+            tb.vtable.SetProgressState(tb, hwnd, w32.TBPF_NOPROGRESS) < 0) return false;
+        const flag: c_int = switch (next.state) {
+            .remove => w32.TBPF_NOPROGRESS,
+            .indeterminate => w32.TBPF_INDETERMINATE,
+            .set => w32.TBPF_NORMAL,
+            .@"error" => w32.TBPF_ERROR,
+            .pause => w32.TBPF_PAUSED,
+        };
+        if (tb.vtable.SetProgressState(tb, hwnd, flag) < 0) return false;
+    }
+    return switch (next.state) {
+        .remove, .indeterminate => true,
+        .set, .@"error", .pause => tb.vtable.SetProgressValue(tb, hwnd, next.value, 100) >= 0,
+    };
+}
+
+test "win32 progress publishes native taskbar states and checks HRESULT" {
+    const testing = std.testing;
+    const Fake = struct {
+        iface: w32.ITaskbarList3,
+        states: [2]c_int = undefined,
+        state_len: usize = 0,
+        value: u64 = 0,
+        fail_value: bool = false,
+
+        fn setState(tb: *w32.ITaskbarList3, _: ?w32.HWND, flag: c_int) callconv(.winapi) w32.HRESULT {
+            const fake: *@This() = @fieldParentPtr("iface", tb);
+            fake.states[fake.state_len] = flag;
+            fake.state_len += 1;
+            return 0;
+        }
+
+        fn setValue(tb: *w32.ITaskbarList3, _: ?w32.HWND, done: u64, total: u64) callconv(.winapi) w32.HRESULT {
+            const fake: *@This() = @fieldParentPtr("iface", tb);
+            if (total != 100 or fake.fail_value) return -1;
+            fake.value = done;
+            return 0;
+        }
+    };
+    var methods: w32.ITaskbarList3.Vtbl = undefined;
+    methods.SetProgressState = &Fake.setState;
+    methods.SetProgressValue = &Fake.setValue;
+    var fake: Fake = .{ .iface = .{ .vtable = &methods } };
+    const hwnd: w32.HWND = @ptrFromInt(1);
+    const failed: Progress = .{ .state = .@"error", .value = 67 };
+    const waiting: Progress = .{ .state = .indeterminate };
+    try testing.expect(submitTaskbarProgress(&fake.iface, hwnd, Progress{}, failed));
+    try testing.expectEqualSlices(c_int, &.{w32.TBPF_ERROR}, fake.states[0..fake.state_len]);
+    try testing.expectEqual(67, fake.value);
+    fake.state_len = 0;
+    try testing.expect(submitTaskbarProgress(&fake.iface, hwnd, failed, waiting));
+    try testing.expectEqualSlices(c_int, &.{ w32.TBPF_NOPROGRESS, w32.TBPF_INDETERMINATE }, fake.states[0..fake.state_len]);
+    fake.state_len = 0;
+    fake.fail_value = true;
+    try testing.expect(!submitTaskbarProgress(&fake.iface, hwnd, waiting, .{ .state = .pause, .value = 20 }));
+    try testing.expectEqualSlices(c_int, &.{w32.TBPF_PAUSED}, fake.states[0..fake.state_len]);
+}
+
 /// Lazily create (and cache) the shell ITaskbarList3 used for taskbar-button
 /// progress. Returns null if COM or the taskbar object is unavailable.
 fn taskbarList(self: *App) ?*w32.ITaskbarList3 {
     if (self.taskbar) |tb| return tb;
-
-    // COM must be initialized on this (the UI) thread before CoCreateInstance.
-    // S_FALSE (already initialized) is fine; we only need it done once.
-    if (!self.com_initialized) {
-        _ = w32.CoInitializeEx(null, w32.COINIT_APARTMENTTHREADED);
-        self.com_initialized = true;
-    }
+    if (!self.ensureCom()) return null;
 
     var ptr: ?*anyopaque = null;
     const hr = w32.CoCreateInstance(
@@ -1650,11 +1901,21 @@ fn taskbarList(self: *App) ?*w32.ITaskbarList3 {
     if (hr < 0 or ptr == null) return null;
 
     const tb: *w32.ITaskbarList3 = @ptrCast(@alignCast(ptr.?));
-    _ = tb.HrInit();
+    if (tb.HrInit() < 0) {
+        tb.Release();
+        return null;
+    }
     self.taskbar = tb;
     return tb;
 }
 
+fn ensureCom(self: *App) bool {
+    if (self.com_initialized) return true;
+    self.com_initialized = w32.CoInitializeEx(null, w32.COINIT_APARTMENTTHREADED) >= 0;
+    return self.com_initialized;
+}
+
+/// Register system-wide hotkeys from keybinds with the `global` flag.
 fn registerGlobalHotkey(self: *App) void {
     const alloc = self.core_app.alloc;
     var next_id: i32 = 1;
@@ -1783,7 +2044,7 @@ fn keyToVk(key: @import("../../input/key.zig").Key) ?u32 {
 // -----------------------------------------------------------------------
 
 /// GitHub releases API URL for this fork.
-const UPDATE_URL = "https://api.github.com/repos/shiweis/ghostty-windows/releases/latest";
+const UPDATE_URL = "https://api.github.com/repos/zszushi/Madotty/releases/latest";
 
 /// Custom message posted from the update thread to the message loop.
 const WM_APP_UPDATE_AVAILABLE: u32 = w32.WM_APP + 2;
@@ -1793,7 +2054,7 @@ const WM_APP_UPDATE_AVAILABLE: u32 = w32.WM_APP + 2;
 const WM_APP_TRAY: u32 = w32.WM_APP + 3;
 
 /// User-facing GitHub releases page that the update balloon links to.
-const RELEASES_URL = "https://github.com/shiweis/ghostty-windows/releases/latest";
+const RELEASES_URL = "https://github.com/zszushi/Madotty/releases/latest";
 
 /// Tray icon and timer IDs for notifications. Distinct IDs mean the
 /// desktop and update balloons can coexist without one's auto-cleanup
@@ -1946,19 +2207,19 @@ fn showUpdateNotification(self: *App, ver: []const u8) void {
     nid.uVersion_or_uTimeout = 10000;
 
     // Title
-    const title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty Update Available");
+    const title = lang.wide("Ghostty Update Available");
     @memcpy(nid.szInfoTitle[0..title.len], title);
     nid.szInfoTitle[title.len] = 0;
 
     // Body: "Version X.Y.Z is available. Visit GitHub to download."
     var body_utf8: [256]u8 = undefined;
-    const body_len = std.mem.print(&body_utf8, "Version {s} is available.\nVisit GitHub releases to download.", .{ver[0..ver_len]}) catch return;
+    const body_len = lang.print(&body_utf8, "Version {s} is available.\nVisit GitHub releases to download.", .{ver[0..ver_len]}) catch return;
     var body_utf16: [256]u16 = undefined;
     const wlen = std.unicode.utf8ToUtf16Le(&body_utf16, body_len) catch 0;
     @memcpy(nid.szInfo[0..wlen], body_utf16[0..wlen]);
     nid.szInfo[wlen] = 0;
 
-    const tip = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
+    const tip = std.unicode.utf8ToUtf16LeStringLiteral("Madotty");
     @memcpy(nid.szTip[0..tip.len], tip);
     nid.szTip[tip.len] = 0;
 
@@ -2017,22 +2278,25 @@ pub fn startQuitTimer(self: *App) void {
     // Cancel any existing timer first.
     self.stopQuitTimer();
 
-    // Check if we should quit at all.
-    if (!self.config.@"quit-after-last-window-closed") return;
+    if (!self.console_server and !self.config.@"quit-after-last-window-closed") return;
 
-    // If a delay is configured, start a Win32 timer.
-    if (self.config.@"quit-after-last-window-closed-delay") |v| {
-        const ms = v.asMilliseconds();
+    const delay: ?u32 = if (self.console_server)
+        if (self.received_console) null else console_server_idle_ms
+    else if (self.config.@"quit-after-last-window-closed-delay") |v|
+        v.asMilliseconds()
+    else
+        null;
+    if (delay) |ms| {
         if (self.msg_hwnd) |hwnd| {
-            _ = w32.SetTimer(hwnd, QUIT_TIMER_ID, ms, null);
-            self.quit_timer_state = .active;
+            if (w32.SetTimer(hwnd, QUIT_TIMER_ID, ms, null) != 0) {
+                self.quit_timer_state = .active;
+                return;
+            }
         }
-    } else {
-        // No delay — quit immediately.
-        self.quit_timer_state = .expired;
-        self.quit_requested = true;
-        w32.PostQuitMessage(0);
     }
+    self.quit_timer_state = .expired;
+    self.quit_requested = true;
+    w32.PostQuitMessage(0);
 }
 
 /// Cancel the quit timer. Called when a new surface opens.
@@ -2106,7 +2370,7 @@ fn showDesktopNotificationText(self: *App, title: []const u8, body: []const u8) 
     nid.szInfo[body_len] = 0;
 
     // Tooltip
-    const tip = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
+    const tip = std.unicode.utf8ToUtf16LeStringLiteral("Madotty");
     @memcpy(nid.szTip[0..tip.len], tip);
     nid.szTip[tip.len] = 0;
 
@@ -2148,6 +2412,13 @@ fn surfaceWndProc(
         return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
 
     switch (msg) {
+        Surface.wm_vulkan_draw => {
+            if (comptime build_config.renderer == .vulkan) {
+                if (is_surface_window) surface.handleVulkanDraw();
+                return 0;
+            }
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         w32.WM_ENTERSIZEMOVE => {
             surface.in_live_resize = true;
             return 0;
@@ -2161,7 +2432,10 @@ fn surfaceWndProc(
         w32.WM_SIZE => {
             const width: u32 = @intCast(lparam & 0xFFFF);
             const height: u32 = @intCast((lparam >> 16) & 0xFFFF);
-            surface.handleResize(width, height);
+            if (is_surface_window)
+                surface.handleResize(width, height)
+            else
+                surface.layoutPopupControls(hwnd, @intCast(width), @intCast(height));
             return 0;
         },
 
@@ -2210,9 +2484,12 @@ fn surfaceWndProc(
         },
 
         w32.WM_ERASEBKGND => {
-            // Fill with the configured background color to prevent
-            // a visible flash during resize. The OpenGL renderer will
-            // overwrite the entire client area on the next frame.
+            // Preserve the last OpenGL frame until the renderer presents
+            // the resized one. A GDI fill here can blank visible glyphs
+            // while the replacement frame is still being rendered.
+            if (is_surface_window and surface.core_surface_ready) return 1;
+
+            // Surfaces that have not drawn yet and popups use the app brush.
             if (surface.app.bg_brush) |brush| {
                 const hdc_erase: w32.HDC = @ptrFromInt(wparam);
                 var rect: w32.RECT = undefined;
@@ -2506,8 +2783,7 @@ fn surfaceWndProc(
 
         w32.WM_SETFOCUS => {
             // Update the active surface for this tab when a split pane gains focus.
-            const tab = surface.parent_window.active_tab;
-            surface.parent_window.tab_active_surface[tab] = surface;
+            if (surface.core_surface_ready) surface.parent_window.focusPane(surface);
             surface.handleFocus(true);
             return 0;
         },
@@ -2536,13 +2812,13 @@ fn openUrlNow(value: apprt.action.OpenUrl) void {
     wbuf[wlen] = 0;
     if (decision == .confirm) {
         var prompt_buf: [8192]u8 = undefined;
-        const prompt = std.mem.print(&prompt_buf, "Open this terminal-supplied link in its registered application?\n" ++
+        const prompt = lang.print(&prompt_buf, "Open this terminal-supplied link in its registered application?\n" ++
             "This may execute commands. Continue only if you trust the target.\n\n{s}", .{url}) catch return;
         var wide_prompt: [8192]u16 = undefined;
         const prompt_len = std.unicode.utf8ToUtf16Le(&wide_prompt, prompt) catch return;
         if (prompt_len >= wide_prompt.len) return;
         wide_prompt[prompt_len] = 0;
-        if (w32.MessageBoxW(null, @ptrCast(&wide_prompt), std.unicode.utf8ToUtf16LeStringLiteral("Open external link?"), w32.MB_OKCANCEL | w32.MB_ICONWARNING | w32.MB_DEFBUTTON2) != w32.IDOK) return;
+        if (w32.MessageBoxW(null, @ptrCast(&wide_prompt), lang.wide("Open external link?"), w32.MB_OKCANCEL | w32.MB_ICONWARNING | w32.MB_DEFBUTTON2) != w32.IDOK) return;
     }
     _ = w32.ShellExecuteW(
         null,
@@ -2585,6 +2861,12 @@ fn msgWndProc(
 
     if (msg == WM_APP_WAKEUP) {
         app.tick();
+        return 0;
+    }
+
+    if (msg == WM_APP_COLOR_SCHEME) {
+        app.color_scheme_pending = false;
+        if (!app.quit_requested) app.refreshColorScheme();
         return 0;
     }
 
@@ -2659,6 +2941,11 @@ fn msgWndProc(
     // Timer ID 3: quick terminal animation tick.
     if (msg == w32.WM_TIMER and wparam == QuickTerminal.ANIM_TIMER_ID) {
         if (app.quick_terminal) |qt| qt.onAnimationTick();
+        return 0;
+    }
+
+    if (msg == w32.WM_TIMER and wparam == Settings.timer_id) {
+        Settings.tick(app);
         return 0;
     }
 

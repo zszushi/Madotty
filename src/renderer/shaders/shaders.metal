@@ -20,7 +20,7 @@ struct Uniforms {
   ushort2 cursor_pos;
   uchar4 cursor_color;
   uchar4 bg_color;
-  bool cursor_wide;
+  uchar cursor_width;
   bool use_display_p3;
   bool use_linear_blending;
   bool use_linear_correction;
@@ -656,11 +656,9 @@ vertex CellTextVertexOut cell_text_vertex(
   }
 
   // Check if current position is under cursor (including wide cursor)
-  bool is_cursor_pos = (
-      in.grid_pos.x == uniforms.cursor_pos.x ||
-      uniforms.cursor_wide &&
-        in.grid_pos.x == uniforms.cursor_pos.x + 1
-    ) && in.grid_pos.y == uniforms.cursor_pos.y;
+  bool is_cursor_pos = in.grid_pos.y == uniforms.cursor_pos.y &&
+    in.grid_pos.x >= uniforms.cursor_pos.x &&
+    in.grid_pos.x < uint(uniforms.cursor_pos.x) + uniforms.cursor_width;
 
   // If this cell is the cursor cell, but we're not processing
   // the cursor glyph itself, then we need to change the color.

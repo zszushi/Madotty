@@ -226,6 +226,13 @@
 //! target is out of range, is not a codepoint cell, has a zero codepoint, or
 //! already received an entry. A kind 1 cell that receives no suffix
 //! codepoints decodes as a plain codepoint cell.
+//!
+//! An entry whose row is 0xFFFF may carry OSC 66 metadata. Its column is
+//! the actual row index, and each 32-bit word describes one horizontal span
+//! or a suffix of wrap padding. Bits 0–15 give the starting column, bits
+//! 16–18 give the span width (zero for padding), bit 19 selects padding, and
+//! bits 20–31 must be 0x66A. The base grid stores these cells as narrow cells.
+//! Legacy readers skip the entry because its apparent row is out of range.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -385,7 +392,8 @@ const native_matches_wire = native: {
                 .style_id = 0xBEEF,
                 .wide = .spacer_tail,
                 .protected = true,
-                ._padding = 0x1D2C,
+                .sized = @truncate(@as(u16, 0x1D2C)),
+                ._padding = 0x1D2C >> 3,
             },
             .wire = .{
                 .kind = 1,
@@ -446,6 +454,18 @@ const native_matches_wire = native: {
 const bulk_codec = native_matches_wire and
     builtin.target.cpu.arch.endian() == .little;
 
+const sized_row = std.math.maxInt(u16);
+const sized_witness = @as(u64, 7) << @bitOffsetOf(Cell, "hyperlink_id");
+
+const SizedMarker = packed struct(u32) {
+    column: u16,
+    width: u3 = 0,
+    padding: bool = false,
+    tag: u12 = tag_value,
+
+    const tag_value = 0x66A;
+};
+
 pub const EncodeError = std.Io.Writer.Error || error{
     /// Wide and spacer cells do not form a valid row.
     InvalidWideCell,
@@ -464,6 +484,7 @@ pub fn encode(
     writer: *std.Io.Writer,
 ) EncodeError!void {
     defer page.assertIntegrity();
+    var sized_rows: usize = 0;
     for (0..page.size.rows) |y| {
         const row = page.getRow(y);
         const cells = page.getCells(row);
@@ -481,23 +502,30 @@ pub fn encode(
         // are narrow, so checking the encoded prefix against the full row
         // width covers every pair.
         const wide_mask: u64 = comptime @bitCast(Cell{ .width = 3 });
-        if (word_or & wide_mask != 0) {
-            for (cells[0..count], 0..) |*cell, x| switch (cell.wide) {
-                .narrow => {},
-                .wide => if (x + 1 == cells.len or
-                    cells[x + 1].wide != .spacer_tail)
-                {
-                    return error.InvalidWideCell;
-                },
-                .spacer_tail => if (x == 0 or
-                    cells[x - 1].wide != .wide)
-                {
-                    return error.InvalidWideCell;
-                },
-                .spacer_head => if (x + 1 != cells.len or !row.wrap) {
-                    return error.InvalidWideCell;
-                },
-            };
+        if (word_or & sized_witness != 0) sized_rows += 1;
+        if (word_or & (wide_mask | sized_witness) != 0) {
+            for (cells[0..count], 0..) |*cell, x| {
+                if (cell.sized != 0) {
+                    if (!TerminalCell.validSizedMarker(cells, x, row.wrap)) return error.InvalidWideCell;
+                    continue;
+                }
+                switch (cell.wide) {
+                    .narrow => {},
+                    .wide => if (x + 1 == cells.len or
+                        cells[x + 1].wide != .spacer_tail or cells[x + 1].sized != 0)
+                    {
+                        return error.InvalidWideCell;
+                    },
+                    .spacer_tail => if (x == 0 or
+                        cells[x - 1].wide != .wide or cells[x - 1].sized != 0)
+                    {
+                        return error.InvalidWideCell;
+                    },
+                    .spacer_head => if (x + 1 != cells.len or !row.wrap) {
+                        return error.InvalidWideCell;
+                    },
+                }
+            }
         }
 
         // Canonical rows use the smallest admissible width.
@@ -597,7 +625,7 @@ pub fn encode(
         }
     }
 
-    try encodeGraphemes(page, writer);
+    try encodeGraphemes(page, writer, sized_rows);
 }
 
 /// The encoded cell count (through the last nonzero cell) and the bitwise
@@ -649,6 +677,7 @@ inline fn classifyWord(cell: *const TerminalCell) u64 {
 
     var wire: Cell = @bitCast(cellBits(cell.*, 0));
     wire.hyperlink = cell.hyperlink;
+    wire.hyperlink_id = cell.sized;
     return @bitCast(wire);
 }
 
@@ -755,14 +784,15 @@ inline fn encodeNarrowStep(
 fn encodeGraphemes(
     page: *const TerminalPage,
     writer: *std.Io.Writer,
+    sized_rows: usize,
 ) EncodeError!void {
     // Every grapheme cell owns exactly one entry in the page's grapheme
     // map, so the section header comes straight from the page without a
     // counting pass over the grid. Rows without the native grapheme hint
     // contain no grapheme cells in any intact page.
     const entries = page.graphemeCount();
-    try io.writeInt(writer, u32, @intCast(entries));
-    if (entries == 0) return;
+    try io.writeInt(writer, u32, @intCast(entries + sized_rows));
+    if (entries == 0) return encodeSizedRows(page, writer, sized_rows);
 
     // Entries are batched into a local buffer so hot pages perform one
     // writer call per flush instead of several per entry.
@@ -807,6 +837,39 @@ fn encodeGraphemes(
     // The declared count is trusted by decoders for framing, so the grid
     // must have produced exactly that many entries.
     assert(emitted == entries);
+    try encodeSizedRows(page, writer, sized_rows);
+}
+
+fn encodeSizedRows(
+    page: *const TerminalPage,
+    writer: *std.Io.Writer,
+    count: usize,
+) std.Io.Writer.Error!void {
+    if (count == 0) return;
+    for (0..page.size.rows) |y| {
+        const cells = page.getCells(page.getRow(y));
+        var markers: u16 = 0;
+        for (cells) |cell| {
+            if (cell.sizedWidth() != null) markers += 1;
+            if (cell.wide == .spacer_head and cell.sized != 0) {
+                markers += 1;
+                break;
+            }
+        }
+        if (markers == 0) continue;
+
+        try io.writeInt(writer, u16, sized_row);
+        try io.writeInt(writer, u16, @intCast(y));
+        try io.writeInt(writer, u16, markers);
+        for (cells, 0..) |cell, x| {
+            if (cell.sizedWidth()) |width| {
+                try io.writeInt(writer, u32, @bitCast(SizedMarker{ .column = @intCast(x), .width = width }));
+            } else if (cell.wide == .spacer_head and cell.sized != 0) {
+                try io.writeInt(writer, u32, @bitCast(SizedMarker{ .column = @intCast(x), .padding = true }));
+                break;
+            }
+        }
+    }
 }
 
 pub const DecodeError = std.Io.Reader.Error || error{
@@ -1338,6 +1401,11 @@ fn decodeGraphemes(
             };
         };
 
+        if (y == sized_row and x < page.size.rows) {
+            try decodeSizedRow(page, reader, x, cp_count);
+            continue;
+        }
+
         // Resolve the target cell. Entries whose target cannot carry a
         // suffix are optional detail: their codepoints are consumed to
         // preserve framing and then dropped.
@@ -1395,6 +1463,50 @@ fn decodeGraphemes(
     }
 }
 
+fn decodeSizedRow(
+    page: *TerminalPage,
+    reader: *std.Io.Reader,
+    y: u16,
+    count: u16,
+) std.Io.Reader.Error!void {
+    const row = page.getRow(y);
+    const cells = page.getCells(row);
+    for (0..count) |_| {
+        const marker: SizedMarker = @bitCast(try io.readInt(reader, u32));
+        if (marker.tag != SizedMarker.tag_value or marker.column >= cells.len) continue;
+        const remaining = cells.len - marker.column;
+        const width = if (marker.padding) padding: {
+            if (!row.wrap or marker.width != 0 or remaining >= 7) continue;
+            break :padding remaining;
+        } else span: {
+            if (marker.width == 0 or marker.width > remaining) continue;
+            break :span marker.width;
+        };
+
+        // Validate all cells before applying any changes. Invalid markers
+        // degrade independently to the legacy narrow cell representation.
+        const span = cells[marker.column..][0..width];
+        for (span, 0..) |cell, offset| {
+            if (cell.wide != .narrow or cell.sized != 0 or
+                cell.hasText() != (!marker.padding and offset == 0)) break;
+        } else {
+            if (marker.padding) {
+                for (span) |*cell| {
+                    cell.wide = .spacer_head;
+                    cell.sized = 1;
+                }
+            } else {
+                span[0].wide = if (width == 1) .narrow else .wide;
+                span[0].sized = marker.width;
+                for (span[1..], 1..) |*cell, offset| {
+                    cell.wide = .spacer_tail;
+                    cell.sized = @intCast(offset);
+                }
+            }
+        }
+    }
+}
+
 /// Attach one decoded suffix codepoint to its resolved target cell.
 ///
 /// If native capacity is exhausted, any prefix already attached is removed
@@ -1423,6 +1535,7 @@ fn applyGraphemeSuffix(
 fn cellBits(cell: TerminalCell, link_id: TerminalHyperlinkId) u64 {
     if (comptime native_matches_wire) {
         var wire: Cell = @bitCast(cell);
+        if (cell.sized != 0) wire.width = 0;
         wire.hyperlink = link_id != 0;
         wire.hyperlink_id = link_id;
         return @bitCast(wire);
@@ -1440,7 +1553,7 @@ fn cellBits(cell: TerminalCell, link_id: TerminalHyperlinkId) u64 {
                 (@as(u24, cell.content.color_rgb.b) << 16),
         },
         .style_id = cell.style_id,
-        .width = switch (cell.wide) {
+        .width = if (cell.sized != 0) 0 else switch (cell.wide) {
             .narrow => 0,
             .wide => 1,
             .spacer_tail => 2,
@@ -1833,6 +1946,112 @@ test "grid golden encoding and decoding" {
         &test_golden_fixture,
         rewriter.buffered(),
     );
+}
+
+test "grid round trips OSC 66 spans through legacy-readable cells" {
+    const testing = std.testing;
+    const capacity: terminal_page.Capacity = .{
+        .cols = 6,
+        .rows = 2,
+        .styles = 0,
+        .hyperlink_bytes = 0,
+        .grapheme_bytes = 64,
+        .string_bytes = 0,
+    };
+    var source = try TerminalPage.init(capacity);
+    defer source.deinit();
+
+    const start = source.getRowAndCell(0, 0);
+    start.row.wrap = true;
+    start.cell.* = .init('P');
+    start.cell.sized = 1;
+    for (4..6) |x| source.getRowAndCell(x, 0).cell.* = .{ .wide = .spacer_head, .sized = 1 };
+
+    const head = source.getRowAndCell(0, 1);
+    head.row.wrap_continuation = true;
+    head.cell.* = .init('X');
+    head.cell.wide = .wide;
+    head.cell.sized = 3;
+    for (1..3) |x| source.getRowAndCell(x, 1).cell.* = .{ .wide = .spacer_tail, .sized = @intCast(x) };
+    try source.appendGrapheme(head.row, head.cell, 'Y');
+
+    var buffer: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try encode(&source, &writer);
+    const encoded = writer.buffered();
+
+    // Read the base rows and suffix entries with the version-1 framing.
+    // A legacy decoder can consume the normal suffix and skip the two
+    // optional entries on the same invalid-row branch it already has.
+    var legacy: std.Io.Reader = .fixed(encoded);
+    for ([_]u16{ 6, 3 }, [_]u24{ 'P', 'X' }) |cell_count, cp| {
+        const row: Row = @bitCast(try io.readInt(&legacy, u8));
+        try testing.expectEqual(Cell.EncodedWidth.eight, row.cell_width);
+        try testing.expectEqual(cell_count, try io.readInt(&legacy, u16));
+        for (0..cell_count) |x| {
+            const wire: Cell = @bitCast(try io.readInt(&legacy, u64));
+            try testing.expectEqual(@as(u2, 0), wire.width);
+            try testing.expectEqual(@as(u16, 0), wire.hyperlink_id);
+            try testing.expectEqual(if (x == 0) cp else 0, wire.content);
+        }
+    }
+    try testing.expectEqual(@as(u32, 3), try io.readInt(&legacy, u32));
+    try testing.expectEqual(@as(u16, 1), try io.readInt(&legacy, u16));
+    try testing.expectEqual(@as(u16, 0), try io.readInt(&legacy, u16));
+    try testing.expectEqual(@as(u16, 1), try io.readInt(&legacy, u16));
+    try testing.expectEqual(@as(u32, 'Y'), try io.readInt(&legacy, u32));
+    for (0..2) |y| {
+        const sentinel = try io.readInt(&legacy, u16);
+        try testing.expect(sentinel >= capacity.rows);
+        try testing.expectEqual(@as(u16, @intCast(y)), try io.readInt(&legacy, u16));
+        const count = try io.readInt(&legacy, u16);
+        try legacy.discardAll(@as(usize, count) * 4);
+    }
+    try testing.expectEqual(@as(usize, 0), legacy.bufferedLen());
+
+    var destination = try TerminalPage.init(capacity);
+    defer destination.deinit();
+    var reader: std.Io.Reader = .fixed(encoded);
+    try decode(&destination, &reader, &.empty, &.empty);
+    try destination.verifyIntegrity(testing.allocator);
+
+    const first = destination.getRowAndCell(0, 0);
+    try testing.expectEqual(@as(?u3, 1), first.cell.sizedWidth());
+    try testing.expectEqual(TerminalCell.Wide.spacer_head, destination.getRowAndCell(4, 0).cell.wide);
+    try testing.expectEqual(TerminalCell.Wide.spacer_head, destination.getRowAndCell(5, 0).cell.wide);
+    const second = destination.getRowAndCell(0, 1);
+    try testing.expectEqual(@as(?u3, 3), second.cell.sizedWidth());
+    try testing.expectEqualSlices(u21, &.{'Y'}, destination.lookupGrapheme(second.cell).?);
+    try testing.expectEqual(@as(?u3, 2), destination.getRowAndCell(2, 1).cell.sizedTailOffset());
+}
+
+test "grid ignores malformed OSC 66 snapshot markers without splitting spans" {
+    const testing = std.testing;
+    var page = try TerminalPage.init(.{ .cols = 4, .rows = 1, .styles = 0, .hyperlink_bytes = 0, .grapheme_bytes = 0, .string_bytes = 0 });
+    defer page.deinit();
+    const row = page.getRow(0);
+    const cells = page.getCells(row);
+    cells[0] = .init('X');
+    cells[1] = .init('Y');
+
+    const markers = [_]SizedMarker{
+        .{ .column = 0, .width = 2 }, // Would cover 'Y'.
+        .{ .column = 1, .width = 2 }, // Valid.
+        .{ .column = 1, .width = 3 }, // Would replace the valid span.
+        .{ .column = 3, .width = 7 }, // Would extend beyond the row.
+        .{ .column = 3, .padding = true }, // Row has no wrap.
+    };
+    var bytes: [markers.len * 4]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&bytes);
+    for (markers) |marker| try io.writeInt(&writer, u32, @bitCast(marker));
+    var reader: std.Io.Reader = .fixed(writer.buffered());
+    try decodeSizedRow(&page, &reader, 0, markers.len);
+
+    try page.verifyIntegrity(testing.allocator);
+    try testing.expectEqual(@as(u3, 0), cells[0].sized);
+    try testing.expectEqual(@as(?u3, 2), cells[1].sizedWidth());
+    try testing.expectEqual(@as(?u3, 1), cells[2].sizedTailOffset());
+    try testing.expect(cells[3].isZero());
 }
 
 test "grid elides trailing default cells" {

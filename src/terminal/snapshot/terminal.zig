@@ -208,12 +208,14 @@
 //! bit 41  in_band_size_reports
 //! bit 42  kitty_paste_events
 //! bit 43  win32_input
-//! bits 44-63  reserved, zero
+//! bit 44  sixel_display_mode
+//! bit 45  sixel_cursor_right
+//! bits 46-63  reserved, zero
 //! ```
 //!
 //! This is the packed field order of native `ModePacked`. Its layout is
-//! well-defined and is the snapshot registry. Moving or adding a native mode
-//! therefore requires a snapshot version bump. Decoders ignore reserved bits.
+//! well-defined and is the snapshot registry. Decoders ignore reserved bits.
+//! Append modes within this space without moving previously allocated bits.
 //!
 //! ## Field classification
 //!
@@ -472,8 +474,8 @@ pub const Header = struct {
         try writer.writeByte(@intCast(@backingInt(self.mouse_shape)));
         try writer.writeByte(@intFromBool(self.password_input));
 
-        // Runtime, saved, and reset mode sets. ModePacked occupies 44 bits;
-        // its eight-byte wire slots zero-extend the native packed value.
+        // Runtime, saved, and reset mode sets. The eight-byte wire slots
+        // zero-extend the native packed value.
         const mode_values = [_]terminal_modes.ModePacked{
             self.current_modes,
             self.saved_modes,
@@ -1219,7 +1221,7 @@ const test_header_fixture = test_fixture.parse(
 
 test "TERMINAL mode bit layout" {
     try std.testing.expectEqual(
-        @as(usize, 44),
+        @as(usize, 46),
         @bitSizeOf(terminal_modes.ModePacked),
     );
 
@@ -1228,8 +1230,8 @@ test "TERMINAL mode bit layout" {
     );
     first.disable_keyboard = true;
     try std.testing.expectEqual(
-        @as(u44, 1) << 0,
-        @as(u44, @bitCast(first)),
+        @as(ModeBits, 1) << 0,
+        @as(ModeBits, @bitCast(first)),
     );
 
     var visibility: terminal_modes.ModePacked = std.mem.zeroes(
@@ -1237,8 +1239,8 @@ test "TERMINAL mode bit layout" {
     );
     visibility.report_visibility = true;
     try std.testing.expectEqual(
-        @as(u44, 1) << 40,
-        @as(u44, @bitCast(visibility)),
+        @as(ModeBits, 1) << 40,
+        @as(ModeBits, @bitCast(visibility)),
     );
 
     var size_reports: terminal_modes.ModePacked = std.mem.zeroes(
@@ -1246,8 +1248,8 @@ test "TERMINAL mode bit layout" {
     );
     size_reports.in_band_size_reports = true;
     try std.testing.expectEqual(
-        @as(u44, 1) << 41,
-        @as(u44, @bitCast(size_reports)),
+        @as(ModeBits, 1) << 41,
+        @as(ModeBits, @bitCast(size_reports)),
     );
 
     var kitty_paste: terminal_modes.ModePacked = std.mem.zeroes(
@@ -1255,8 +1257,8 @@ test "TERMINAL mode bit layout" {
     );
     kitty_paste.kitty_paste_events = true;
     try std.testing.expectEqual(
-        @as(u44, 1) << 42,
-        @as(u44, @bitCast(kitty_paste)),
+        @as(ModeBits, 1) << 42,
+        @as(ModeBits, @bitCast(kitty_paste)),
     );
 
     var last: terminal_modes.ModePacked = std.mem.zeroes(
@@ -1264,9 +1266,14 @@ test "TERMINAL mode bit layout" {
     );
     last.win32_input = true;
     try std.testing.expectEqual(
-        @as(u44, 1) << 43,
-        @as(u44, @bitCast(last)),
+        @as(ModeBits, 1) << 43,
+        @as(ModeBits, @bitCast(last)),
     );
+
+    last.win32_input = false;
+    last.sixel_display_mode = true;
+    last.sixel_cursor_right = true;
+    try std.testing.expectEqual(@as(ModeBits, 3) << 44, @as(ModeBits, @bitCast(last)));
 }
 
 test "TERMINAL header golden encoding and decoding" {

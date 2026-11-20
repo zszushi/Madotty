@@ -1377,13 +1377,21 @@ pub const RenderState = struct {
                 assert(start.x <= end.x);
                 assert(start.y == end.y);
 
-                const start_x = if (start.x > 0 and
-                    start.rowAndCell().cell.wide == .spacer_tail)
-                    start.x - 1
+                const start_cell = start.rowAndCell().cell;
+                const start_x = if (start_cell.wide == .spacer_tail)
+                    start.x - (start_cell.sizedTailOffset() orelse 1)
                 else
                     start.x;
+                const end_cell = end.rowAndCell().cell;
+                const end_x = if (end_cell.sized != 0)
+                    if (page.Cell.sizedSpan(end.cells(.all), end.x)) |span|
+                        @as(size.CellCountInt, @intCast(span.end - 1))
+                    else
+                        end.x
+                else
+                    end.x;
 
-                sel_bounds.* = .{ start_x, end.x };
+                sel_bounds.* = .{ start_x, end_x };
             }
         }
 

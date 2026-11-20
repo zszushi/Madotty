@@ -124,6 +124,8 @@ pub const WM_USER: u32 = 0x0400;
 pub const WM_APP: u32 = 0x8000;
 pub const WM_QUIT: u32 = 0x0012;
 pub const WM_CLOSE: u32 = 0x0010;
+pub const WM_INITDIALOG: u32 = 0x0110;
+pub const WM_SYSCOMMAND: u32 = 0x0112;
 pub const WM_DESTROY: u32 = 0x0002;
 pub const PM_REMOVE: u32 = 0x0001;
 pub const WM_SIZE: u32 = 0x0005;
@@ -284,9 +286,14 @@ pub const WHEEL_DELTA: i16 = 120;
 
 // Show window commands
 pub const SW_HIDE: i32 = 0;
+pub const SW_SHOWMINIMIZED: i32 = 2;
 pub const SW_SHOW: i32 = 5;
+pub const SW_MINIMIZE: i32 = 6;
+pub const SW_SHOWMINNOACTIVE: i32 = 7;
+pub const SW_SHOWNA: i32 = 8;
 pub const SW_MAXIMIZE: i32 = 3;
 pub const SW_RESTORE: i32 = 9;
+pub const SW_FORCEMINIMIZE: i32 = 11;
 
 // Font weight constants
 pub const FW_NORMAL: i32 = 400;
@@ -343,6 +350,7 @@ pub const IDC_SIZENESW: usize = 32643;
 pub const IDC_SIZEWE: usize = 32644;
 pub const IDC_SIZENS: usize = 32645;
 pub const IDC_NO: usize = 32648;
+pub const IDC_HELP: usize = 32651;
 pub const IDC_HAND: usize = 32649;
 pub const IDC_APPSTARTING: usize = 32650;
 
@@ -467,6 +475,8 @@ pub const GetCursorPos_ = struct {
         lpPoint: *POINT,
     ) callconv(.winapi) i32;
 }.GetCursorPos;
+
+pub extern "user32" fn WindowFromPoint(point: POINT) callconv(.winapi) ?HWND;
 
 pub extern "user32" fn ScreenToClient(
     hWnd: HWND,
@@ -740,6 +750,7 @@ pub extern "kernel32" fn CloseHandle(
 // Stock object indices for GetStockObject
 pub const BLACK_BRUSH: i32 = 4;
 pub const DC_BRUSH: i32 = 18;
+pub const NULL_PEN: i32 = 8;
 
 pub extern "gdi32" fn GetStockObject(
     i: i32,
@@ -845,6 +856,8 @@ pub extern "kernel32" fn CompareStringOrdinal(
 pub const SS_CENTER: u32 = 0x0001;
 pub const SS_RIGHT: u32 = 0x0002;
 pub const SS_CENTERIMAGE: u32 = 0x0200;
+pub const SS_NOPREFIX: u32 = 0x0080;
+pub const SS_ENDELLIPSIS: u32 = 0x4000;
 
 // Edit control notification codes (high word of wParam in WM_COMMAND)
 pub const EN_CHANGE: u16 = 0x0300;
@@ -1140,6 +1153,12 @@ pub const DWMWA_COLOR_DEFAULT: u32 = 0xFFFFFFFF;
 pub const DWMWA_TEXT_COLOR: u32 = 36;
 /// Border color (Windows 11+). COLORREF 0x00BBGGRR.
 pub const DWMWA_BORDER_COLOR: u32 = 34;
+pub const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
+pub const DWM_SYSTEMBACKDROP_TYPE = enum(u32) {
+    none = 1,
+    main_window = 2,
+    transient_window = 3,
+};
 
 pub const MARGINS = extern struct {
     left: i32,
@@ -1174,12 +1193,17 @@ pub extern "gdi32" fn CreateCompatibleDC(hdc: ?HDC) callconv(.winapi) ?HDC;
 pub extern "gdi32" fn CreateCompatibleBitmap(hdc: HDC, cx: i32, cy: i32) callconv(.winapi) ?*anyopaque;
 pub extern "gdi32" fn SelectObject(hdc: HDC, h: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 pub extern "gdi32" fn DeleteDC(hdc: HDC) callconv(.winapi) i32;
+pub extern "gdi32" fn GdiFlush() callconv(.winapi) i32;
 pub extern "gdi32" fn BitBlt(hdcDest: HDC, x: i32, y: i32, cx: i32, cy: i32, hdcSrc: HDC, x1: i32, y1: i32, rop: u32) callconv(.winapi) i32;
 // DrawTextW is exported by user32.dll, not gdi32.dll. The previous
 // declaration on gdi32 worked only because user32 was linked anyway.
 pub extern "user32" fn DrawTextW(hdc: HDC, lpchText: [*]const u16, cchText: i32, lprc: *RECT, format: u32) callconv(.winapi) i32;
 pub extern "gdi32" fn SetBkMode(hdc: HDC, mode: i32) callconv(.winapi) i32;
 pub extern "gdi32" fn CreatePen(iStyle: i32, cWidth: i32, color: u32) callconv(.winapi) ?*anyopaque;
+pub extern "gdi32" fn RoundRect(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, width: i32, height: i32) callconv(.winapi) i32;
+pub extern "gdi32" fn SaveDC(hdc: HDC) callconv(.winapi) i32;
+pub extern "gdi32" fn RestoreDC(hdc: HDC, saved: i32) callconv(.winapi) i32;
+pub extern "gdi32" fn IntersectClipRect(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32) callconv(.winapi) i32;
 pub extern "gdi32" fn MoveToEx(hdc: HDC, x: i32, y: i32, lppt: ?*anyopaque) callconv(.winapi) i32;
 pub extern "gdi32" fn LineTo(hdc: HDC, x: i32, y: i32) callconv(.winapi) i32;
 
@@ -1203,6 +1227,8 @@ pub const DT_VCENTER: u32 = 4;
 pub const DT_SINGLELINE: u32 = 32;
 pub const DT_END_ELLIPSIS: u32 = 0x8000;
 pub const DT_NOPREFIX: u32 = 0x800;
+pub const DT_RIGHT: u32 = 0x0002;
+pub const DT_CALCRECT: u32 = 0x0400;
 
 pub extern "gdi32" fn ChoosePixelFormat(
     hdc: HDC,
@@ -1267,6 +1293,11 @@ pub const TPM_TOPALIGN: u32 = 0x0000;
 pub const TPM_RETURNCMD: u32 = 0x0100;
 
 pub extern "user32" fn CreatePopupMenu() callconv(.winapi) ?HMENU;
+pub extern "user32" fn GetSystemMenu(hwnd: HWND, revert: i32) callconv(.winapi) ?HMENU;
+pub extern "kernel32" fn GetSystemDirectoryW(buffer: [*]u16, capacity: u32) callconv(.winapi) u32;
+pub extern "user32" fn DialogBoxParamW(instance: HINSTANCE, template: [*:0]const u16, owner: ?HWND, proc: *const fn (HWND, u32, usize, isize) callconv(.winapi) isize, param: isize) callconv(.winapi) isize;
+pub extern "user32" fn EndDialog(hwnd: HWND, result: isize) callconv(.winapi) i32;
+pub extern "user32" fn GetDlgItem(hwnd: HWND, id: i32) callconv(.winapi) ?HWND;
 
 pub extern "user32" fn AppendMenuW(
     hMenu: HMENU,
@@ -1516,6 +1547,7 @@ pub extern "advapi32" fn RegCloseKey(hKey: HKEY) callconv(.winapi) u32;
 // -----------------------------------------------------------------------
 
 pub const WM_SETTINGCHANGE: u32 = 0x001A;
+pub const WM_DWMCOMPOSITIONCHANGED: u32 = 0x031E;
 pub const WM_SHOWWINDOW: u32 = 0x0018;
 
 // -----------------------------------------------------------------------
@@ -1568,6 +1600,7 @@ pub const CLSCTX_INPROC_SERVER: u32 = 0x1;
 pub const COINIT_APARTMENTTHREADED: u32 = 0x2;
 
 pub extern "ole32" fn CoInitializeEx(pvReserved: ?*anyopaque, dwCoInit: u32) callconv(.winapi) HRESULT;
+pub extern "ole32" fn CoUninitialize() callconv(.winapi) void;
 pub extern "ole32" fn CoCreateInstance(
     rclsid: *const GUID,
     pUnkOuter: ?*anyopaque,

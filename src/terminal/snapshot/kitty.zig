@@ -271,8 +271,12 @@
 //! end +------------------------------------+
 //! ```
 //!
-//! Placement ID tags are 0 internal and 1 external. Location kinds and their
-//! locations are:
+//! Placement ID tags are 0 internal and 1 external. In the placement key,
+//! bit 7 makes the columns/rows fields an exact physical pixel size instead.
+//! Older readers skip these placements as unknown IDs without losing record
+//! alignment. Parent references retain the original ID tags.
+//!
+//! Location kinds and their locations are:
 //!
 //! - 0 pin: in KITTY_IMAGE_STORAGE, page index within the screen's SCREEN
 //!   sequence (u16), then y (u16) and x (u16) within that page. In
@@ -1067,9 +1071,12 @@ const PinContext = union(enum) {
     page,
 };
 
-fn encodePlacementKey(writer: *std.Io.Writer, key: PlacementKey) !void {
+const pixel_placement_flag = 0x80;
+
+fn encodePlacementKey(writer: *std.Io.Writer, key: PlacementKey, pixel_size: bool) !void {
     try io.writeInt(writer, u32, key.image_id);
-    try writer.writeByte(@backingInt(key.placement_id.tag));
+    const tag: u8 = @backingInt(key.placement_id.tag);
+    try writer.writeByte(tag | if (pixel_size) @as(u8, pixel_placement_flag) else 0);
     try io.writeInt(writer, u32, key.placement_id.id);
 }
 
@@ -1079,7 +1086,8 @@ fn encodePlacement(
     context: PinContext,
 ) !void {
     const p = planned.placement;
-    try encodePlacementKey(writer, planned.key);
+    const pixel_size = p.destination_width > 0 and p.destination_height > 0;
+    try encodePlacementKey(writer, planned.key, pixel_size);
     switch (p.location) {
         .pin => |pin| {
             try writer.writeByte(0);
@@ -1097,7 +1105,7 @@ fn encodePlacement(
         .virtual => try writer.writeByte(1),
         .relative => |rel| {
             try writer.writeByte(2);
-            try encodePlacementKey(writer, rel.parent);
+            try encodePlacementKey(writer, rel.parent, false);
             try io.writeInt(writer, i32, rel.horizontal_offset);
             try io.writeInt(writer, i32, rel.vertical_offset);
         },
@@ -1108,8 +1116,8 @@ fn encodePlacement(
     try io.writeInt(writer, u32, p.source_y);
     try io.writeInt(writer, u32, p.source_width);
     try io.writeInt(writer, u32, p.source_height);
-    try io.writeInt(writer, u32, p.columns);
-    try io.writeInt(writer, u32, p.rows);
+    try io.writeInt(writer, u32, if (pixel_size) p.destination_width else p.columns);
+    try io.writeInt(writer, u32, if (pixel_size) p.destination_height else p.rows);
     try io.writeInt(writer, i32, p.z);
 }
 
@@ -1504,9 +1512,13 @@ const DecodedPlacement = struct {
         invalid,
     };
 
-    fn decodePlacementKey(reader: *std.Io.Reader) DecodeError!?PlacementKey {
+    fn decodePlacementKey(reader: *std.Io.Reader, pixel_size: ?*bool) DecodeError!?PlacementKey {
         const image_id = try io.readInt(reader, u32);
-        const tag_raw = try reader.takeByte();
+        var tag_raw = try reader.takeByte();
+        if (pixel_size) |flag| {
+            flag.* = (tag_raw & pixel_placement_flag) != 0;
+            tag_raw &= ~@as(u8, pixel_placement_flag);
+        }
         const id = try io.readInt(reader, u32);
         const tag: @FieldType(PlacementId, "tag") = switch (tag_raw) {
             0 => .internal,
@@ -1525,7 +1537,8 @@ const DecodedPlacement = struct {
         reader: *std.Io.Reader,
         context: std.meta.Tag(PinContext),
     ) DecodeError!DecodedPlacement {
-        const key = try decodePlacementKey(reader);
+        var pixel_size = false;
+        const key = try decodePlacementKey(reader, &pixel_size);
         const location: Location = switch (try reader.takeByte()) {
             0 => .{ .pin = .{
                 .page = switch (context) {
@@ -1540,7 +1553,7 @@ const DecodedPlacement = struct {
                 .page => .invalid,
             },
             2 => relative: {
-                const parent = try decodePlacementKey(reader);
+                const parent = try decodePlacementKey(reader, null);
                 const horizontal = try io.readInt(reader, i32);
                 const vertical = try io.readInt(reader, i32);
                 break :relative if (parent) |p| .{ .relative = .{
@@ -1552,7 +1565,7 @@ const DecodedPlacement = struct {
             else => .invalid,
         };
 
-        return .{
+        var decoded: DecodedPlacement = .{
             .key = key,
             .location = location,
             .placement = .{
@@ -1568,6 +1581,18 @@ const DecodedPlacement = struct {
                 .z = try io.readInt(reader, i32),
             },
         };
+        if (pixel_size) {
+            const p = &decoded.placement;
+            if (p.columns == 0 or p.rows == 0) {
+                decoded.key = null;
+            } else {
+                p.destination_width = p.columns;
+                p.destination_height = p.rows;
+                p.columns = 0;
+                p.rows = 0;
+            }
+        }
+        return decoded;
     }
 
     /// Insert the placement with its exact key. It is left out if its key
@@ -2166,6 +2191,8 @@ fn expectStorageEqual(
         try testing.expectEqual(e.source_x, a.source_x);
         try testing.expectEqual(e.source_y, a.source_y);
         try testing.expectEqual(e.source_width, a.source_width);
+        try testing.expectEqual(e.destination_width, a.destination_width);
+        try testing.expectEqual(e.destination_height, a.destination_height);
         try testing.expectEqual(e.source_height, a.source_height);
         try testing.expectEqual(e.columns, a.columns);
         try testing.expectEqual(e.rows, a.rows);
@@ -2284,6 +2311,40 @@ fn testVirtualTerminal() !Terminal {
     try t.setAttribute(.{ .@"256_fg" = 3 });
     try t.printString("\u{10EEEE}\u{0305}\u{0305}\u{10EEEE}\u{0305}\u{030D}");
     return t;
+}
+
+test "OSC 1337 exact placement size round trips without changing record alignment" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+    const pin = t.screens.active.cursor.page_pin;
+    const pixel_placement: Placement = .{
+        .location = .{ .pin = pin },
+        .destination_width = 17,
+        .destination_height = 23,
+    };
+    const cell_placement: Placement = .{ .location = .{ .pin = pin }, .columns = 4, .rows = 3 };
+    const pixel_key: PlacementKey = .{ .image_id = 7, .placement_id = .{ .tag = .internal, .id = 9 } };
+    const cell_key: PlacementKey = .{ .image_id = 8, .placement_id = .{ .tag = .external, .id = 3 } };
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try encodePlacement(&writer, .{ .key = pixel_key, .placement = &pixel_placement, .root = null, .depth = 0 }, .page);
+    try encodePlacement(&writer, .{ .key = cell_key, .placement = &cell_placement, .root = null, .depth = 0 }, .page);
+
+    const bytes = writer.buffered();
+    try testing.expectEqual(@as(u8, pixel_placement_flag), bytes[4]);
+    var reader: std.Io.Reader = .fixed(bytes);
+    const decoded_pixels = try DecodedPlacement.decode(&reader, .page);
+    const decoded_cells = try DecodedPlacement.decode(&reader, .page);
+    try testing.expectEqual(pixel_key, decoded_pixels.key.?);
+    try testing.expectEqual(@as(u32, 17), decoded_pixels.placement.destination_width);
+    try testing.expectEqual(@as(u32, 23), decoded_pixels.placement.destination_height);
+    try testing.expectEqual(@as(u32, 0), decoded_pixels.placement.columns);
+    try testing.expectEqual(@as(u32, 0), decoded_pixels.placement.rows);
+    try testing.expectEqual(cell_key, decoded_cells.key.?);
+    try testing.expectEqual(@as(u32, 4), decoded_cells.placement.columns);
+    try testing.expectEqual(@as(u32, 3), decoded_cells.placement.rows);
+    try testing.expectEqual(@as(u32, 0), decoded_cells.placement.destination_width);
 }
 
 test "golden snapshot with a virtual placement" {

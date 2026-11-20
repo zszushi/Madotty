@@ -433,12 +433,15 @@ pub const Face = struct {
         self.ft_mutex.lockUncancelable(global.io());
         defer self.ft_mutex.unlock(global.io());
 
-        // Load the glyph.
-        try self.face.loadGlyph(glyph_index, self.glyphLoadFlags(opts.constraint.doesAnything()));
+        // Layered color glyphs (COLR) may have an empty base outline.
+        // Composite their layers before taking bounds and fitting to the cell.
+        var flags = self.glyphLoadFlags(opts.constraint.doesAnything());
+        flags.render = atlas.format == .bgra and flags.color;
+        try self.face.loadGlyph(glyph_index, flags);
         const glyph = self.face.handle.*.glyph;
 
         // For synthetic bold, we embolden the glyph.
-        if (self.synthetic.bold) {
+        if (self.synthetic.bold and glyph.*.format == freetype.c.FT_GLYPH_FORMAT_OUTLINE) {
             // We need to scale the embolden amount based on the font size.
             // This is a heuristic I found worked well across a variety of
             // founts: 1 pixel per 64 units of height.
@@ -450,7 +453,13 @@ pub const Face = struct {
 
         // We get a rect that represents the position
         // and size of the glyph before constraints.
-        const rect = getGlyphSize(glyph);
+        const rect: font.Glyph.Size = if (glyph.*.format == freetype.c.FT_GLYPH_FORMAT_BITMAP and
+            glyph.*.bitmap.pixel_mode == freetype.c.FT_PIXEL_MODE_BGRA) .{
+            .x = @floatFromInt(glyph.*.bitmap_left),
+            .y = @as(f64, @floatFromInt(glyph.*.bitmap_top)) - @as(f64, @floatFromInt(glyph.*.bitmap.rows)),
+            .width = @floatFromInt(glyph.*.bitmap.width),
+            .height = @floatFromInt(glyph.*.bitmap.rows),
+        } else getGlyphSize(glyph);
 
         // If our glyph is smaller than a quarter pixel in either axis
         // then it has no outlines or they're too small to render.

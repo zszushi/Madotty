@@ -474,6 +474,44 @@ pub const ImageStorage = struct {
         gop.value_ptr.transmission = self.generation;
     }
 
+    /// Store a decoded Sixel at native size. A subsequent opaque bitmap at
+    /// the same origin can replace an older bitmap it completely covers.
+    /// This keeps applications redrawing a chart from stacking old frames.
+    pub fn addSixel(
+        self: *ImageStorage,
+        io: std.Io,
+        alloc: Allocator,
+        screen: *terminal.Screen,
+        image: Image,
+        placement: Placement,
+        opaque_background: bool,
+    ) !void {
+        try self.placements.ensureUnusedCapacity(alloc, 1);
+        try self.addImage(io, alloc, screen, image);
+        // Capacity is reserved and a new image has no other placements.
+        self.addPlacement(io, alloc, screen, image.id, 0, placement) catch unreachable;
+
+        if (!opaque_background) return;
+        const origin = placement.location.pin;
+        const rect = placement.sourceRect(image);
+        var removed = false;
+        var it = self.placements.iterator();
+        while (it.next()) |entry| {
+            const id = entry.key_ptr.image_id;
+            if (id == image.id or entry.value_ptr.location != .pin) continue;
+            const pin = entry.value_ptr.location.pin;
+            if (pin.node != origin.node or pin.y != origin.y or pin.x != origin.x) continue;
+            const previous = self.images.get(id).?;
+            if (!previous.metadata.sixel) continue;
+            const previous_rect = entry.value_ptr.sourceRect(previous);
+            if (previous_rect.width > rect.width or previous_rect.height > rect.height) continue;
+            self.removePlacement(screen, entry);
+            self.deleteIfUnused(alloc, id);
+            removed = true;
+        }
+        if (removed) _ = self.removeOrphans(screen, alloc);
+    }
+
     /// Add an image whose pixels have not arrived yet. `img.data` must be
     /// `.pending` with the length of the decoded pixels. Returns the
     /// ticket to attach those pixels later. See `PendingImage`.
@@ -1980,6 +2018,10 @@ pub const ImageStorage = struct {
         /// The columns/rows this image occupies.
         columns: u32 = 0,
         rows: u32 = 0,
+        /// An explicit destination size in physical pixels, used by inline
+        /// images whose dimensions need not be a whole number of cells.
+        destination_width: u32 = 0,
+        destination_height: u32 = 0,
 
         /// The z-index for this placement.
         z: i32 = 0,
@@ -2107,6 +2149,11 @@ pub const ImageStorage = struct {
             const width = source.width;
             const height = source.height;
 
+            if (self.destination_width > 0 and self.destination_height > 0) return .{
+                .width = if (width > 0) self.destination_width else 0,
+                .height = if (height > 0) self.destination_height else 0,
+            };
+
             // If we don't have any specified cols or rows then the placement
             // should be the native size of the image, and doesn't need to be
             // re-scaled.
@@ -2181,7 +2228,8 @@ pub const ImageStorage = struct {
             rows: u32,
         } {
             // If we have a specified columns and rows then this is trivial.
-            if (self.columns > 0 and self.rows > 0) return .{
+            if (self.destination_width == 0 and self.destination_height == 0 and
+                self.columns > 0 and self.rows > 0) return .{
                 .cols = self.columns,
                 .rows = self.rows,
             };
@@ -2223,6 +2271,18 @@ pub const ImageStorage = struct {
         ) bool {
             assert(count > 0 and count < span);
             const src = self.sourceRect(image);
+            if (self.destination_height > 0) {
+                const pixels = saturatingMul(t.height_px / t.rows, count) -| self.cellOffset(t).y;
+                if (src.height == 0 or pixels >= self.destination_height) return false;
+                const crop: u32 = @intCast(@as(u64, src.height) * pixels / self.destination_height);
+                self.source_x = src.x;
+                self.source_y = src.y + crop;
+                self.source_width = src.width;
+                self.source_height = src.height - crop;
+                self.destination_height -= pixels;
+                self.y_offset = 0;
+                return true;
+            }
             const crop: u32 = if (self.rows > 0)
                 // Scaled placement: each grid row shows an equal
                 // fraction of the source.
@@ -2254,7 +2314,13 @@ pub const ImageStorage = struct {
             // guarantees we never store an explicit zero source height,
             // which would be reinterpreted as "full image".
             if (src.height == 0) return false;
-            if (self.rows > 0) {
+            if (self.destination_height > 0) {
+                const visible = saturatingMul(t.height_px / t.rows, span - count) -| self.cellOffset(t).y;
+                const height = @min(self.destination_height, visible);
+                if (height == 0) return false;
+                self.source_height = @max(1, scaleDimension(height, src.height, self.destination_height));
+                self.destination_height = height;
+            } else if (self.rows > 0) {
                 const crop: u32 = @intCast(@as(u64, src.height) * count / span);
                 if (crop >= src.height) return false;
                 self.source_height = src.height - crop;

@@ -22,13 +22,13 @@ class WindowsPackage(unittest.TestCase):
         self.root = Path(self.temp.name) / "checkout"
         self.scripts = self.root / "dist/windows"
         self.scripts.mkdir(parents=True)
-        for name in ("package.sh", "verify-build.ps1"):
+        for name in ("package.sh", "verify-build.ps1", "portable-readme.txt"):
             shutil.copy2(REPO / "dist/windows" / name, self.scripts / name)
         (self.root / "LICENSE").write_text("fixture license")
         (self.root / ".gitignore").write_text("zig-out/\ndist/windows/_stage/\ndist/windows/*.zip\n")
         self.payload = self.root / "zig-out"
         self.files = (
-            "bin/ghostty.exe", "bin/conpty.dll", "bin/OpenConsole.exe",
+            "bin/ghostty.exe", "bin/ghostty.com", "bin/conpty.dll", "bin/OpenConsole.exe",
             "share/terminfo/ghostty.terminfo", "share/licenses/conpty/LICENSE.txt",
             "share/ghostty/themes/Fixture Theme",
             "share/ghostty/shell-integration/powershell/ghostty-shell-integration.ps1",
@@ -110,6 +110,16 @@ class WindowsPackage(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("semantic executable version", result.stderr)
         self.assertFalse(list(self.scripts.glob("*.zip")))
+
+    def test_full_package_requires_both_prefix_and_dxc(self):
+        for option in ("--full-build=custom-prefix", "--dxc-dir=custom-dxc"):
+            with self.subTest(option=option):
+                result = self.package(option)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("requires both", result.stderr)
+        result = self.package("--full-build=custom-prefix", "--dxc-dir=custom-dxc")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Building ghostty", result.stdout)
 
     def test_release_requires_exact_annotated_tag_and_clean_tree(self):
         result = self.package("--release")

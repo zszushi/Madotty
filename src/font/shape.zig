@@ -4,6 +4,7 @@ const run = @import("shaper/run.zig");
 const feature = @import("shaper/feature.zig");
 const configpkg = @import("../config.zig");
 const terminal = @import("../terminal/main.zig");
+const unicode = @import("../unicode/main.zig");
 const SharedGrid = @import("main.zig").SharedGrid;
 pub const noop = @import("shaper/noop.zig");
 pub const harfbuzz = @import("shaper/harfbuzz.zig");
@@ -84,6 +85,10 @@ pub const RunOptions = struct {
     /// null.
     cursor_x: ?usize = null,
 
+    /// Explicit-width text may use the configured text ligatures; the
+    /// surrounding fixed grid retains its usual breaks.
+    allow_text_ligatures: bool = false,
+
     /// Apply the font break configuration to the run.
     pub fn applyBreakConfig(
         self: *RunOptions,
@@ -92,6 +97,74 @@ pub const RunOptions = struct {
         if (!config.cursor) self.cursor_x = null;
     }
 };
+
+/// Reusable shaping input for one horizontal OSC 66 block. The renderer
+/// clips the last cluster if its natural width exceeds the explicit width.
+pub const SizedCells = struct {
+    codepoints: std.ArrayList(u21) = .empty,
+    cells: std.MultiArrayList(terminal.RenderState.Cell) = .empty,
+
+    pub fn deinit(self: *SizedCells, alloc: std.mem.Allocator) void {
+        self.codepoints.deinit(alloc);
+        self.cells.deinit(alloc);
+    }
+
+    pub fn build(
+        self: *SizedCells,
+        alloc: std.mem.Allocator,
+        head: terminal.page.Cell,
+        extra: []const u21,
+        style: terminal.Style,
+        width: u3,
+    ) std.mem.Allocator.Error!std.MultiArrayList(terminal.RenderState.Cell).Slice {
+        self.codepoints.clearRetainingCapacity();
+        self.cells.clearRetainingCapacity();
+        try self.codepoints.ensureUnusedCapacity(alloc, extra.len + 1);
+        self.codepoints.appendAssumeCapacity(head.codepoint());
+        self.codepoints.appendSliceAssumeCapacity(extra);
+        // A two-cell glyph may start in the last visible column.
+        try self.cells.ensureUnusedCapacity(alloc, @as(usize, width) + 1);
+
+        var remaining: []const u21 = self.codepoints.items;
+        while (remaining.len != 0 and self.cells.len < width) {
+            const cluster = unicode.graphemeWidth(u21, remaining);
+            const wide = cluster.width == 2;
+            self.cells.appendAssumeCapacity(.{
+                .raw = .{
+                    .content = .{ .codepoint = .{ .data = remaining[0] } },
+                    .content_tag = if (cluster.len == 1) .codepoint else .codepoint_grapheme,
+                    .style_id = head.style_id,
+                    .wide = if (wide) .wide else .narrow,
+                },
+                .grapheme = remaining[1..cluster.len],
+                .style = style,
+            });
+            if (wide) self.cells.appendAssumeCapacity(.{
+                .raw = .{ .wide = .spacer_tail },
+                .grapheme = &.{},
+                .style = .{},
+            });
+            remaining = remaining[cluster.len..];
+        }
+        return self.cells.slice();
+    }
+};
+
+test "OSC 66 shaping input preserves clusters and clips after the last fitting start" {
+    var cells: SizedCells = .{};
+    defer cells.deinit(std.testing.allocator);
+    const head: terminal.page.Cell = .{ .content = .{ .codepoint = .{ .data = 'f' } } };
+    const abc = try cells.build(std.testing.allocator, head, &.{ 'f', 'i', '!' }, .{}, 3);
+    try std.testing.expectEqual(3, abc.len);
+    try std.testing.expectEqual('f', abc.items(.raw)[1].codepoint());
+    try std.testing.expectEqual('i', abc.items(.raw)[2].codepoint());
+
+    const mixed = try cells.build(std.testing.allocator, head, &.{ 0x0301, 0x1f469, 0x200d, 0x1f4bb, '!' }, .{}, 2);
+    try std.testing.expectEqual(3, mixed.len);
+    try std.testing.expectEqualSlices(u21, &.{0x0301}, mixed.items(.grapheme)[0]);
+    try std.testing.expectEqualSlices(u21, &.{ 0x200d, 0x1f4bb }, mixed.items(.grapheme)[1]);
+    try std.testing.expectEqual(.spacer_tail, mixed.items(.raw)[2].wide);
+}
 
 test {
     _ = Cache;

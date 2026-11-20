@@ -1,6 +1,6 @@
 .{
     .name = .ghostty,
-    .version = "1.4.0",
+    .version = "1.4.1",
     .paths = .{""},
     .fingerprint = 0x64407a2a0b4147e5,
     .minimum_zig_version = "0.17.0",
@@ -12,6 +12,12 @@
         // Windows console host redistributable. Its native helper fetches the
         // pinned NuGet ZIP, whose .nupkg suffix Zig cannot unpack directly.
         .conpty = .{ .path = "./pkg/conpty", .lazy = true },
+
+        .vulkan_headers = .{
+            .url = "https://codeload.github.com/KhronosGroup/Vulkan-Headers/tar.gz/refs/tags/v1.3.296",
+            .hash = "N-V-__8AANZErwH8FRRaqLabtE0MmFySzqoWgGcn1-AKo1Bh",
+            .lazy = true,
+        },
 
         // Zig libs
         .libxev = .{

@@ -29,6 +29,8 @@ pub const Size = struct {
     screen: ScreenSize,
     cell: CellSize,
     padding: Padding,
+    /// Physical pixels per logical point, for reporting cell dimensions.
+    pixels_per_point: f32 = 1,
 
     /// Return the grid size for this size. The grid size is calculated by
     /// taking the screen size, removing padding, and dividing by the cell

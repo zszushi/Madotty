@@ -11,8 +11,12 @@ exe: *std.Build.Step.Compile,
 install_step: *std.Build.Step.InstallArtifact,
 
 pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty {
+    return initNamed(b, cfg, deps, "ghostty");
+}
+
+fn initNamed(b: *std.Build, cfg: *const Config, deps: *const SharedDeps, name: []const u8) !Ghostty {
     const exe: *std.Build.Step.Compile = b.addExecutable(.{
-        .name = "ghostty",
+        .name = name,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = cfg.target,
@@ -72,6 +76,21 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
     };
 }
 
+pub fn installWindowsRenderer(
+    b: *std.Build,
+    deps: *const SharedDeps,
+    backend: @import("../renderer/backend.zig").Backend,
+) !void {
+    const name = switch (backend) {
+        .d3d12 => "ghostty-d3d12",
+        .vulkan => "ghostty-vulkan",
+        else => unreachable,
+    };
+    const alternate = try deps.changeRenderer(b, backend);
+    const exe = try initNamed(b, alternate.config, &alternate, name);
+    b.getInstallStep().dependOn(&exe.install_step.step);
+}
+
 /// Add the ghostty exe to the install target.
 pub fn install(self: *const Ghostty) void {
     const b = self.install_step.step.owner;
@@ -79,6 +98,20 @@ pub fn install(self: *const Ghostty) void {
 
     const target = self.exe.root_module.resolved_target.?;
     if (target.result.os.tag == .windows) {
+        const console = b.addExecutable(.{
+            .name = "ghostty-console",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main_windows_console.zig"),
+                .target = target,
+                .optimize = .ReleaseSmall,
+                .strip = true,
+            }),
+        });
+        console.subsystem = .console;
+        b.getInstallStep().dependOn(&b.addInstallArtifact(console, .{
+            .dest_sub_path = "ghostty.com",
+        }).step);
+
         // Copy Microsoft's matching runtime pair; loading it dynamically
         // keeps GNU cross-builds independent of MSVC import libraries.
         const conpty = b.lazyDependency("conpty", .{ .target = target }) orelse return;

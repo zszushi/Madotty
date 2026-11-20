@@ -4,6 +4,8 @@ const Allocator = std.mem.Allocator;
 const Parser = @import("Parser.zig");
 const UTF8Decoder = @import("UTF8Decoder.zig");
 
+pub const SixelString = enum { inactive, active, escape };
+
 /// Errors possible while validating a snapshot continuation.
 pub const ValidateError = error{
     /// Nonempty input left both the VT parser and UTF-8 decoder at ground.
@@ -88,7 +90,9 @@ pub fn validate(bytes: []const u8) ValidateError!void {
     // It also can't be byte zero, because a Stream at ground reads C1 bytes
     // as UTF-8 text, so there is always extra input before it.
     if (c1_restart) return error.NonCanonicalContinuation;
-    const replay_start = if (scanner.parser.state != .ground)
+    const replay_start = if (scanner.sixel_string == .escape)
+        findVTReplayStart(bytes[0 .. bytes.len - 1])
+    else if (scanner.parser.state != .ground)
         findVTReplayStart(bytes)
     else
         findUtf8ReplayStart(bytes);
@@ -178,7 +182,7 @@ pub const Tracker = struct {
     /// parser is outside ground the unfinished state is an escape sequence.
     /// When it is grounded, only the UTF-8 decoder can be unfinished, with
     /// an incomplete codepoint ending the feed.
-    pub const Pending = enum { vt, utf8 };
+    pub const Pending = enum { vt, vt_sixel_end, utf8 };
 
     /// Retain the part of `input` needed to replay a feed that ended with
     /// `pending` state unfinished.
@@ -191,6 +195,8 @@ pub const Tracker = struct {
     pub fn append(self: *Tracker, pending: Pending, input: []const u8) void {
         const start = switch (pending) {
             .vt => findVTReplayStart(input),
+            // The ESC prefix of ST still belongs to the in-progress bitmap.
+            .vt_sixel_end => findVTReplayStart(input[0..input.len -| 1]),
             .utf8 => findUtf8ReplayStart(input),
         } orelse {
             self.extend(input);
@@ -395,6 +401,7 @@ fn findUtf8ReplayStart(input: []const u8) ?usize {
 const BoundaryScanner = struct {
     parser: Parser,
     utf8decoder: UTF8Decoder,
+    sixel_string: SixelString = .inactive,
 
     /// Set by each call to `next`. It is non-null when that byte was an
     /// 8-bit C1 introducer that started a new sequence and discarded the
@@ -464,6 +471,8 @@ const BoundaryScanner = struct {
                 break :committed committed;
             }
 
+            const finished_sixel = self.sixel_string == .escape and c == '\\';
+            if (self.sixel_string == .escape) self.sixel_string = .inactive;
             const actions = self.parser.next(c);
 
             // Check whether this byte is a C1 introducer that started a new
@@ -498,7 +507,15 @@ const BoundaryScanner = struct {
                 switch (action) {
                     // These actions only build standard handler state. Their
                     // matching end/unhook actions are committed work.
-                    .dcs_hook,
+                    .dcs_hook => |dcs| self.sixel_string = if (dcs.isSixel()) .active else .inactive,
+                    .dcs_unhook => {
+                        if (self.sixel_string == .active and c == 0x1B) {
+                            self.sixel_string = .escape;
+                        } else {
+                            self.sixel_string = .inactive;
+                            break :committed true;
+                        }
+                    },
                     .dcs_put,
                     .apc_start,
                     .apc_put,
@@ -507,7 +524,7 @@ const BoundaryScanner = struct {
                 }
             }
 
-            break :committed false;
+            break :committed finished_sixel;
         };
 
         if (!committed) return .uncommitted;
@@ -570,7 +587,7 @@ test "boundary scanner preserves unfinished builder actions" {
     var dcs: BoundaryScanner = .init();
     try testing.expectEqual(BoundaryScanner.Effect.uncommitted, dcs.next(0x1B));
     try testing.expectEqual(BoundaryScanner.Effect.uncommitted, dcs.next('P'));
-    try testing.expectEqual(BoundaryScanner.Effect.uncommitted, dcs.next('q'));
+    try testing.expectEqual(BoundaryScanner.Effect.uncommitted, dcs.next('p'));
     try testing.expectEqual(BoundaryScanner.Effect.uncommitted, dcs.next('x'));
     try testing.expectEqual(BoundaryScanner.Effect.committed, dcs.next(0x1B));
 }
@@ -617,6 +634,21 @@ test "findVTReplayStart finds the latest ESC across vector boundaries" {
             try testing.expectEqual(@as(?usize, idx), findVTReplayStart(&buf));
         }
     }
+}
+
+test "sixel continuation retains the bitmap while waiting for the end of ST" {
+    const testing = std.testing;
+    const image = "\x1bPq\"1;1;6;6!6~";
+    var tracker: Tracker = .init(testing.allocator, 256);
+    defer tracker.deinit();
+    tracker.append(.vt, image);
+    tracker.append(.vt_sixel_end, "\x1b");
+    var storage: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&storage);
+    try tracker.write(&writer);
+    try testing.expectEqualStrings(image ++ "\x1b", writer.buffered());
+    try validate(writer.buffered());
+    try testing.expectError(error.NoPendingState, validate(image ++ "\x1b\\"));
 }
 
 test "findUtf8ReplayStart finds the pending lead byte" {

@@ -60,11 +60,11 @@ pub const RunIterator = struct {
             break :max 0;
         };
 
-        // Invisible cells don't have any glyphs rendered,
-        // so we explicitly skip them in the shaping process.
+        // The renderer shapes explicit-width blocks in isolation. Invisible
+        // cells also do not contribute a glyph to a normal shaping run.
         while (self.i < max and
-            (cells[self.i].hasStyling() and
-                styles[self.i].flags.invisible)) self.i += 1;
+            (cells[self.i].sized != 0 or (cells[self.i].hasStyling() and
+                styles[self.i].flags.invisible))) self.i += 1;
 
         // We're over at the max
         if (self.i >= max) return null;
@@ -90,6 +90,7 @@ pub const RunIterator = struct {
             // row produce the same hash, enabling cache reuse.
             const cluster = j - self.i;
             const cell: *const terminal.page.Cell = &cells[j];
+            if (cell.sized != 0) break;
 
             // If we have a selection and we're at a boundary point, then
             // we break the run here.
@@ -123,13 +124,13 @@ pub const RunIterator = struct {
                         // fl, fi
                         'f' => {
                             const cp = cell.codepoint();
-                            if (cp == 'l' or cp == 'i') break;
+                            if ((cp == 'l' or cp == 'i') and !self.opts.allow_text_ligatures) break;
                         },
 
                         // st
                         's' => {
                             const cp = cell.codepoint();
-                            if (cp == 't') break;
+                            if (cp == 't' and !self.opts.allow_text_ligatures) break;
                         },
 
                         else => {},

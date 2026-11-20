@@ -1,0 +1,3 @@
+// Madotty's proxy factory uses its own CLSID. The interface IIDs remain the
+// Windows Terminal wire identifiers.
+#define PROXY_CLSID_IS {0x9c11cdbc, 0xc14f, 0x4c6d, {0xac, 0x73, 0x31, 0x10, 0xba, 0xd9, 0xdc, 0xa6}}

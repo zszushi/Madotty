@@ -5,6 +5,7 @@
 #   ./dist/windows/package.sh              # fast, x86_64
 #   ./dist/windows/package.sh debug        # Debug build (Console subsystem)
 #   ./dist/windows/package.sh --release    # exact, clean annotated win-vX.Y.Z
+#   ./dist/windows/package.sh --full-build=<published-prefix> --dxc-dir=<distribution>
 #
 # Output: dist/windows/ghostty-windows-x64-<version>.zip
 
@@ -14,11 +15,17 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 OPTIMIZE=fast
 RELEASE=false
+FULL_BUILD=
+DXC_DIR=
+HANDOFF_DIR=
 for arg in "$@"; do
     case "$arg" in
         fast|debug|safe|small) OPTIMIZE="$arg" ;;
         --release) RELEASE=true ;;
-        *) echo "Usage: bash dist/windows/package.sh [fast|debug|safe|small] [--release]" >&2; exit 2 ;;
+        --full-build=?*) FULL_BUILD="${arg#*=}" ;;
+        --dxc-dir=?*) DXC_DIR="${arg#*=}" ;;
+        --handoff-dir=?*) HANDOFF_DIR="${arg#*=}" ;;
+        *) echo "Usage: bash dist/windows/package.sh [fast|debug|safe|small] [--release] [--full-build=<prefix> --dxc-dir=<distribution>]" >&2; exit 2 ;;
     esac
 done
 
@@ -57,10 +64,23 @@ windows_path() {
     fi
 }
 
+if [ -n "$FULL_BUILD" ] || [ -n "$DXC_DIR" ] || [ -n "$HANDOFF_DIR" ]; then
+    if [ -z "$FULL_BUILD" ] || [ -z "$DXC_DIR" ]; then
+        echo 'The full portable package requires both --full-build and --dxc-dir.' >&2
+        exit 2
+    fi
+    version_args=()
+    if [ "$RELEASE" = true ]; then version_args=(-ExpectedVersion "$RELEASE_VERSION" -RequireFast); fi
+    if [ -n "$HANDOFF_DIR" ]; then version_args+=(-HandoffDir "$(windows_path "$HANDOFF_DIR")"); fi
+    exec powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+        -File "$(windows_path "$SCRIPT_DIR/package-portable.ps1")" \
+        -BuildDir "$(windows_path "$FULL_BUILD")" -DxcDir "$(windows_path "$DXC_DIR")" "${version_args[@]}"
+fi
+
 echo "Building ghostty (optimize=$OPTIMIZE)..."
 bash "$SCRIPT_DIR/build.sh" -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize="$OPTIMIZE"
 
-for resource in bin/ghostty.exe bin/conpty.dll bin/OpenConsole.exe share/terminfo/ghostty.terminfo share/licenses/conpty/LICENSE.txt share/ghostty/shell-integration/powershell/ghostty-shell-integration.ps1; do
+for resource in bin/ghostty.exe bin/ghostty.com bin/conpty.dll bin/OpenConsole.exe share/terminfo/ghostty.terminfo share/licenses/conpty/LICENSE.txt share/ghostty/shell-integration/powershell/ghostty-shell-integration.ps1; do
     if [ ! -f "zig-out/$resource" ]; then
         echo "ERROR: Incomplete Windows build — zig-out/$resource not found" >&2
         exit 1
@@ -95,7 +115,7 @@ trap 'rm -rf "$REPO_DIR/dist/windows/_stage"' EXIT
 cp LICENSE "$STAGE_DIR/LICENSE"
 
 # Keep the matching console runtime pair beside the executable.
-for binary in ghostty.exe conpty.dll OpenConsole.exe; do
+for binary in ghostty.exe ghostty.com conpty.dll OpenConsole.exe; do
     cp "zig-out/bin/$binary" "$STAGE_DIR/"
     echo "  $binary"
 done
@@ -126,40 +146,7 @@ if [ -f zig-out/share/terminfo/ghostty.terminfo ]; then
 fi
 
 # Create a minimal README
-cat > "$STAGE_DIR/README.txt" << READMEEOF
-Ghostty for Windows — $VERSION
-https://github.com/shiweis/ghostty-windows
-
-QUICK START
-  1. Run ghostty.exe
-  2. Config file: %LOCALAPPDATA%\\ghostty\\config.ghostty
-     (the legacy filename "config" is also supported)
-  Keep conpty.dll and OpenConsole.exe beside ghostty.exe.
-
-KEYBOARD SHORTCUTS
-  Ctrl+Shift+T        New tab
-  Ctrl+Shift+W        Close tab/pane
-  Ctrl+Shift+N        New window
-  Ctrl+Shift+P        Command palette
-  Ctrl+Shift+O        Split right
-  Ctrl+Shift+E        Split down
-  Ctrl+Shift+[ / ]    Navigate splits
-  Ctrl+Shift+C / V    Copy / Paste
-  Ctrl+Shift+F        Find
-  Ctrl+Enter          Toggle fullscreen
-  Ctrl+= / - / 0      Zoom in / out / reset
-  Ctrl+,              Open config file
-
-SHELL INTEGRATION (PowerShell)
-  Windows PowerShell 5.1 (powershell.exe) and PowerShell 7 (pwsh.exe)
-  load the bundled integration automatically when enabled.
-  No PowerShell profile edit is required. Keep the share/ folder beside
-  ghostty.exe wherever you extract this portable package.
-  The script is share/ghostty/shell-integration/powershell/ghostty-shell-integration.ps1.
-  To disable integration, set shell-integration = none in your config.
-
-For full documentation: https://ghostty.org/docs
-READMEEOF
+sed "s/@VERSION@/$VERSION/g" "$SCRIPT_DIR/portable-readme.txt" > "$STAGE_DIR/README.txt"
 echo "  README.txt"
 
 # Check the flattened portable layout as well as the build prefix.

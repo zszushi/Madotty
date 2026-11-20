@@ -3,6 +3,7 @@ const build_options = @import("terminal_options");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const terminal = @import("main.zig");
+const sixel = @import("sixel.zig");
 const DCS = terminal.DCS;
 
 const log = std.log.scoped(.terminal_dcs);
@@ -13,9 +14,8 @@ const log = std.log.scoped(.terminal_dcs);
 pub const Handler = struct {
     state: State = .{ .inactive = {} },
 
-    /// Maximum bytes any DCS command can take. This is to prevent
-    /// malicious input from causing us to allocate too much memory.
-    /// This is arbitrarily set to 1MB today, increase if needed.
+    /// Maximum bytes for control commands. Sixel has its own input and
+    /// decoded-image limits.
     max_bytes: usize = 1024 * 1024,
 
     pub fn deinit(self: *Handler) void {
@@ -50,6 +50,14 @@ pub const Handler = struct {
     fn tryHook(self: Handler, alloc: Allocator, dcs: DCS) !?Hook {
         return switch (dcs.intermediates.len) {
             0 => switch (dcs.final) {
+                'q' => if (build_options.kitty_graphics and dcs.params.len <= 3) .{
+                    .state = .{ .sixel = .{
+                        .aspect = if (dcs.params.len > 0) dcs.params[0] else 0,
+                        .background_mode = if (dcs.params.len > 1) dcs.params[1] else 0,
+                        .data = try .initCapacity(alloc, 512),
+                    } },
+                } else null,
+
                 // Tmux control mode
                 'p' => tmux: {
                     if (comptime !build_options.tmux_control_mode) {
@@ -141,6 +149,11 @@ pub const Handler = struct {
                 try list.writer.writeByte(byte);
             },
 
+            .sixel => |*image| {
+                if (image.data.written().len >= sixel.max_payload_bytes) return error.OutOfMemory;
+                try image.data.writer.writeByte(byte);
+            },
+
             .decrqss => |*buffer| {
                 if (buffer.len >= buffer.data.len) {
                     return error.OutOfMemory;
@@ -155,6 +168,10 @@ pub const Handler = struct {
     }
 
     pub fn unhook(self: *Handler) ?Command {
+        return self.end(true);
+    }
+
+    pub fn end(self: *Handler, terminated: bool) ?Command {
         // Note: we do NOT call deinit here on purpose because some commands
         // transfer memory ownership. If state needs cleanup, the switch
         // prong below should handle it.
@@ -176,6 +193,11 @@ pub const Handler = struct {
                 const items = list.written();
                 for (items, 0..) |b, i| items[i] = std.ascii.toUpper(b);
                 break :xtgettcap .{ .xtgettcap = .{ .data = list.* } };
+            },
+
+            .sixel => |*image| if (terminated) .{ .sixel = image.* } else canceled: {
+                image.data.deinit();
+                break :canceled null;
             },
 
             .decrqss => |buffer| .{ .decrqss = switch (buffer.len) {
@@ -211,6 +233,8 @@ pub const Command = union(enum) {
     /// DECRQSS
     decrqss: DECRQSS,
 
+    sixel: Sixel,
+
     /// Tmux control mode
     tmux: if (build_options.tmux_control_mode)
         terminal.tmux.ControlNotification
@@ -221,9 +245,16 @@ pub const Command = union(enum) {
         switch (self.*) {
             .xtgettcap => |*v| v.data.deinit(),
             .decrqss => {},
+            .sixel => |*image| image.data.deinit(),
             .tmux => {},
         }
     }
+
+    pub const Sixel = struct {
+        aspect: u16,
+        background_mode: u16,
+        data: std.Io.Writer.Allocating,
+    };
 
     pub const XTGETTCAP = struct {
         data: std.Io.Writer.Allocating,
@@ -325,6 +356,8 @@ const State = union(enum) {
     /// XTGETTCAP
     xtgettcap: std.Io.Writer.Allocating,
 
+    sixel: Command.Sixel,
+
     /// DECRQSS
     decrqss: struct {
         data: [2]u8 = undefined,
@@ -344,6 +377,7 @@ const State = union(enum) {
             => {},
 
             .xtgettcap => |*v| v.deinit(),
+            .sixel => |*image| image.data.deinit(),
             .decrqss => {},
             .tmux => |*v| if (comptime build_options.tmux_control_mode) {
                 v.deinit();
@@ -487,6 +521,13 @@ test "DECRQSS response encoding" {
     try S.expectResponse(&t, .none, "\x1BP0$r\x1B\\");
     try S.expectResponse(&t, .sgr, "\x1BP1$r0m\x1B\\");
 
+    try t.setAttribute(.{ .underline_color = .{ .r = 1, .g = 2, .b = 3 } });
+    try S.expectResponse(&t, .sgr, "\x1BP1$r0;58:2::1:2:3m\x1B\\");
+    try t.setAttribute(.{ .@"256_underline_color" = 12 });
+    try S.expectResponse(&t, .sgr, "\x1BP1$r0;58:5:12m\x1B\\");
+    try t.setAttribute(.reset_underline_color);
+    try S.expectResponse(&t, .sgr, "\x1BP1$r0m\x1B\\");
+
     try t.setAttribute(.bold);
     try t.setAttribute(.{ .underline = .curly });
     try S.expectResponse(&t, .sgr, "\x1BP1$r0;1;4:3m\x1B\\");
@@ -534,6 +575,11 @@ test "DECRQSS largest response fits fixed buffer" {
         .g = 255,
         .b = 255,
     } });
+    try t.setAttribute(.{ .underline_color = .{
+        .r = 255,
+        .g = 255,
+        .b = 255,
+    } });
 
     var buf: [Command.DECRQSS.max_response_bytes]u8 = undefined;
     const encoded = try Command.DECRQSS.sgr.encode(&t, &buf);
@@ -541,7 +587,8 @@ test "DECRQSS largest response fits fixed buffer" {
     const expected =
         "\x1BP1$r0;1;2;3;4:5;53;5;7;8;9" ++
         ";38:2::255:255:255" ++
-        ";48:2::255:255:255m\x1B\\";
+        ";48:2::255:255:255" ++
+        ";58:2::255:255:255m\x1B\\";
     try testing.expectEqualStrings(expected, encoded);
     try testing.expect(encoded.len <= Command.DECRQSS.max_response_bytes);
 }

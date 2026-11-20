@@ -18,6 +18,8 @@ const osc = @import("osc.zig");
 const osc_color = @import("osc/parsers/color.zig");
 const kitty_clipboard = @import("kitty/clipboard.zig");
 const kitty_color = @import("kitty/color.zig");
+const kitty_notification = @import("kitty/notification.zig");
+const kitty_pointer = @import("kitty/pointer.zig");
 const paste_pkg = @import("paste.zig");
 const kitty_dnd = @import("kitty/dnd.zig");
 const lib = @import("lib.zig");
@@ -100,6 +102,7 @@ pub const Handler = struct {
     /// recorded when a clipboard_read or clipboard_write reply asks to
     /// remember the user's decision.
     kitty_clipboard_grants: kitty_clipboard.Grants = .{},
+    kitty_notifications: kitty_notification.State = .{},
 
     /// Maximum total decoded bytes accumulated by one Kitty clipboard
     /// protocol (OSC 5522) write transaction, captured when the
@@ -174,7 +177,7 @@ pub const Handler = struct {
         bell: ?*const fn (*Handler) void,
 
         /// Called when the running program requests a desktop notification
-        /// via OSC 9 or OSC 777. The title and body are borrowed and only
+        /// via OSC 9, OSC 99, or OSC 777. The title and body are borrowed and only
         /// valid for the duration of the callback.
         desktop_notification: ?*const fn (*Handler, Action.ShowDesktopNotification) void,
 
@@ -512,6 +515,7 @@ pub const Handler = struct {
         self.kitty_clipboard_grants.deinit(self.terminal.gpa());
         self.apc_handler.deinit();
         self.dcs_handler.deinit();
+        self.kitty_notifications.deinit(self.terminal.gpa());
     }
 
     /// Resize the terminal and apply any side effects (if supported)
@@ -731,6 +735,7 @@ pub const Handler = struct {
                 // A reset turns off synchronized output, ending its hold.
                 const sync = self.terminal.modes.get(.synchronized_output);
                 self.terminal.fullReset();
+                self.kitty_notifications.deinit(self.terminal.gpa());
                 if (sync) self.renderHold(false);
 
                 // Full reset clears grants
@@ -746,8 +751,9 @@ pub const Handler = struct {
             .start_hyperlink => try self.terminal.screens.active.startHyperlink(value.uri, value.id),
             .end_hyperlink => self.terminal.screens.active.endHyperlink(),
             .semantic_prompt => try self.semanticPrompt(value),
-            .mouse_shape => self.terminal.mouse_shape = value,
-            .mouse_shape_reset => self.terminal.mouse_shape = .text,
+            .mouse_shape => self.setPointerShape(value),
+            .mouse_shape_reset => self.setPointerShape(null),
+            .kitty_pointer => try self.kittyPointer(value.payload),
             .color_operation => self.colorOperation(
                 &value.requests,
                 value.terminator,
@@ -774,6 +780,10 @@ pub const Handler = struct {
             // Effect-based handlers
             .bell => self.bell(),
             .show_desktop_notification => self.desktopNotification(value),
+            .kitty_notification => try self.kittyNotification(value),
+            .kitty_text_sizing => try self.terminal.printSized(value.text, value.width),
+            .iterm_report_cell_size => try self.itermReportCellSize(value),
+            .iterm_inline_image => try self.terminal.itermInlineImage(value),
             .device_attributes => self.reportDeviceAttributes(value),
             .device_status => self.deviceStatus(value.request),
             .enquiry => self.reportEnquiry(),
@@ -805,7 +815,12 @@ pub const Handler = struct {
 
             .dcs_hook => try self.dcsHook(value),
             .dcs_put => try self.dcsPut(value),
-            .dcs_unhook => try self.dcsUnhook(),
+            .dcs_unhook => try self.dcsUnhook(value.terminated),
+            .sixel_query => {
+                var buf: [64]u8 = undefined;
+                if (try @import("sixel_display.zig").query(self.terminal, value, &buf)) |response|
+                    self.writePty(response);
+            },
 
             // Have no terminal-modifying effect
             .title_push,
@@ -834,8 +849,8 @@ pub const Handler = struct {
         try self.dcsCommand(&cmd);
     }
 
-    fn dcsUnhook(self: *Handler) !void {
-        var cmd = self.dcs_handler.unhook() orelse return;
+    fn dcsUnhook(self: *Handler, terminated: bool) !void {
+        var cmd = self.dcs_handler.end(terminated) orelse return;
         defer cmd.deinit();
         try self.dcsCommand(&cmd);
     }
@@ -867,6 +882,7 @@ pub const Handler = struct {
             },
 
             .tmux => {},
+            .sixel => |*image| try @import("sixel_display.zig").display(self.terminal, image),
         }
     }
 
@@ -911,6 +927,42 @@ pub const Handler = struct {
     ) void {
         const func = self.effects.desktop_notification orelse return;
         func(self, notification);
+    }
+
+    fn kittyNotification(self: *Handler, request: osc.Command.KittyDesktopNotification) !void {
+        const alloc = self.terminal.gpa();
+        const result = try self.kitty_notifications.handle(alloc, request, .{
+            .focused = self.terminal.flags.focused,
+            .visible = self.terminal.flags.visible,
+            .available = self.effects.desktop_notification != null,
+        });
+        defer result.deinit(alloc);
+        switch (result) {
+            .ignored => {},
+            .reply => |reply| self.writePty(reply),
+            .notification => |notice| self.desktopNotification(.{ .title = notice.title, .body = notice.body }),
+        }
+    }
+
+    fn setPointerShape(self: *Handler, shape: ?@import("mouse.zig").Shape) void {
+        self.terminal.kitty_pointer.setShape(self.terminal.screens.active_key == .alternate, shape);
+        self.terminal.mouse_shape = self.terminal.effectiveMouseShape();
+    }
+
+    fn kittyPointer(self: *Handler, payload: []const u8) !void {
+        const alternate = self.terminal.screens.active_key == .alternate;
+        const pointer = &self.terminal.kitty_pointer;
+        const request = kitty_pointer.parse(payload);
+        if (request == .query) {
+            if (self.effects.write_pty == null) return;
+            var response: std.Io.Writer.Allocating = .init(self.terminal.gpa());
+            defer response.deinit();
+            try pointer.writeResponse(alternate, request.query, .{}, &response.writer);
+            self.writePty(response.written());
+            return;
+        }
+        pointer.apply(alternate, request, .{});
+        self.terminal.mouse_shape = self.terminal.effectiveMouseShape();
     }
 
     fn semanticPrompt(self: *Handler, cmd: osc.Command.SemanticPrompt) !void {
@@ -1831,6 +1883,19 @@ pub const Handler = struct {
         self.writePty(buf[0..len :0]);
     }
 
+    fn itermReportCellSize(self: *Handler, terminator: osc.Terminator) !void {
+        const t = self.terminal;
+        const width, const height = if (self.effects.size) |get_size| dims: {
+            const current = get_size(self) orelse return;
+            break :dims .{ current.cell_width, current.cell_height };
+        } else .{ t.width_px / t.cols, t.height_px / t.rows };
+
+        var buf: [192]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try size_report.encodeITermCellSize(&writer, width, height, t.pixels_per_point, terminator);
+        if (writer.buffered().len != 0) self.writePty(writer.buffered());
+    }
+
     fn reportSize(self: *Handler, style: csi.SizeReportStyle) void {
         // Almost all size reports will fit in 256 bytes so try that
         // on the stack before falling back to a heap allocation.
@@ -2053,33 +2118,15 @@ pub const Handler = struct {
 
             .report_visibility => if (enabled) self.sendVisibilityReport(),
 
-            .mouse_event_x10 => {
-                if (enabled) {
-                    self.terminal.flags.mouse_event = .x10;
-                } else {
-                    self.terminal.flags.mouse_event = .none;
-                }
-            },
-            .mouse_event_normal => {
-                if (enabled) {
-                    self.terminal.flags.mouse_event = .normal;
-                } else {
-                    self.terminal.flags.mouse_event = .none;
-                }
-            },
-            .mouse_event_button => {
-                if (enabled) {
-                    self.terminal.flags.mouse_event = .button;
-                } else {
-                    self.terminal.flags.mouse_event = .none;
-                }
-            },
-            .mouse_event_any => {
-                if (enabled) {
-                    self.terminal.flags.mouse_event = .any;
-                } else {
-                    self.terminal.flags.mouse_event = .none;
-                }
+            .mouse_event_x10, .mouse_event_normal, .mouse_event_button, .mouse_event_any => {
+                self.terminal.flags.mouse_event = if (!enabled) .none else switch (mode) {
+                    .mouse_event_x10 => .x10,
+                    .mouse_event_normal => .normal,
+                    .mouse_event_button => .button,
+                    .mouse_event_any => .any,
+                    else => unreachable,
+                };
+                self.terminal.mouse_shape = self.terminal.effectiveMouseShape();
             },
 
             .mouse_format_utf8 => self.terminal.flags.mouse_format = if (enabled) .utf8 else .x10,
@@ -6882,6 +6929,148 @@ test "device attributes: custom response" {
     try testing.expectEqualStrings("\x1b[>41;100;0c", S.written.?);
 }
 
+test "OSC 1337 reports live cell size and ignores an echoed report" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 12, .rows = 4 });
+    defer t.deinit(testing.allocator);
+    const Capture = struct {
+        var buffer: [128]u8 = undefined;
+        var len: usize = 0;
+        var count: usize = 0;
+        fn reply(_: *Handler, response: []const u8) void {
+            @memcpy(buffer[0..response.len], response);
+            len = response.len;
+            count += 1;
+        }
+    };
+    Capture.count = 0;
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &Capture.reply;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    try s.handler.resize(.{ .cols = 12, .rows = 4, .cell_size_px = .{ .width = 13, .height = 25 } });
+    t.pixels_per_point = 1.25;
+    s.nextSlice("\x1b]1337;ReportCellSize\x1b\\");
+    const response = "\x1b]1337;ReportCellSize=20.0000;10.4000;1.2500\x1b\\";
+    try testing.expectEqualStrings(response, Capture.buffer[0..Capture.len]);
+    s.nextSlice(response);
+    try testing.expectEqual(@as(usize, 1), Capture.count);
+}
+
+test "OSC 66 prints a sized span and erases it when ordinary output hits its tail" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 12, .rows = 4 });
+    defer t.deinit(testing.allocator);
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = .init(&t) });
+    defer s.deinit();
+
+    s.nextSlice("\x1b]66;w=5;x y\x1b\\Z");
+    const cursor = &t.screens.active.cursor;
+    const cells = cursor.page_pin.cells(.all);
+    try testing.expectEqual(@as(usize, 6), cursor.x);
+    try testing.expectEqual(@as(?u3, 5), cells[0].sizedWidth());
+    try testing.expectEqualSlices(u21, &.{ ' ', 'y' }, cursor.page_pin.node.page().lookupGrapheme(&cells[0]).?);
+    try testing.expectEqual(@as(u21, 'Z'), cells[5].codepoint());
+
+    s.nextSlice("\x1b[1;4Hq");
+    for (cells[0..5], 0..) |cell, x| {
+        try testing.expectEqual(@as(u21, if (x == 3) 'q' else 0), cell.codepoint());
+        try testing.expectEqual(@as(u3, 0), cell.sized);
+    }
+    try testing.expectEqual(@as(u21, 'Z'), cells[5].codepoint());
+}
+
+test "OSC 66 wraps whole spans and backs up when wrapping is disabled" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 8, .rows = 4 });
+    defer t.deinit(testing.allocator);
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = .init(&t) });
+    defer s.deinit();
+
+    s.nextSlice("abcdef\x1b]66;w=3;x\x07");
+    const cursor = &t.screens.active.cursor;
+    try testing.expectEqual(@as(usize, 1), cursor.y);
+    try testing.expectEqual(@as(usize, 3), cursor.x);
+    const prev = cursor.page_pin.up(1).?;
+    try testing.expect(prev.rowAndCell().row.wrap);
+    for (prev.cells(.all)[6..]) |cell| {
+        try testing.expectEqual(.spacer_head, cell.wide);
+        try testing.expectEqual(@as(u3, 1), cell.sized);
+    }
+
+    s.nextSlice("\x1b[?7l\x1b[3;8H\x1b]66;w=4;y\x07");
+    try testing.expectEqual(@as(usize, 2), cursor.y);
+    try testing.expectEqual(@as(usize, 7), cursor.x);
+    try testing.expectEqual(@as(?u3, 4), cursor.page_pin.cells(.all)[4].sizedWidth());
+}
+
+test "OSC 66 editing moves intact spans and erases divided spans" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 12, .rows = 4 });
+    defer t.deinit(testing.allocator);
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = .init(&t) });
+    defer s.deinit();
+
+    s.nextSlice("Y\x1b]66;w=5;x\x07Z\x1b[1;2H\x1b[2@");
+    const cells = t.screens.active.cursor.page_pin.cells(.all);
+    try testing.expectEqual(@as(?u3, 5), cells[3].sizedWidth());
+    try testing.expectEqual(@as(u21, 'Z'), cells[8].codepoint());
+    s.nextSlice("\x1b[P");
+    try testing.expectEqual(@as(?u3, 5), cells[2].sizedWidth());
+    try testing.expectEqual(@as(u21, 'Z'), cells[7].codepoint());
+    s.nextSlice("\x1b[1;6H\x1b[X");
+    for (cells[2..7]) |cell| {
+        try testing.expectEqual(@as(u21, 0), cell.codepoint());
+        try testing.expectEqual(@as(u3, 0), cell.sized);
+    }
+    try testing.expectEqual(@as(u21, 'Y'), cells[0].codepoint());
+    try testing.expectEqual(@as(u21, 'Z'), cells[7].codepoint());
+}
+
+test "kitty pointer and OSC 99 notification effects from the terminal stream" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+    const Capture = struct {
+        var response: ?[]u8 = null;
+        var notifications: usize = 0;
+        fn reply(_: *Handler, value: []const u8) void {
+            if (response) |previous| testing.allocator.free(previous);
+            response = testing.allocator.dupe(u8, value) catch @panic("OOM");
+        }
+        fn notice(_: *Handler, value: Action.ShowDesktopNotification) void {
+            std.debug.assert(std.mem.eql(u8, value.title, "Task done"));
+            std.debug.assert(std.mem.eql(u8, value.body, "All checks passed"));
+            notifications += 1;
+        }
+    };
+    Capture.response = null;
+    Capture.notifications = 0;
+    defer if (Capture.response) |reply| testing.allocator.free(reply);
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &Capture.reply;
+    handler.effects.desktop_notification = &Capture.notice;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    s.nextSlice("\x1b]22;pointer\x1b\\\x1b[?1000h");
+    try testing.expectEqual(@as(@TypeOf(t.mouse_shape), .pointer), t.mouse_shape);
+    s.nextSlice("\x1b[?1049h\x1b]22;?__current__\x1b\\");
+    try testing.expectEqualStrings("\x1b]22;0\x1b\\", Capture.response.?);
+    s.nextSlice("\x1b[?1049l\x1b]22;?__current__\x1b\\");
+    try testing.expectEqualStrings("\x1b]22;pointer\x1b\\", Capture.response.?);
+
+    s.nextSlice("\x1b]99;i=test:p=?;\x07");
+    try testing.expectEqualStrings(
+        "\x1b]99;i=test:p=?;o=always,unfocused,invisible:p=title,body\x07",
+        Capture.response.?,
+    );
+    s.nextSlice("\x1b]99;i=test:d=0;Task done\x1b\\");
+    try testing.expectEqual(@as(usize, 0), Capture.notifications);
+    s.nextSlice("\x1b]99;i=test:p=body;All checks passed\x1b\\");
+    try testing.expectEqual(@as(usize, 1), Capture.notifications);
+
+    s.nextSlice("\x1bc\x1b]22;?__current__\x1b\\");
+    try testing.expectEqualStrings("\x1b]22;0\x1b\\", Capture.response.?);
+}
+
 test "kitty graphics APC response" {
     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
 
@@ -6909,6 +7098,65 @@ test "kitty graphics APC response" {
 
     // Should have written a response back
     try testing.expectEqualStrings("\x1b_Gi=1;OK\x1b\\", S.written.?);
+}
+
+test "sixel follows cursor modes and replaces opaque images at the same origin" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    var terminal: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer terminal.deinit(testing.allocator);
+    terminal.width_px = 100;
+    terminal.height_px = 200;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = .init(&terminal) });
+    defer s.deinit();
+
+    const screen = terminal.screens.active;
+    const storage = &screen.kitty_images;
+    const first = "\x1bPq\"1;1;20;6#1;2;100;0;0!20~\x1b\\";
+    const replacement = "\x1bPq\"1;1;20;6#1;2;0;100;0!20~\x1b\\";
+    s.nextSlice(first[0 .. first.len - 1]);
+    try testing.expectEqual(@as(usize, 0), storage.images.count());
+    s.nextSlice(first[first.len - 1 ..]);
+    try testing.expectEqual(@as(usize, 1), storage.images.count());
+    try testing.expectEqual(@as(usize, 1), screen.cursor.y);
+    try testing.expectEqual(@as(usize, 0), screen.cursor.x);
+
+    s.nextSlice("\x1b[H");
+    s.nextSlice(replacement);
+    try testing.expectEqual(@as(usize, 1), storage.images.count());
+    try testing.expectEqual(@as(usize, 1), storage.placements.count());
+    var images = storage.images.valueIterator();
+    try testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, images.next().?.data.bytes().?[0..4]);
+
+    s.nextSlice("\x1b[?8452h\x1b[3;4H");
+    s.nextSlice(first);
+    try testing.expectEqual(@as(usize, 2), screen.cursor.y);
+    try testing.expectEqual(@as(usize, 5), screen.cursor.x);
+
+    s.nextSlice("\x1b[?80h\x1b[4;4H");
+    s.nextSlice(first);
+    try testing.expectEqual(@as(usize, 3), screen.cursor.y);
+    try testing.expectEqual(@as(usize, 3), screen.cursor.x);
+    try testing.expectEqual(@as(usize, 2), storage.placements.count());
+
+    s.nextSlice("\x1b[2J");
+    try testing.expectEqual(@as(usize, 0), storage.placements.count());
+    try testing.expectEqual(@as(usize, 0), storage.images.count());
+}
+
+test "sixel cancels instead of drawing on CAN and an intervening escape" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    var terminal: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer terminal.deinit(testing.allocator);
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = .init(&terminal) });
+    defer s.deinit();
+
+    s.nextSlice("\x1bPq\"1;1;8;6!8~\x18\x1bPq\"1;1;8;6!8~\x1b[3;4H");
+    try testing.expectEqual(@as(usize, 0), terminal.screens.active.kitty_images.images.count());
+    try testing.expectEqual(@as(usize, 2), terminal.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 3), terminal.screens.active.cursor.x);
+
+    s.nextSlice("\x1bPq\"1;1;8;6!8~\x9c");
+    try testing.expectEqual(@as(usize, 1), terminal.screens.active.kitty_images.images.count());
 }
 
 test "kitty graphics via APC" {

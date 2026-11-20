@@ -43,6 +43,8 @@ const FlatpakHostCommand = if (!build_config.flatpak) struct {
 
 /// The subprocess state for our exec backend.
 subprocess: Subprocess,
+attachment_reader_stop: if (builtin.os.tag == .windows) std.atomic.Value(bool) else void =
+    if (builtin.os.tag == .windows) .init(false) else {},
 
 /// Initialize the exec state. This will NOT start it, this only sets
 /// up the internal state necessary to start it later.
@@ -54,6 +56,42 @@ pub fn init(
     errdefer subprocess.deinit();
 
     return .{ .subprocess = subprocess };
+}
+
+/// A console that Windows has already started. The attachment owns the
+/// local PTY and its duplicated client process handle.
+pub const Attachment = if (builtin.os.tag == .windows) struct {
+    pty: Pty,
+    client: windows.HANDLE,
+
+    pub fn deinit(self: *@This()) void {
+        self.pty.deinit();
+        _ = windows.exp.kernel32.CloseHandle(self.client);
+    }
+} else void;
+
+pub fn initAttached(alloc: Allocator, attachment: Attachment) Exec {
+    return .{ .subprocess = .{
+        .arena = .init(alloc),
+        .cwd = null,
+        .env = null,
+        .args = &.{},
+        .grid_size = undefined,
+        .screen_size = undefined,
+        .rt_pre_exec_info = .{},
+        .rt_post_fork_info = .{},
+        .pending_attachment = attachment,
+    } };
+}
+
+pub fn hasAttachment(self: *const Exec) bool {
+    if (comptime builtin.os.tag != .windows) return false;
+    return self.subprocess.pending_attachment != null or self.subprocess.attached_client != null;
+}
+
+/// Validate the adopted console before the surface starts its I/O thread.
+pub fn prepareAttachment(self: *Exec) !void {
+    if (comptime builtin.os.tag == .windows) try self.subprocess.prepareAttachment();
 }
 
 pub fn deinit(self: *Exec) void {
@@ -142,11 +180,14 @@ pub fn threadEnter(
     errdefer termios_timer.deinit();
 
     // Start our read thread
-    const read_thread = try std.Thread.spawn(
-        .{},
-        if (builtin.target.os.tag == .windows) ReadThread.threadMainWindows else ReadThread.threadMainPosix,
-        .{ pty_fds.read, io, pipe[0] },
-    );
+    const read_thread = if (comptime builtin.os.tag == .windows) windows_reader: {
+        const attachment: ?AttachedReader = if (self.subprocess.attached_client) |client| .{
+            .client = client,
+            .start = process_start,
+            .stop = &self.attachment_reader_stop,
+        } else null;
+        break :windows_reader try std.Thread.spawn(.{}, ReadThread.threadMainWindows, .{ pty_fds.read, io, pipe[0], attachment });
+    } else try std.Thread.spawn(.{}, ReadThread.threadMainPosix, .{ pty_fds.read, io, pipe[0] });
     read_thread.setName(global.io(), "io-reader") catch {};
 
     // Setup our threadata backend state to be our own
@@ -242,8 +283,10 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     signalReadThreadQuit(exec.read_thread_pipe);
 
     if (comptime builtin.target.os.tag == .windows) {
-        // Interrupt the blocking read so the thread can see the quit message
-        if (windows.exp.kernel32.CancelIoEx(exec.read_thread_fd, null) == windows.FALSE) {
+        if (self.hasAttachment()) {
+            stopAttachedReader(exec.read_thread, &self.attachment_reader_stop);
+        } else if (windows.exp.kernel32.CancelIoEx(exec.read_thread_fd, null) == windows.FALSE) {
+            // Interrupt the blocking read so the thread can see the quit message.
             switch (windows.GetLastError()) {
                 .NOT_FOUND => {},
                 else => |err| log.warn("error interrupting read thread err={}", .{err}),
@@ -256,6 +299,53 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     if (comptime builtin.target.os.tag == .windows) {
         if (exec.process_watcher_thread) |t| t.join();
     }
+}
+
+const AttachedReader = struct {
+    client: windows.HANDLE,
+    start: std.Io.Timestamp,
+    stop: *const std.atomic.Value(bool),
+};
+
+extern "kernel32" fn CancelSynchronousIo(windows.HANDLE) callconv(.winapi) windows.BOOL;
+
+fn stopAttachedReader(reader: std.Thread, stop: *std.atomic.Value(bool)) void {
+    stop.store(true, .release);
+    const handle = reader.getHandle();
+    const wait_timeout = 258;
+    // Cancellation can land between the stop check and the start of ReadFile.
+    // Retry until the reader exits, without closing the caller's console pipe.
+    while (windows.exp.kernel32.WaitForSingleObject(handle, 0) == wait_timeout) {
+        if (CancelSynchronousIo(handle) == windows.FALSE) switch (windows.GetLastError()) {
+            .NOT_FOUND => {},
+            else => |err| log.warn("error interrupting attached console reader err={}", .{err}),
+        };
+        if (windows.exp.kernel32.WaitForSingleObject(handle, 10) != wait_timeout) break;
+    }
+}
+
+test "win32 console attachment cancels a synchronous read with the writer still open" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const Fixture = struct {
+        fn read(fd: windows.HANDLE, result: *std.atomic.Value(windows.DWORD)) void {
+            var byte: u8 = undefined;
+            var read_count: windows.DWORD = 0;
+            const ok = windows.exp.kernel32.ReadFile(fd, @ptrCast(&byte), 1, &read_count, null);
+            result.store(if (ok == windows.FALSE) @backingInt(windows.GetLastError()) else 0, .release);
+        }
+    };
+
+    const pipe = try internal_os.pipe();
+    defer closeReadThreadPipe(pipe[0]);
+    defer closeReadThreadPipe(pipe[1]);
+    var result: std.atomic.Value(windows.DWORD) = .init(0);
+    var stop: std.atomic.Value(bool) = .init(false);
+    const reader = try std.Thread.spawn(.{}, Fixture.read, .{ pipe[0], &result });
+    defer reader.join();
+
+    stopAttachedReader(reader, &stop);
+    const operation_aborted: @TypeOf(windows.GetLastError()) = .OPERATION_ABORTED;
+    try std.testing.expectEqual(@as(windows.DWORD, @backingInt(operation_aborted)), result.load(.acquire));
 }
 
 /// internal_os.pipe returns native HANDLEs on Windows, not CRT descriptor
@@ -714,6 +804,10 @@ const Subprocess = struct {
     screen_size: renderer.ScreenSize,
     pty: ?Pty = null,
     process: ?Process = null,
+    pending_attachment: if (builtin.os.tag == .windows) ?Attachment else void =
+        if (builtin.os.tag == .windows) null else {},
+    attached_client: if (builtin.os.tag == .windows) ?windows.HANDLE else void =
+        if (builtin.os.tag == .windows) null else {},
 
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
@@ -1011,9 +1105,31 @@ const Subprocess = struct {
     pub fn deinit(self: *Subprocess) void {
         self.stop();
         if (self.pty) |*pty| pty.deinit();
+        if (comptime builtin.os.tag == .windows) {
+            if (self.attached_client) |client| _ = windows.exp.kernel32.CloseHandle(client);
+            if (self.pending_attachment) |*attachment| attachment.deinit();
+        }
         if (self.env) |*env| env.deinit();
         self.arena.deinit();
         self.* = undefined;
+    }
+
+    fn ptySize(self: *const Subprocess) ptypkg.winsize {
+        return .{
+            .ws_row = @intCast(self.grid_size.rows),
+            .ws_col = @intCast(self.grid_size.columns),
+            .ws_xpixel = @intCast(self.screen_size.width),
+            .ws_ypixel = @intCast(self.screen_size.height),
+        };
+    }
+
+    fn prepareAttachment(self: *Subprocess) !void {
+        const attachment = if (self.pending_attachment) |*v| v else return;
+        try attachment.pty.setSize(self.ptySize());
+        try attachment.pty.releaseConsoleReference();
+        self.pty = attachment.pty;
+        self.attached_client = attachment.client;
+        self.pending_attachment = null;
     }
 
     /// Start the subprocess. If the subprocess is already started this
@@ -1022,21 +1138,16 @@ const Subprocess = struct {
         read: Pty.Fd,
         write: Pty.Fd,
     } {
+        if (comptime builtin.os.tag == .windows) {
+            try self.prepareAttachment();
+            if (self.attached_client != null)
+                return .{ .read = self.pty.?.out_pipe, .write = self.pty.?.in_pipe };
+        }
         assert(self.pty == null and self.process == null);
 
-        // This function is funny because on POSIX systems it can
-        // fail in the forked process. This is flipped to true if
-        // we're in an error state in the forked process (child
-        // process).
+        // Errors in a forked child must not unwind resources owned by the parent.
         var in_child: bool = false;
-
-        // Create our pty
-        var pty = try Pty.open(.{
-            .ws_row = @intCast(self.grid_size.rows),
-            .ws_col = @intCast(self.grid_size.columns),
-            .ws_xpixel = @intCast(self.screen_size.width),
-            .ws_ypixel = @intCast(self.screen_size.height),
-        });
+        var pty = try Pty.open(self.ptySize());
         self.pty = pty;
         errdefer if (!in_child) {
             if (comptime builtin.target.os.tag != .windows) {
@@ -1899,7 +2010,12 @@ pub const ReadThread = struct {
         return true;
     }
 
-    fn threadMainWindows(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t) void {
+    fn threadMainWindows(
+        fd: posix.fd_t,
+        io: *termio.Termio,
+        quit: posix.fd_t,
+        attachment: ?AttachedReader,
+    ) void {
         // Always close our end of the pipe when we exit.
         defer closeReadThreadPipe(quit);
 
@@ -1910,9 +2026,13 @@ pub const ReadThread = struct {
         };
         defer crash.sentry.thread_state = null;
 
-        var buf: [1024]u8 = undefined;
+        // ReadFile returns the available bytes immediately. Give large
+        // ConPTY output bursts room to amortize the read and render wake,
+        // but release the terminal lock regularly during sustained output.
+        var buf: [4 * 1024]u8 = undefined;
         while (true) {
             while (true) {
+                if (attachment) |state| if (state.stop.load(.acquire)) return;
                 var n: windows.DWORD = 0;
                 if (windows.exp.kernel32.ReadFile(fd, &buf, buf.len, &n, null) == windows.FALSE) {
                     const err = windows.GetLastError();
@@ -1927,6 +2047,9 @@ pub const ReadThread = struct {
                         .PIPE_NOT_CONNECTED,
                         => {
                             log.info("io reader exiting", .{});
+                            if (attachment) |state| {
+                                if (!state.stop.load(.acquire)) attachedConsoleExited(io, state.client, state.start);
+                            }
                             return;
                         },
 
@@ -1962,6 +2085,19 @@ pub const ReadThread = struct {
         }
     }
 };
+
+/// The output pipe closes when the delegated console session ends, including
+/// when its client detaches and is still running elsewhere.
+fn attachedConsoleExited(io: *termio.Termio, client: windows.HANDLE, start: std.Io.Timestamp) void {
+    var exit_code: windows.DWORD = 0;
+    const still_active = 259;
+    if (windows.exp.kernel32.GetExitCodeProcess(client, &exit_code) == windows.FALSE or exit_code == still_active)
+        exit_code = 0;
+    _ = io.surface_mailbox.push(.{ .child_exited = .{
+        .exit_code = exit_code,
+        .runtime_ms = @max(0, start.untilNow(global.io(), .awake).toMilliseconds()),
+    } }, .{ .forever = {} });
+}
 
 /// Builds the argv array for the process we should exec for the
 /// configured command. This isn't as straightforward as it seems since

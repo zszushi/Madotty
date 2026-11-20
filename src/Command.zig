@@ -622,7 +622,7 @@ fn windowsCreateCommandLine(allocator: mem.Allocator, argv: []const []const u8) 
 
     for (argv, 0..) |arg, arg_i| {
         if (arg_i != 0) try writer.writeByte(' ');
-        if (mem.indexOfAny(u8, arg, " \t\n\"") == null) {
+        if (arg.len != 0 and mem.indexOfAny(u8, arg, " \t\n\"") == null) {
             try writer.writeAll(arg);
             continue;
         }
@@ -648,6 +648,12 @@ fn windowsCreateCommandLine(allocator: mem.Allocator, argv: []const []const u8) 
     }
 
     return buf.toOwnedSliceSentinel(0);
+}
+
+test "windowsCreateCommandLine preserves an empty argument" {
+    const command_line = try windowsCreateCommandLine(testing.allocator, &.{ "program", "", "+version" });
+    defer testing.allocator.free(command_line);
+    try testing.expectEqualStrings("program \"\" +version", command_line);
 }
 
 test "createNullDelimitedEnvMap" {

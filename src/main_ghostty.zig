@@ -15,6 +15,14 @@ const App = @import("App.zig");
 const Ghostty = @import("main_c.zig").Ghostty;
 const global = @import("global.zig");
 
+extern "kernel32" fn AttachConsole(process: u32) callconv(.winapi) i32;
+
+fn attachParentConsole() void {
+    if (comptime builtin.os.tag == .windows and build_config.artifact == .exe) {
+        _ = AttachConsole(std.math.maxInt(u32)); // ATTACH_PARENT_PROCESS
+    }
+}
+
 /// The return type for main() depends on the build artifact. The lib build
 /// also calls "main" in order to run the CLI actions, but it calls it as
 /// an API and not an entrypoint.
@@ -29,6 +37,7 @@ pub fn main(minimal: std.process.Init.Minimal) !MainReturn {
     // a global is because the C API needs to be able to access this state;
     // no other Zig code should EVER access the global state.
     global.init(.{ .main = minimal }) catch |err| {
+        attachParentConsole();
         var buffer: [1024]u8 = undefined;
         var stderr_writer = std.Io.File.stderr().writer(
             std.Io.Threaded.global_single_threaded.io(),
@@ -66,6 +75,7 @@ pub fn main(minimal: std.process.Init.Minimal) !MainReturn {
 
     // Execute our action if we have one
     if (global.action()) |action| {
+        attachParentConsole();
         std.log.info("executing CLI action={}", .{action});
         std.process.exit(action.run(alloc) catch |err| err: {
             std.log.err("CLI action failed error={}", .{err});
@@ -102,7 +112,12 @@ pub fn main(minimal: std.process.Init.Minimal) !MainReturn {
 
     // Create our runtime app
     var app_runtime: apprt.App = undefined;
-    try app_runtime.init(app, .{});
+    app_runtime.init(app, .{}) catch |err| {
+        if (comptime build_config.app_runtime == .win32) {
+            if (err == error.RendererHandedOff) return;
+        }
+        return err;
+    };
     defer app_runtime.terminate();
 
     // Since - by definition - there are no surfaces when first started, the

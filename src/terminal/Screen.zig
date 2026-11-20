@@ -1856,9 +1856,20 @@ pub fn clearCells(
     self: *Screen,
     page: *Page,
     row: *Row,
-    cells: []Cell,
+    range: []Cell,
 ) void {
-    if (cells.len == 0) return;
+    if (range.len == 0) return;
+
+    const cells = cells: {
+        if (range[0].sized == 0 and range[range.len - 1].sized == 0) break :cells range;
+        const row_cells = page.getCells(row);
+        var start = (@intFromPtr(range.ptr) - @intFromPtr(row_cells.ptr)) / @sizeOf(Cell);
+        var end = start + range.len;
+        if (Cell.sizedSpan(row_cells, start)) |span| start = span.start;
+        if (Cell.sizedSpan(row_cells, end - 1)) |span| end = span.end;
+        if (row_cells[end - 1].wide == .spacer_head) clearSizedWrapPadding(row_cells);
+        break :cells row_cells[start..end];
+    };
 
     // This whole operation does unsafe things, so we just want to assert
     // the end state.
@@ -1949,6 +1960,24 @@ pub fn clearCells(
     }
 
     @memset(cells, self.blankCell());
+}
+
+/// Turn OSC 66 wrap padding back into ordinary blanks before editing a row.
+pub fn clearSizedWrapPadding(cells: []Cell) void {
+    var end = cells.len;
+    while (end > 0) : (end -= 1) {
+        const cell = &cells[end - 1];
+        if (cell.wide != .spacer_head or cell.sized == 0) break;
+        cell.wide = .narrow;
+        cell.sized = 0;
+    }
+}
+
+/// Erase a sized span if a cell operation splits it at this column.
+pub fn splitSizedBoundary(self: *Screen, page: *Page, row: *Row, cells: []Cell, x: usize) void {
+    if (x >= cells.len or cells[x].sizedTailOffset() == null) return;
+    const span = Cell.sizedSpan(cells, x).?;
+    self.clearCells(page, row, cells[span.start..span.end]);
 }
 
 /// Clear cells but only if they are not protected.
@@ -2090,17 +2119,17 @@ pub fn splitCellBoundary(
         assert(x < cols);
 
         const cells = self.cursor.page_pin.cells(.all);
+        self.splitSizedBoundary(page, self.cursor.page_row, cells, x);
 
         const left = cells[x - 1];
         switch (left.wide) {
-            // There should not be spacer heads in the middle of the row.
-            .spacer_head => unreachable,
+            .spacer_head => clearSizedWrapPadding(cells),
 
-            // We don't need to do anything for narrow cells or spacer tails.
             .narrow, .spacer_tail => {},
 
             // A wide char would be split, so must be cleared.
             .wide => {
+                assert(left.sized == 0);
                 self.clearCells(
                     page,
                     self.cursor.page_row,
@@ -2425,19 +2454,23 @@ pub fn setAttribute(
     self: *Screen,
     attr: sgr.Attribute,
 ) PageList.IncreaseCapacityError!void {
-    // If we fail to set our style for any reason, we should revert
-    // back to the old style. If we fail to do that, we revert back to
-    // the default style.
     const old_style = self.cursor.style;
-    errdefer {
-        self.cursor.style = old_style;
-        self.manualStyleUpdate() catch |err| {
-            log.warn("setAttribute error restoring old style after failure err={}", .{err});
-            self.cursor.style = .{};
-            self.manualStyleUpdate() catch unreachable;
-        };
-    }
+    self.applyAttribute(attr);
+    try self.commitAttributes(old_style);
+}
 
+/// A CSI m changes several fields of one pen. Intermediate styles are never
+/// used by a cell, so only intern the final style in the page.
+pub fn setAttributes(self: *Screen, parser: *sgr.Parser) PageList.IncreaseCapacityError!void {
+    const old_style = self.cursor.style;
+    while (parser.next()) |attr| {
+        if (attr == .unknown) log.warn("unimplemented or unknown SGR attribute: {any}", .{attr.unknown});
+        self.applyAttribute(attr);
+    }
+    try self.commitAttributes(old_style);
+}
+
+fn applyAttribute(self: *Screen, attr: sgr.Attribute) void {
     switch (attr) {
         .unset => {
             self.cursor.style = .{};
@@ -2574,6 +2607,20 @@ pub fn setAttribute(
         },
 
         .unknown => return,
+    }
+}
+
+fn commitAttributes(self: *Screen, old_style: style.Style) PageList.IncreaseCapacityError!void {
+    // If we fail to set our style for any reason, we should revert
+    // back to the old style. If we fail to do that, we revert back to
+    // the default style.
+    errdefer {
+        self.cursor.style = old_style;
+        self.manualStyleUpdate() catch |err| {
+            log.warn("setAttribute error restoring old style after failure err={}", .{err});
+            self.cursor.style = .{};
+            self.manualStyleUpdate() catch unreachable;
+        };
     }
 
     // If the attribute didn't change our style then we can skip the
@@ -3537,7 +3584,7 @@ fn selectWordCodepoint(pin: Pin) ?u21 {
     const rac = pin.rowAndCell();
     const cell = switch (rac.cell.wide) {
         .narrow, .wide => rac.cell,
-        .spacer_tail => pin.left(1).rowAndCell().cell,
+        .spacer_tail => pin.left(rac.cell.sizedTailOffset() orelse 1).rowAndCell().cell,
         .spacer_head => cell: {
             const next_row = pin.down(1) orelse return null;
             const owner = &next_row.cells(.all)[0];
@@ -3925,7 +3972,7 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
                     .narrow => {},
                     .wide => {},
                     .spacer_head => unreachable,
-                    .spacer_tail => cell = self.cursorCellLeft(2),
+                    .spacer_tail => cell = self.cursorCellLeft(1 + @as(size.CellCountInt, cell.sizedTailOffset() orelse 1)),
                 }
 
                 break :cell cell;
@@ -4581,6 +4628,20 @@ test "Screen cursorCopy hyperlink copy disabled" {
     try s2.cursorCopy(s.cursor, .{ .hyperlink = false });
     try testing.expectEqual(@as(usize, 0), page.hyperlink_set.count());
     try testing.expect(s2.cursor.hyperlink_id == 0);
+}
+
+test "Screen compound SGR applies attributes in order and preserves the default style ID" {
+    var screen = try Screen.init(std.testing.io, std.testing.allocator, .{ .cols = 8, .rows = 2, .max_scrollback_bytes = 0 });
+    defer screen.deinit();
+    var pen: sgr.Parser = .{ .params = &.{ 38, 2, 1, 2, 3, 48, 5, 200, 1 } };
+    try screen.setAttributes(&pen);
+    try std.testing.expect(screen.cursor.style_id != 0);
+    try std.testing.expect(screen.cursor.style.flags.bold);
+    try std.testing.expectEqual(@as(u8, 3), screen.cursor.style.fg_color.rgb.b);
+    try std.testing.expectEqual(@as(u8, 200), screen.cursor.style.bg_color.palette);
+    var clear_pen: sgr.Parser = .{ .params = &.{ 3, 0 } };
+    try screen.setAttributes(&clear_pen);
+    try std.testing.expectEqual(@as(usize, 0), screen.cursor.style_id);
 }
 
 test "Screen style basics" {

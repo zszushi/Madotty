@@ -255,7 +255,7 @@ pub fn constraintWidth(
     const cell = raw_slice[x];
     const cp = cell.codepoint();
 
-    const grid_width = cell.gridWidth();
+    const grid_width: u2 = @intCast(@min(cell.gridWidth(), 2));
 
     // If the grid width of the cell is 2, the constraint
     // width will always be 2, so we can just return early.
@@ -287,6 +287,37 @@ pub fn constraintWidth(
 
     // Otherwise, this has to be 1 cell wide.
     return 1;
+}
+
+/// Crop an atlas glyph to a horizontal pixel interval relative to its cell.
+/// Keeping the bearings and atlas interval in sync avoids rescaling any ink.
+pub fn clipTextHorizontally(cell: *shaderpkg.CellText, left: i32, right: i32) bool {
+    const x: i32 = cell.bearings[0];
+    const end = x + @as(i32, @intCast(cell.glyph_size[0]));
+    const visible_x = @max(x, left);
+    const visible_end = @min(end, right);
+    if (visible_x >= visible_end) return false;
+
+    cell.bearings[0] = @intCast(visible_x);
+    cell.glyph_pos[0] += @intCast(visible_x - x);
+    cell.glyph_size[0] = @intCast(visible_end - visible_x);
+    return true;
+}
+
+test "OSC 66 clips glyph geometry and atlas coordinates together" {
+    var glyph: shaderpkg.CellText = .{
+        .grid_pos = .{ 0, 0 },
+        .color = .{ 0, 0, 0, 255 },
+        .atlas = .grayscale,
+        .glyph_pos = .{ 256, 128 },
+        .glyph_size = .{ 20, 8 },
+        .bearings = .{ -2, 1 },
+    };
+    try std.testing.expect(clipTextHorizontally(&glyph, 0, 10));
+    try std.testing.expectEqual([2]i16{ 0, 1 }, glyph.bearings);
+    try std.testing.expectEqual([2]u32{ 258, 128 }, glyph.glyph_pos);
+    try std.testing.expectEqual([2]u32{ 10, 8 }, glyph.glyph_size);
+    try std.testing.expect(!clipTextHorizontally(&glyph, 11, 20));
 }
 
 /// Whether min contrast should be disabled for a given glyph. True

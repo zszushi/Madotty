@@ -130,6 +130,18 @@ pub fn changeEntrypoint(
     return result;
 }
 
+pub fn changeRenderer(self: *const SharedDeps, b: *std.Build, renderer: @TypeOf(self.config.renderer)) !SharedDeps {
+    const config = try b.allocator.create(Config);
+    config.* = self.config.*;
+    config.renderer = renderer;
+
+    var result = self.*;
+    result.config = config;
+    result.options = b.addOptions();
+    try config.addOptions(result.options);
+    return result;
+}
+
 fn initTarget(
     self: *SharedDeps,
     b: *std.Build,
@@ -382,6 +394,7 @@ pub fn add(
     if (b.lazyDependency("spirv_cross", .{
         .target = target,
         .optimize = optimize,
+        .hlsl = self.config.renderer == .d3d12,
     })) |spirv_cross_dep| {
         step.root_module.addImport(
             "spirv_cross",
@@ -662,12 +675,13 @@ pub fn add(
 
     // If we're building an exe then we have additional dependencies.
     if (step.kind != .lib) {
-        // We always statically compile glad
-        step.root_module.addIncludePath(b.path("vendor/glad/include/"));
-        step.root_module.addCSourceFile(.{
-            .file = b.path("vendor/glad/src/gl.c"),
-            .flags = &.{},
-        });
+        if (self.config.renderer != .d3d12) {
+            step.root_module.addIncludePath(b.path("vendor/glad/include/"));
+            step.root_module.addCSourceFile(.{
+                .file = b.path("vendor/glad/src/gl.c"),
+                .flags = &.{},
+            });
+        }
 
         // Link EGL for GTK.
         if (self.config.app_runtime == .gtk) {
@@ -701,8 +715,18 @@ pub fn add(
             .win32 => {
                 // Link Windows system libraries for Win32 runtime
                 if (step.rootModuleTarget().os.tag == .windows) {
-                    step.root_module.linkSystemLibrary("opengl32", .{});
+                    switch (self.config.renderer) {
+                        .d3d12 => try self.addDirectX12(step.root_module),
+                        .vulkan => _ = try @import("Vulkan.zig").addImports(b, step.root_module, self.config),
+                        else => step.root_module.linkSystemLibrary("opengl32", .{}),
+                    }
                     step.root_module.linkSystemLibrary("gdi32", .{});
+                    step.root_module.linkSystemLibrary("d2d1", .{});
+                    step.root_module.addCSourceFile(.{
+                        .file = b.path("src/apprt/win32/tab_text.cpp"),
+                        .flags = &.{ "-fno-rtti", "-fno-exceptions" },
+                    });
+                    step.root_module.linkSystemLibrary("gdiplus", .{});
                     step.root_module.linkSystemLibrary("user32", .{});
                     step.root_module.linkSystemLibrary("dwrite", .{});
                     step.root_module.linkSystemLibrary("dwmapi", .{});
@@ -720,6 +744,32 @@ pub fn add(
     self.framedata.addImport(step);
 
     return static_libs;
+}
+
+fn addDirectX12(self: *const SharedDeps, mod: *std.Build.Module) !void {
+    const b = mod.owner;
+    const dxc: std.Build.LazyPath = if (self.config.dxc) |path|
+        .{ .cwd_relative = path }
+    else
+        b.findProgramLazy(.{ .names = &.{"dxc"} });
+
+    mod.linkSystemLibrary("d3d12", .{});
+    mod.linkSystemLibrary("dxgi", .{});
+    mod.linkSystemLibrary("dcomp", .{});
+
+    const shader_source = b.path("src/renderer/directx12/shaders.hlsl");
+    for ([_][]const u8{
+        "full_screen_vs", "bg_color_ps", "cell_bg_ps",  "cell_text_vs", "cell_text_ps",
+        "image_vs",       "image_ps",    "bg_image_vs", "bg_image_ps",
+    }) |entry| {
+        const profile = if (std.mem.endsWith(u8, entry, "_vs")) "vs_6_0" else "ps_6_0";
+        const dxc_run = std.Build.Step.Run.create(b, b.fmt("compile D3D12 shader {s}", .{entry}));
+        dxc_run.addFileArg(dxc);
+        dxc_run.addArgs(&.{ "-T", profile, "-E", entry, "-O3", "-Ges", "-Fo" });
+        const dxil = dxc_run.addOutputFileArg(b.fmt("{s}.dxil", .{entry}));
+        dxc_run.addFileArg(shader_source);
+        mod.addAnonymousImport(entry, .{ .root_source_file = dxil });
+    }
 }
 
 /// Setup the dependencies for the GTK apprt build.

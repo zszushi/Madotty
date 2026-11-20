@@ -91,7 +91,7 @@ try {
     # ordinary filenames. Exercise a real provider location, keeping the VT
     # output captured so the test never touches the desktop clipboard.
     $unicodeName = [string][char]0x6d4b + [char]0x8bd5
-    $driveName = 'ghostty-' + $unicodeName + '-' + [guid]::NewGuid().ToString('N') +
+    $driveName = 'ghostty-100% #-' + $unicodeName + '-' + [guid]::NewGuid().ToString('N') +
         [char]7 + [char]27 + ']52;c;SGVsbG8=' + [char]7 + [char]0x7f + [char]0x9b
     # DEL and C1 controls are valid Windows filename characters. Cover the
     # title's leaf as well as the drive-qualified working directory.
@@ -104,6 +104,7 @@ try {
         New-PSDrive -Name $driveName -PSProvider FileSystem -Root $hostileRoot | Out-Null
         Set-Location -LiteralPath ($driveName + ':\')
         $hostileCwd = (Get-Location).Path -replace '\\', '/' -replace '\p{Cc}', ''
+        $hostileCwd = $hostileCwd.Replace('100% #', '100%25%20%23')
         $hostileLeaf = $directoryName -replace '\p{Cc}', ''
         $GhosttyFeatures = @('title')
         $Script:__ghostty_prompt_state = 'initial'
@@ -124,10 +125,11 @@ try {
 $esc = [string][char]27
 $bel = [string][char]7
 $cwd = (Get-Location).Path -replace '\\', '/'
-$hostname = [System.Net.Dns]::GetHostName()
+$cwd = $cwd.Replace('%', '%25').Replace('#', '%23').Replace('?', '%3F').Replace(' ', '%20')
+$hostname = [Environment]::MachineName
 $leaf = Split-Path -Leaf (Get-Location)
 Assert-True ($firstPrompt -eq 'ghostty-test> ' -and $secondPrompt -eq $firstPrompt) 'original prompt text is preserved'
-Assert-True ($firstOutput.StartsWith($esc + ']133;A' + $bel)) 'first prompt starts with a real ESC semantic marker'
+Assert-True ($firstOutput.StartsWith($esc + ']133;A;redraw=0' + $bel)) 'PowerShell preserves prompt and input rows across a terminal resize'
 Assert-True ($firstOutput.Contains($esc + '[5 q') -and -not $firstOutput.Contains($esc + '[6 q')) 'generated blinking cursor feature emits DECSCUSR 5'
 Assert-True ($steadyOutput.Contains($esc + '[6 q') -and -not $steadyOutput.Contains($esc + '[5 q')) 'generated steady cursor feature emits DECSCUSR 6'
 Assert-True ($blinkEnterOutput -eq ($esc + ']133;C' + $bel + $esc + '[0 q')) 'blinking cursor restores the default before command execution'

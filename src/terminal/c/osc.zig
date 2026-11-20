@@ -47,7 +47,11 @@ pub fn next(parser_: Parser, byte: u8) callconv(lib.calling_conv) void {
 }
 
 pub fn end(parser_: Parser, terminator: u8) callconv(lib.calling_conv) Command {
-    return parser_.?.end(terminator);
+    const command = parser_.?.end(terminator) orelse return null;
+    // The VT stream consumes this internal signal to release pending image
+    // bytes. A standalone OSC parser has no multipart state to release.
+    if (command.* == .iterm_inline_image and command.iterm_inline_image == .cancel) return null;
+    return command;
 }
 
 /// C: GhosttyOscOption

@@ -39,6 +39,8 @@ pub const Renderer = GenericRenderer(GraphicsAPI);
 const GraphicsAPI = switch (build_config.renderer) {
     .metal => Metal,
     .opengl => OpenGL,
+    .d3d12 => @import("renderer/DirectX12.zig"),
+    .vulkan => @import("renderer/Vulkan.zig"),
 };
 
 /// The app-scoped render device from which surface renderers are created.
@@ -59,6 +61,7 @@ pub const Health = enum(c_int) {
 test {
     // Our comptime-chosen renderer
     _ = Renderer;
+    if (build_config.renderer == .d3d12) _ = @import("renderer/directx12/frame_test.zig");
 
     _ = cursor;
     _ = message;
