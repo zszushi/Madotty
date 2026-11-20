@@ -27,7 +27,7 @@ pub fn addImports(b: *std.Build, module: *std.Build.Module, config: *const Confi
         .source = .{ .file = b.path("src/renderer/vulkan/win32_vulkan.h") },
         .target = config.target,
         .optimize = config.optimize,
-        .include_paths = &.{headers.path("Vulkan-Headers-1.3.296/include")},
+        .include_paths = &.{headers.path("include")},
         .default_init = true,
     });
 
