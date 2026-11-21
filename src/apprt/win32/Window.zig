@@ -92,6 +92,10 @@ hover_button: ?TabButton = null,
 
 /// Tab drag state: which tab is being dragged (-1 = none).
 drag_tab: isize = -1,
+drag_pane: ?*Surface = null,
+snap_overlay: ?w32.HWND = null,
+snap_rect: w32.RECT = std.mem.zeroes(w32.RECT),
+snap_started: u64 = 0,
 drag_previous_tab: usize = 0,
 /// Client coordinates of the original press.
 drag_start: w32.POINT = .{ .x = 0, .y = 0 },
@@ -558,13 +562,28 @@ pub fn tabBarHeight(self: *const Window) i32 {
 
 /// Returns the client rect available for the active surface, which is
 /// the full client area minus the tab bar height from the top.
-pub fn surfaceRect(self: *const Window) w32.RECT {
+fn surfaceArea(self: *const Window) w32.RECT {
     const hwnd = self.hwnd orelse return .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     var rect: w32.RECT = undefined;
     if (w32.GetClientRect(hwnd, &rect) == 0) {
         return .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     }
     rect.top += self.tabBarHeight();
+    return rect;
+}
+
+pub fn surfaceRect(self: *const Window) w32.RECT {
+    var rect = self.surfaceArea();
+    if (self.tab_count == 0) return rect;
+    const tree = self.tab_trees[self.active_tab];
+    if (!tree.isSplit() or tree.zoomed != null) return rect;
+    const gap: i32 = @intFromFloat(@round(5 * self.scale));
+    const x = @min(gap, @max(0, @divTrunc(rect.right - rect.left - 1, 2)));
+    const y = @min(gap, @max(0, @divTrunc(rect.bottom - rect.top - 1, 2)));
+    rect.left += x;
+    rect.right -= x;
+    rect.top += y;
+    rect.bottom -= y;
     return rect;
 }
 
@@ -607,6 +626,9 @@ pub fn focusPane(self: *Window, surface: *Surface) void {
     const previous = self.getActiveSurface() orelse return;
     if (previous == surface) return;
     self.tab_active_surface[self.active_tab] = surface;
+    if (self.hwnd) |hwnd| {
+        _ = w32.InvalidateRect(hwnd, null, 0);
+    }
     self.invalidateTabBar();
 }
 
@@ -826,6 +848,7 @@ pub fn closeTabMode(self: *Window, mode: apprt.action.CloseTabMode, surface: *Su
 /// Close a single surface within a split tree. If it's the last surface
 /// in the tab, close the entire tab instead.
 pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
+    self.cancelTabDrag();
     const alloc = self.app.core_app.alloc;
     const tab = self.findTabIndex(surface) orelse {
         log.debug("closeSplitSurface: surface not found in any tab", .{});
@@ -911,16 +934,21 @@ pub fn selectTabIndex(self: *Window, idx: usize) void {
 }
 
 fn showTab(self: *Window, idx: usize, focus: bool) void {
-    if (self.active_tab < self.tab_count) {
-        var it = self.tab_trees[self.active_tab].iterator();
+    self.stopSplitAnimation();
+    const previous = self.active_tab;
+    self.active_tab = idx;
+    const surface = self.tab_active_surface[idx];
+    // Position and show the incoming children before retiring the old ones.
+    // Hiding first briefly exposes the empty parent between two GPU surfaces.
+    self.layoutSplits();
+    if (previous != idx and previous < self.tab_count) {
+        var it = self.tab_trees[previous].iterator();
         while (it.next()) |entry| {
             entry.view.setVisible(false);
             if (entry.view.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
         }
+        if (self.hwnd) |h| _ = w32.InvalidateRect(h, null, 0);
     }
-    self.active_tab = idx;
-    const surface = self.tab_active_surface[idx];
-    self.layoutSplits();
     // An inactive child can exit while the user is searching. Keep focus
     // in the overview; explicit activation hides it before selecting.
     if (focus and !self.tab_overview.active) {
@@ -938,6 +966,7 @@ pub fn layoutSplits(self: *Window) void {
     if (tree.zoomed) |zoomed_handle| {
         var it = tree.iterator();
         while (it.next()) |entry| {
+            entry.view.pane_header = std.mem.zeroes(w32.RECT);
             if (entry.handle == zoomed_handle) {
                 entry.view.setVisible(self.isVisible());
                 if (entry.view.hwnd) |h| {
@@ -955,7 +984,7 @@ pub fn layoutSplits(self: *Window) void {
     }
     self.layoutNode(tree, .root, rect);
 
-    // Paint divider lines directly using GetDC (not BeginPaint, which
+    // Paint the newly exposed pane chrome using GetDC (not BeginPaint, which
     // clips to the invalid region and misses the content area gaps).
     if (self.hwnd) |hwnd| {
         const hdc = w32.GetDC(hwnd);
@@ -970,77 +999,165 @@ fn layoutNode(self: *Window, tree: SplitTree(Surface), handle: SplitTree(Surface
     if (handle.idx() >= tree.nodes.len) return;
     switch (tree.nodes[handle.idx()]) {
         .leaf => |view| {
+            view.pane_header = paneHeaderRect(rect, self.scale, handle != .root);
             view.setVisible(self.isVisible());
             if (view.hwnd) |h| {
-                const w = @max(rect.right - rect.left, 1);
-                const ht = @max(rect.bottom - rect.top, 1);
-                _ = w32.MoveWindow(h, rect.left, rect.top, @intCast(w), @intCast(ht), 1);
+                const content = self.paneBody(rect, view.pane_header);
+                _ = w32.MoveWindow(h, content.left, content.top, @max(1, content.right - content.left), @max(1, content.bottom - content.top), 1);
                 _ = w32.ShowWindow(h, w32.SW_SHOW);
             }
         },
         .split => |s| {
-            const gap: i32 = @intFromFloat(@round(5.0 * self.scale));
-            if (s.layout == .horizontal) {
-                const total_w = rect.right - rect.left;
-                const split_x = rect.left + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_w))));
-                const left_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = split_x - @divTrunc(gap, 2), .bottom = rect.bottom };
-                const right_rect = w32.RECT{ .left = split_x + @divTrunc(gap + 1, 2), .top = rect.top, .right = rect.right, .bottom = rect.bottom };
-                self.layoutNode(tree, s.left, left_rect);
-                self.layoutNode(tree, s.right, right_rect);
-            } else {
-                const total_h = rect.bottom - rect.top;
-                const split_y = rect.top + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_h))));
-                const top_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = split_y - @divTrunc(gap, 2) };
-                const bottom_rect = w32.RECT{ .left = rect.left, .top = split_y + @divTrunc(gap + 1, 2), .right = rect.right, .bottom = rect.bottom };
-                self.layoutNode(tree, s.left, top_rect);
-                self.layoutNode(tree, s.right, bottom_rect);
-            }
+            const areas = splitAreas(rect, s.layout, s.ratio, self.scale);
+            self.layoutNode(tree, s.left, areas.first);
+            self.layoutNode(tree, s.right, areas.second);
         },
     }
 }
 
-/// Paint divider lines between split panes in the active tab.
+/// Geometry shared by child placement and background painting at each split.
+const SplitAreas = struct { first: w32.RECT, gutter: w32.RECT, second: w32.RECT };
+
+fn splitAreas(rect: w32.RECT, layout: SplitTree(Surface).Split.Layout, ratio: f16, scale: f32) SplitAreas {
+    const horizontal = layout == .horizontal;
+    const start = if (horizontal) rect.left else rect.top;
+    const end = if (horizontal) rect.right else rect.bottom;
+    const span = @max(0, end - start);
+    const gap: i32 = @min(span, @as(i32, @intFromFloat(@round(5 * scale))));
+    const center = start + @as(i32, @intFromFloat(@as(f32, ratio) * @as(f32, @floatFromInt(span))));
+    const a = std.math.clamp(center - @divTrunc(gap, 2), start, start + span - gap);
+    const b = a + gap;
+    var areas = SplitAreas{ .first = rect, .gutter = rect, .second = rect };
+    if (horizontal) {
+        areas.first.right = a;
+        areas.gutter.left = a;
+        areas.gutter.right = b;
+        areas.second.left = b;
+    } else {
+        areas.first.bottom = a;
+        areas.gutter.top = a;
+        areas.gutter.bottom = b;
+        areas.second.top = b;
+    }
+    return areas;
+}
+
+test "win32 pane headers and nested gutters tile without uncovered pixels" {
+    const rect = w32.RECT{ .left = 3, .top = 17, .right = 274, .bottom = 240 };
+    for ([_]f32{ 1, 1.25, 1.5, 2 }) |scale| {
+        const across = splitAreas(rect, .horizontal, 0.5, scale);
+        const down = splitAreas(across.second, .vertical, 0.375, scale);
+        try std.testing.expectEqual(across.first.right, across.gutter.left);
+        try std.testing.expectEqual(across.gutter.right, down.gutter.left);
+        try std.testing.expectEqual(down.first.bottom, down.gutter.top);
+        try std.testing.expectEqual(down.gutter.bottom, down.second.top);
+        try std.testing.expectEqual(rect.right, down.gutter.right);
+    }
+}
+
 fn paintDividers(self: *Window, hdc: w32.HDC) void {
     if (self.tab_count == 0) return;
     const tree = self.tab_trees[self.active_tab];
     if (!tree.isSplit()) return;
     if (tree.zoomed != null) return;
     const rect = self.surfaceRect();
+    const outer = self.surfaceArea();
+    const bg = self.app.config.background;
+    if (w32.GetStockObject(w32.DC_BRUSH)) |brush| {
+        _ = w32.SetDCBrushColor(hdc, w32.RGB(bg.r, bg.g, bg.b));
+        for ([_]w32.RECT{
+            .{ .left = outer.left, .right = outer.right, .top = outer.top, .bottom = rect.top },
+            .{ .left = outer.left, .right = outer.right, .top = rect.bottom, .bottom = outer.bottom },
+            .{ .left = outer.left, .right = rect.left, .top = rect.top, .bottom = rect.bottom },
+            .{ .left = rect.right, .right = outer.right, .top = rect.top, .bottom = rect.bottom },
+        }) |edge| _ = w32.FillRect(hdc, &edge, @ptrCast(brush));
+    }
     self.paintDividerNode(hdc, tree, .root, rect);
+}
+
+fn paneHeaderRect(rect: w32.RECT, scale: f32, split: bool) w32.RECT {
+    var header = rect;
+    const height: i32 = @intFromFloat(@round(25 * scale));
+    header.bottom = rect.top + if (split and rect.bottom - rect.top >= 3 * height and rect.right - rect.left >= 2 * height) height else @as(i32, 0);
+    return header;
+}
+
+test "win32 pane headers reserve space only in roomy splits" {
+    const rect: w32.RECT = .{ .left = 10, .top = 30, .right = 310, .bottom = 106 };
+    try std.testing.expectEqual(@as(i32, 55), paneHeaderRect(rect, 1, true).bottom);
+    try std.testing.expectEqual(rect.top, paneHeaderRect(rect, 1, false).bottom);
+    try std.testing.expectEqual(rect.top, paneHeaderRect(rect, 2, true).bottom);
+}
+
+fn paneBody(self: *const Window, outer: w32.RECT, header: w32.RECT) w32.RECT {
+    const edge: i32 = if (header.bottom > outer.top) @intFromFloat(@round(3 * self.scale)) else 0;
+    return .{ .left = outer.left + edge, .top = header.bottom, .right = outer.right - edge, .bottom = outer.bottom - edge };
+}
+
+fn paintPaneHeader(self: *Window, dc: w32.HDC, view: *Surface, outer: w32.RECT) void {
+    const rect = view.pane_header;
+    const height = rect.bottom - rect.top;
+    if (height <= 0 or rect.right <= rect.left) return;
+    const saved = w32.SaveDC(dc);
+    if (saved == 0) return;
+    defer _ = w32.RestoreDC(dc, saved);
+    const active = self.getActiveSurface() == view;
+    const bg = self.app.config.background;
+    const fg = self.app.config.foreground;
+    const brush = w32.GetStockObject(w32.DC_BRUSH) orelse return;
+    const body = self.paneBody(outer, rect);
+    // Only paint the four strips around the renderer's child window.
+    const edges = [_]w32.RECT{
+        rect,
+        .{ .left = outer.left, .top = body.bottom, .right = outer.right, .bottom = outer.bottom },
+        .{ .left = outer.left, .top = body.top, .right = body.left, .bottom = body.bottom },
+        .{ .left = body.right, .top = body.top, .right = outer.right, .bottom = body.bottom },
+    };
+    const radius: i32 = @intFromFloat(@round(6 * self.scale));
+    for (edges) |edge| {
+        const state = w32.SaveDC(dc);
+        if (state == 0) continue;
+        defer _ = w32.RestoreDC(dc, state);
+        if (w32.IntersectClipRect(dc, edge.left, edge.top, edge.right, edge.bottom) <= 1) continue;
+        _ = w32.SetDCBrushColor(dc, w32.RGB(bg.r, bg.g, bg.b));
+        _ = w32.FillRect(dc, &edge, @ptrCast(brush));
+        const color = tabColor(bg, fg, if (active) 27 else 12);
+        if (self.app.tab_icon_renderer == null or !Icons.fillRounded(dc, outer, 0, radius, color)) {
+            _ = w32.SetDCBrushColor(dc, color);
+            _ = w32.FillRect(dc, &edge, @ptrCast(brush));
+        }
+    }
+    if (w32.IntersectClipRect(dc, rect.left, rect.top, rect.right, rect.bottom) <= 1) return;
+    const pad: i32 = @intFromFloat(@round(8 * self.scale));
+    const size: i32 = @intFromFloat(@round(15 * self.scale));
+    var text = rect;
+    text.left += pad;
+    text.right -= pad;
+    if (rect.right - rect.left >= size + 7 * pad) {
+        if (view.tab_shell) |shell| {
+            if (shell.draw(dc, text.left, rect.top + @divTrunc(height - size, 2), size)) text.left += size + @divTrunc(pad, 2);
+        }
+    }
+    if (text.left >= text.right) return;
+    if (self.tab_font) |font| _ = w32.SelectObject(dc, font);
+    _ = w32.SetBkMode(dc, w32.TRANSPARENT);
+    const label = if (view.launch_title_len != 0) view.launch_title[0..view.launch_title_len] else std.unicode.utf8ToUtf16LeStringLiteral("Madotty");
+    _ = self.drawTabLabel(dc, text, label, tabColor(bg, fg, if (active) 245 else 176), w32.DT_LEFT, false);
 }
 
 fn paintDividerNode(self: *Window, hdc: w32.HDC, tree: SplitTree(Surface), handle: SplitTree(Surface).Node.Handle, rect: w32.RECT) void {
     if (handle.idx() >= tree.nodes.len) return;
     switch (tree.nodes[handle.idx()]) {
-        .leaf => {},
+        .leaf => |pane| self.paintPaneHeader(hdc, pane, rect),
         .split => |s| {
-            const gap: i32 = @intFromFloat(@round(5.0 * self.scale));
-            const line_w: i32 = @max(@as(i32, @intFromFloat(@round(1.0 * self.scale))), 1);
-
-            const pen = w32.CreatePen(0, line_w, 0x00808080) orelse return;
-            defer _ = w32.DeleteObject(pen);
-            const old_pen = w32.SelectObject(hdc, pen);
-            defer _ = w32.SelectObject(hdc, old_pen);
-
-            if (s.layout == .horizontal) {
-                const total_w = rect.right - rect.left;
-                const split_x = rect.left + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_w))));
-                _ = w32.MoveToEx(hdc, split_x, rect.top, null);
-                _ = w32.LineTo(hdc, split_x, rect.bottom);
-                const left_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = split_x - @divTrunc(gap, 2), .bottom = rect.bottom };
-                const right_rect = w32.RECT{ .left = split_x + @divTrunc(gap + 1, 2), .top = rect.top, .right = rect.right, .bottom = rect.bottom };
-                self.paintDividerNode(hdc, tree, s.left, left_rect);
-                self.paintDividerNode(hdc, tree, s.right, right_rect);
-            } else {
-                const total_h = rect.bottom - rect.top;
-                const split_y = rect.top + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_h))));
-                _ = w32.MoveToEx(hdc, rect.left, split_y, null);
-                _ = w32.LineTo(hdc, rect.right, split_y);
-                const top_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = split_y - @divTrunc(gap, 2) };
-                const bottom_rect = w32.RECT{ .left = rect.left, .top = split_y + @divTrunc(gap + 1, 2), .right = rect.right, .bottom = rect.bottom };
-                self.paintDividerNode(hdc, tree, s.left, top_rect);
-                self.paintDividerNode(hdc, tree, s.right, bottom_rect);
+            const areas = splitAreas(rect, s.layout, s.ratio, self.scale);
+            if (w32.GetStockObject(w32.DC_BRUSH)) |brush| {
+                const bg = self.app.config.background;
+                _ = w32.SetDCBrushColor(hdc, w32.RGB(bg.r, bg.g, bg.b));
+                _ = w32.FillRect(hdc, &areas.gutter, @ptrCast(brush));
             }
+            self.paintDividerNode(hdc, tree, s.left, areas.first);
+            self.paintDividerNode(hdc, tree, s.right, areas.second);
         },
     }
 }
@@ -1185,6 +1302,7 @@ pub fn newSplit(self: *Window, direction: SplitTree(Surface).Split.Direction) !v
     self.focusPane(new_surface);
 
     self.layoutSplits();
+    self.startSplitAnimation(new_surface);
     if (new_surface.hwnd) |h| _ = w32.SetFocus(h);
 }
 
@@ -1451,6 +1569,7 @@ pub fn mergeTabIntoPane(self: *Window, tab_idx: usize, destination: *Window, tar
     destination.selectTabIndex(new_index);
     destination.updateTabBarVisibility();
     if (self != destination) _ = w32.SetForegroundWindow(destination_hwnd);
+    destination.startSplitAnimation(moved_active);
     if (moved_active.hwnd) |h| _ = w32.SetFocus(h);
 }
 
@@ -1481,12 +1600,9 @@ fn adoptTabPanes(destination: *Window, moved: *const SplitTree(Surface)) void {
 }
 
 fn reparentTabWindows(tree: *const SplitTree(Surface), source: w32.HWND, destination: w32.HWND) !void {
-    const native = struct {
-        extern "user32" fn GetFocus() callconv(.winapi) ?w32.HWND;
-    };
-    const previous_focus = native.GetFocus();
+    const previous_focus = w32.GetFocus();
     errdefer if (previous_focus) |hwnd| {
-        if (native.GetFocus() != hwnd) _ = w32.SetFocus(hwnd);
+        if (w32.GetFocus() != hwnd) _ = w32.SetFocus(hwnd);
     };
     var moved: usize = 0;
     var it = tree.iterator();
@@ -2152,14 +2268,16 @@ fn layoutTabStrip(self: *Window, width: i32, height: i32) void {
     };
 }
 
-fn drawPill(hdc: w32.HDC, rect: w32.RECT, inset: i32, color: u32) void {
-    const diameter = @min(rect.right - rect.left, rect.bottom - rect.top) - 2 * inset;
-    if (diameter <= 0) return;
-    _ = w32.SetDCBrushColor(hdc, color);
-    _ = w32.RoundRect(hdc, rect.left + inset, rect.top + inset, rect.right - inset, rect.bottom - inset, diameter, diameter);
-}
+const TabBitmap = struct {
+    pixels: [*]u32,
+    stride: i32,
 
-fn drawTabProgress(self: *const Window, dc: w32.HDC, tab: w32.RECT, progress: Progress) void {
+    fn drawPill(bitmap: TabBitmap, dc: w32.HDC, rect: w32.RECT, inset: i32, color: u32) void {
+        Icons.fillTabPill(dc, bitmap.pixels, bitmap.stride, rect, inset, color);
+    }
+};
+
+fn drawTabProgress(self: *const Window, bitmap: TabBitmap, dc: w32.HDC, tab: w32.RECT, progress: Progress) void {
     const slot: usize = switch (progress.state) {
         .remove => return,
         .set, .indeterminate => 2,
@@ -2183,32 +2301,32 @@ fn drawTabProgress(self: *const Window, dc: w32.HDC, tab: w32.RECT, progress: Pr
     const bottom = tab.bottom - @as(i32, @intFromFloat(@round(5 * self.scale)));
     const left = tab.left + @divTrunc(tab.right - tab.left - width, 2);
     var track: w32.RECT = .{ .left = left, .top = bottom - height, .right = left + width, .bottom = bottom };
-    drawPill(dc, track, 0, tabColor(bg, fg, 68));
+    bitmap.drawPill(dc, track, 0, tabColor(bg, fg, 68));
     if (progress.state == .indeterminate) {
         const dash = @min(height + 1, @divTrunc(width, 5));
         for (0..3) |index| {
             track.left = left + @divTrunc(width - 5 * dash, 2) + 2 * dash * @as(i32, @intCast(index));
             track.right = track.left + dash;
-            drawPill(dc, track, 0, color);
+            bitmap.drawPill(dc, track, 0, color);
         }
     } else if (progress.value != 0) {
         track.right = left + @max(1, @divTrunc(width * progress.value + 50, 100));
-        drawPill(dc, track, 0, color);
+        bitmap.drawPill(dc, track, 0, color);
     }
 }
 
-fn drawNewTabControl(self: *const Window, dc: w32.HDC, brush: w32.HBRUSH, bg: Config.Color, fg: Config.Color, inset: i32) void {
+fn drawNewTabControl(self: *const Window, bitmap: TabBitmap, dc: w32.HDC, brush: w32.HBRUSH, bg: Config.Color, fg: Config.Color, inset: i32) void {
     const plus = self.tab_buttons[@backingInt(TabButton.new_tab)];
     const menu = self.tab_buttons[@backingInt(TabButton.environment)];
     if (plus.right - plus.left <= 2 * inset) return;
     const control: w32.RECT = .{ .left = plus.left, .top = plus.top, .right = menu.right, .bottom = menu.bottom };
-    drawPill(dc, control, inset, tabColor(bg, fg, 15));
+    bitmap.drawPill(dc, control, inset, tabColor(bg, fg, 15));
     if (self.hover_button) |button| {
         const half = self.tab_buttons[@backingInt(button)];
         const saved = w32.SaveDC(dc);
         if (saved != 0) {
             _ = w32.IntersectClipRect(dc, half.left, half.top, half.right, half.bottom);
-            drawPill(dc, control, inset, tabColor(bg, fg, 30));
+            bitmap.drawPill(dc, control, inset, tabColor(bg, fg, 30));
             _ = w32.RestoreDC(dc, saved);
         }
     }
@@ -2241,7 +2359,7 @@ fn paintTabBar(self: *Window) void {
     const hdc_screen = w32.BeginPaint(hwnd, &ps) orelse return;
     defer _ = w32.EndPaint(hwnd, &ps);
 
-    // If the tab bar is not visible, just validate the region and return.
+    if (ps.rcPaint.bottom > self.tabBarHeight()) self.paintDividers(hdc_screen);
     if (!self.tab_bar_visible) return;
 
     const bar_h = self.tabBarHeight();
@@ -2264,10 +2382,8 @@ fn paintTabBar(self: *Window) void {
     defer _ = w32.DeleteDC(mem_dc);
 
     var bitmap_bits: ?*anyopaque = null;
-    const mem_bmp = if (self.system_backdrop_active)
-        w32.CreateDIBSection(hdc_screen, &.{ .bmiHeader = .{ .biWidth = client_w, .biHeight = -bar_h } }, w32.DIB_RGB_COLORS, &bitmap_bits, null, 0) orelse return
-    else
-        w32.CreateCompatibleBitmap(hdc_screen, client_w, bar_h) orelse return;
+    const mem_bmp = w32.CreateDIBSection(hdc_screen, &.{ .bmiHeader = .{ .biWidth = client_w, .biHeight = -bar_h } }, w32.DIB_RGB_COLORS, &bitmap_bits, null, 0) orelse return;
+    const bitmap: TabBitmap = .{ .pixels = @ptrCast(@alignCast(bitmap_bits.?)), .stride = client_w };
     const old_bmp = w32.SelectObject(mem_dc, mem_bmp);
     defer {
         _ = w32.SelectObject(mem_dc, old_bmp);
@@ -2276,7 +2392,6 @@ fn paintTabBar(self: *Window) void {
 
     const bg = self.app.config.background;
     const fg = self.app.config.foreground;
-    const bar_color = w32.RGB(bg.r, bg.g, bg.b);
     const hover_color = tabColor(bg, fg, 16);
     const active_bg_color = tabColor(bg, fg, 25);
     const close_hover_color = tabColor(bg, fg, 40);
@@ -2286,8 +2401,12 @@ fn paintTabBar(self: *Window) void {
     const brush: w32.HBRUSH = @ptrCast(w32.GetStockObject(w32.DC_BRUSH) orelse return);
 
     // --- Fill bar background ---
-    _ = w32.SetDCBrushColor(mem_dc, bar_color);
-    _ = w32.FillRect(mem_dc, &dirty, brush);
+    const base_rgb = (@as(u32, bg.r) << 16) | (@as(u32, bg.g) << 8) | bg.b;
+    const fill = if (self.system_backdrop_active) backdropTabPixel(bg, self.app.config.@"background-opacity", self.app.config.@"alpha-blending") else 0xff000000 | base_rgb;
+    for (@intCast(dirty.top)..@intCast(dirty.bottom)) |y| {
+        const row = bitmap.pixels + y * @as(usize, @intCast(client_w));
+        @memset(row[@intCast(dirty.left)..@intCast(dirty.right)], fill);
+    }
 
     // --- Select font and set text mode ---
     var old_font: ?*anyopaque = null;
@@ -2313,7 +2432,6 @@ fn paintTabBar(self: *Window) void {
     _ = w32.IntersectClipRect(mem_dc, 0, 0, tab_area_right, bar_h);
     var shortcuts: [MAX_TABS]?Binding.Trigger = undefined;
     tabShortcuts(self.app.config.keybind.set, shortcuts[0..self.tab_count]);
-    const common_shell = mostFrequentShell(self.tab_active_surface[0..self.tab_count]);
 
     // --- Draw each tab ---
     // The floating tab is only the reorder preview. Once a hover reveals
@@ -2342,9 +2460,9 @@ fn paintTabBar(self: *Window) void {
 
         if (visual.right <= dirty.left or x >= @min(dirty.right, tab_area_right)) continue;
         if (is_active or is_hovered)
-            drawPill(mem_dc, visual, inset, if (is_active) active_bg_color else hover_color);
+            bitmap.drawPill(mem_dc, visual, inset, if (is_active) active_bg_color else hover_color);
         if (self.app.config.@"progress-style" and self.progress.state != .remove)
-            self.drawTabProgress(mem_dc, visual, self.tabProgress(i));
+            self.drawTabProgress(bitmap, mem_dc, visual, self.tabProgress(i));
 
         const flags = w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX;
         const close_rect = self.tabCloseRect(visual);
@@ -2377,17 +2495,19 @@ fn paintTabBar(self: *Window) void {
         if (tab_label.len > 0 or show_admin) {
             _ = w32.SetTextColor(mem_dc, if (is_active) active_text_color else inactive_text_color);
             var title = tabTitleLayout(this_tab_w, padding, inset, is_hovered);
-            if (self.tab_active_surface[i].tab_shell) |shell| {
-                if (shell.id != common_shell) {
-                    const size = 4 * inset;
-                    const leading = 2 * inset + size + inset;
-                    // On the narrowest tabs the close affordance takes
-                    // priority over the icon while the pointer is inside.
-                    if (this_tab_w - leading - title.trailing >= 8 * inset and
-                        shell.draw(mem_dc, x + 2 * inset, @divTrunc(bar_h - size, 2), size))
-                        title.leading = @max(leading, title.leading);
-                }
+            var measured = std.mem.zeroes(w32.RECT);
+            if (tab_label.len > 0)
+                _ = w32.DrawTextW(mem_dc, tab_label.ptr, @intCast(tab_label.len), &measured, flags | w32.DT_CALCRECT);
+            const icons = tabIconLayout(this_tab_w, bar_h, title, inset, measured.right);
+            var panes = self.tab_trees[i].iterator();
+            var drawn: i32 = 0;
+            while (drawn < icons.count) {
+                const pane = panes.next() orelse break;
+                const shell = pane.view.tab_shell orelse continue;
+                const left = x + icons.start + drawn * (icons.size + inset);
+                if (shell.draw(mem_dc, left, @divTrunc(bar_h - icons.size, 2), icons.size)) drawn += 1;
             }
+            if (drawn > 0) title.leading = @max(title.leading, icons.start + drawn * (icons.size + inset));
             const text_rect = w32.RECT{
                 .left = x + title.leading,
                 .top = 0,
@@ -2411,7 +2531,7 @@ fn paintTabBar(self: *Window) void {
 
         if (is_hovered) {
             if (self.hover_close) {
-                drawPill(mem_dc, close_rect, @divTrunc(inset, 2), close_hover_color);
+                bitmap.drawPill(mem_dc, close_rect, @divTrunc(inset, 2), close_hover_color);
             }
             if (self.app.tab_icon_renderer != null) {
                 const color = if (self.hover_close) active_text_color else inactive_text_color;
@@ -2425,25 +2545,20 @@ fn paintTabBar(self: *Window) void {
     if (self.drop_slot) |slot| {
         const edge = if (slot < self.tab_count) self.tab_rects[slot].left else if (self.tab_count > 0) self.tab_rects[self.tab_count - 1].right else 0;
         const x = std.math.clamp(edge, 0, @max(0, tab_area_right - inset));
-        drawPill(mem_dc, .{ .left = x, .right = x + inset, .top = inset, .bottom = bar_h - inset }, 0, active_text_color);
+        bitmap.drawPill(mem_dc, .{ .left = x, .right = x + inset, .top = inset, .bottom = bar_h - inset }, 0, active_text_color);
     }
     _ = w32.RestoreDC(mem_dc, saved_dc);
 
-    if (dirty.right > tab_area_right) self.drawNewTabControl(mem_dc, brush, bg, fg, inset);
+    if (dirty.right > tab_area_right) self.drawNewTabControl(bitmap, mem_dc, brush, bg, fg, inset);
 
-    if (bitmap_bits) |bits| {
-        // GDI leaves alpha unset. DWM would add the strip RGB to its
-        // material. Supply the same fill as the WGL window and keep the
-        // rasterized tabs, labels, and controls opaque.
+    if (self.system_backdrop_active) {
+        // GDI text and rules can clear alpha. Keep the coverage written by
+        // the pill rasterizer, including pixels blended with the backdrop.
         _ = w32.GdiFlush();
-        const pixels: [*]u32 = @ptrCast(@alignCast(bits));
-        const base_rgb = (@as(u32, bg.r) << 16) | (@as(u32, bg.g) << 8) | bg.b;
-        const fill = backdropTabPixel(bg, self.app.config.@"background-opacity", self.app.config.@"alpha-blending");
         for (@intCast(dirty.top)..@intCast(dirty.bottom)) |y| {
-            const row = pixels + y * @as(usize, @intCast(client_w));
+            const row = bitmap.pixels + y * @as(usize, @intCast(client_w));
             for (row[@intCast(dirty.left)..@intCast(dirty.right)]) |*pixel| {
-                const rgb = pixel.* & 0x00ffffff;
-                pixel.* = if (rgb == base_rgb) fill else rgb | 0xff000000;
+                if (pixel.* >> 24 == 0 and pixel.* != fill) pixel.* |= 0xff000000;
             }
         }
     }
@@ -2454,40 +2569,23 @@ fn paintTabBar(self: *Window) void {
 
 const TabTitleLayout = struct { leading: i32, trailing: i32, flags: u32 };
 
-fn mostFrequentShell(panes: []const *Surface) ?u64 {
-    var counts: [MAX_TABS]struct { id: u64, count: usize } = undefined;
-    var used: usize = 0;
-    for (panes) |pane| {
-        const shell = pane.tab_shell orelse continue;
-        for (counts[0..used]) |*entry| {
-            if (entry.id == shell.id) {
-                entry.count += 1;
-                break;
-            }
-        } else {
-            counts[used] = .{ .id = shell.id, .count = 1 };
-            used += 1;
-        }
-    }
-    if (used == 0) return null;
-    var common = counts[0];
-    for (counts[1..used]) |entry| {
-        if (entry.count > common.count) common = entry;
-    }
-    return common.id;
+const TabIcons = struct { start: i32, size: i32, count: i32 };
+
+fn tabIconLayout(width: i32, height: i32, title: TabTitleLayout, inset: i32, label_width: i32) TabIcons {
+    const start = 2 * inset;
+    const size = @min(4 * inset, height - 2 * inset);
+    const allowed = @max(title.leading, width - title.trailing - @max(10 * inset, label_width));
+    const count = if (size <= 0 or title.flags == w32.DT_LEFT) 0 else std.math.clamp(@divTrunc(allowed - start, size + inset), 0, 3);
+    return .{ .start = start, .size = size, .count = count };
 }
 
-test "tab bar icons distinguish mixed known shells" {
-    var first: Surface = undefined;
-    var second: Surface = undefined;
-    first.tab_shell = .{ .id = 1, .icon = null };
-    second.tab_shell = null;
-    try std.testing.expectEqual(@as(?u64, 1), mostFrequentShell(&.{ &first, &second }));
-    second.tab_shell = first.tab_shell;
-    try std.testing.expectEqual(@as(?u64, 1), mostFrequentShell(&.{ &first, &second }));
-    second.tab_shell.?.id = 2;
-    try std.testing.expectEqual(@as(?u64, 1), mostFrequentShell(&.{ &first, &second }));
-    try std.testing.expectEqual(@as(?u64, 2), mostFrequentShell(&.{ &first, &second, &second }));
+test "win32 tab icons preserve the title and fit the rounded bounds" {
+    for ([_]i32{ 4, 5, 6, 8 }) |s| {
+        const wide = tabTitleLayout(80 * s, 8 * s, s, false);
+        try std.testing.expectEqual(@as(i32, 3), tabIconLayout(80 * s, 8 * s, wide, s, 30 * s).count);
+        try std.testing.expectEqual(@as(i32, 1), tabIconLayout(80 * s, 8 * s, wide, s, 80 * s).count);
+        try std.testing.expectEqual(@as(i32, 0), tabIconLayout(18 * s, 8 * s, tabTitleLayout(18 * s, 8 * s, s, false), s, 5 * s).count);
+    }
 }
 
 const DirectoryLabels = struct { full: []const u16, short: []const u16 };
@@ -2843,7 +2941,11 @@ fn handleTabBarClick(self: *Window, x: i16, y: i16) void {
         self.closeTabByIndex(i);
     } else {
         const previous = self.active_tab;
-        self.selectTabIndex(i);
+        if (previous != i) {
+            self.selectTabIndex(i);
+        } else if (self.tab_active_surface[i].hwnd) |h| {
+            if (w32.GetFocus() != h) _ = w32.SetFocus(h);
+        }
         self.drag_tab = @intCast(i);
         self.drag_previous_tab = previous;
         self.drag_start = .{ .x = x, .y = y };
@@ -2859,6 +2961,45 @@ fn handleTabBarClick(self: *Window, x: i16, y: i16) void {
 }
 
 const SplitDirection = SplitTree(Surface).Split.Direction;
+const split_animation_timer = 0x5350;
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+extern "user32" fn SystemParametersInfoW(u32, u32, *i32, u32) callconv(.winapi) i32;
+
+fn stopSplitAnimation(self: *Window) void {
+    const overlay = self.snap_overlay orelse return;
+    self.snap_overlay = null;
+    if (self.hwnd) |owner| _ = w32.KillTimer(owner, split_animation_timer);
+    _ = w32.DestroyWindow(overlay);
+}
+
+fn startSplitAnimation(self: *Window, surface: *Surface) void {
+    self.stopSplitAnimation();
+    const owner = self.hwnd orelse return;
+    const pane = surface.hwnd orelse return;
+    var enabled: i32 = 0;
+    if (SystemParametersInfoW(0x1042, 0, &enabled, 0) == 0 or enabled == 0 or
+        w32.GetForegroundWindow() != owner or w32.GetWindowRect(pane, &self.snap_rect) == 0) return;
+    const overlay = w32.CreateWindowExW(w32.WS_EX_NOACTIVATE | w32.WS_EX_TOOLWINDOW | w32.WS_EX_TRANSPARENT | w32.WS_EX_LAYERED, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral(""), w32.WS_POPUP, 0, 0, 0, 0, owner, null, self.app.hinstance, null) orelse return;
+    self.snap_overlay = overlay;
+    self.snap_started = GetTickCount64();
+    if (w32.SetTimer(owner, split_animation_timer, 16, null) == 0) return self.stopSplitAnimation();
+    self.stepSplitAnimation();
+}
+
+fn stepSplitAnimation(self: *Window) void {
+    const overlay = self.snap_overlay orelse return;
+    const elapsed = GetTickCount64() - self.snap_started;
+    if (elapsed >= 150) return self.stopSplitAnimation();
+    const t = 1 - @as(f32, @floatFromInt(elapsed)) / 150;
+    const rect = self.snap_rect;
+    const w = rect.right - rect.left;
+    const h = rect.bottom - rect.top;
+    const dx: i32 = @intFromFloat(@as(f32, @floatFromInt(w)) * 0.06 * t * t);
+    const dy: i32 = @intFromFloat(@as(f32, @floatFromInt(h)) * 0.06 * t * t);
+    _ = w32.SetLayeredWindowAttributes(overlay, 0, @intFromFloat(52 * t), w32.LWA_ALPHA);
+    _ = w32.SetWindowPos(overlay, null, rect.left + dx, rect.top + dy, w - 2 * dx, h - 2 * dy, w32.SWP_NOACTIVATE | w32.SWP_SHOWWINDOW);
+}
+
 const PaneDrop = struct { direction: SplitDirection, rect: w32.RECT };
 const DropTarget = struct {
     window: *Window,
@@ -2942,9 +3083,10 @@ fn dropTarget(self: *Window, screen: w32.POINT) ?DropTarget {
             } else slot = other.tab_count;
             return .{ .window = other, .target = .{ .strip = slot } };
         }
-        if (other == self and self.drag_tab == @as(isize, @intCast(other.active_tab))) return none;
+        if (self.drag_pane == null and other == self and self.drag_tab == @as(isize, @intCast(other.active_tab))) return none;
         var panes = other.tab_trees[other.active_tab].iterator();
         while (panes.next()) |entry| {
+            if (entry.view == self.drag_pane) continue;
             const hwnd = entry.view.hwnd orelse continue;
             var rect: w32.RECT = undefined;
             if (w32.IsWindowVisible_(hwnd) == 0 or w32.GetWindowRect(hwnd, &rect) == 0) continue;
@@ -3001,7 +3143,8 @@ fn showDraggedTitle(self: *Window, point: w32.POINT, on_strip: bool) void {
     if (self.drag_label == null) {
         const i: usize = @intCast(self.drag_tab);
         var title: [257]u16 = undefined;
-        const visible = self.tabLabel(i);
+        var pane_title: [255]u16 = undefined;
+        const visible = if (self.drag_pane) |pane| pane_title[0..encodeTabTitle(&pane_title, pane, pane.getTitle() orelse "")] else self.tabLabel(i);
         const len = visible.len;
         @memcpy(title[0..len], visible);
         title[len] = 0;
@@ -3021,9 +3164,11 @@ pub fn cancelTabDrag(self: *Window) void {
 fn endTabDrag(self: *Window, restore: bool) void {
     if (self.drag_tab < 0) return;
     const tab = self.drag_previous_tab;
+    const restore_tab = restore and self.drag_active;
     self.setDragHover(null);
     self.showDropTarget(null);
     self.drag_tab = -1;
+    self.drag_pane = null;
     self.drag_active = false;
     self.drag_on_strip = false;
     if (self.split_preview) |popup| {
@@ -3037,7 +3182,7 @@ fn endTabDrag(self: *Window, restore: bool) void {
     self.invalidateTabBar();
     if (self.hwnd) |hwnd| {
         if (GetCapture() == hwnd) _ = w32.ReleaseCapture();
-        if (restore and !self.closing and tab < self.tab_count and self.active_tab != tab)
+        if (restore_tab and !self.closing and tab < self.tab_count and self.active_tab != tab)
             self.showTab(tab, w32.GetForegroundWindow() == hwnd);
     }
 }
@@ -3075,7 +3220,15 @@ fn finishTabDrag(self: *Window, point: w32.POINT) void {
     }
     const target = self.dropTarget(position);
     const previous = self.drag_previous_tab;
+    const dragged_pane = self.drag_pane;
     self.endTabDrag(if (target) |t| t.window != self or t.target != .pane else true);
+    if (dragged_pane) |pane| {
+        if (target) |t| {
+            if (t.target == .none) return;
+        } else if (containsPoint(outer, position.x, position.y)) return;
+        self.dropSinglePane(tab, pane, target, position) catch |err| log.err("failed to move pane: {}", .{err});
+        return;
+    }
     if (target) |t| {
         switch (t.target) {
             .none => {},
@@ -3105,6 +3258,53 @@ fn finishTabDrag(self: *Window, point: w32.POINT) void {
     }
     _ = self.moveTabToNewWindowAt(self.tab_active_surface[tab], position) catch |err|
         log.err("failed to detach dragged tab: {}", .{err});
+}
+
+/// Stage the pane as a single-leaf tab to reuse the normal tab transfer and
+/// native-window rollback paths. Keep the original tree until the drop commits.
+fn dropSinglePane(self: *Window, source: usize, pane: *Surface, target: ?DropTarget, position: w32.POINT) !void {
+    if (source >= self.tab_count or self.tab_count >= MAX_TABS) return error.InvalidTabTarget;
+    const handle = self.findHandle(source, pane) orelse return error.InvalidTabTarget;
+    var original = self.tab_trees[source];
+    if (!original.isSplit()) return error.InvalidTabTarget;
+    const alloc = self.app.core_app.alloc;
+    var remainder = try original.remove(alloc, handle);
+    errdefer remainder.deinit();
+    var single = try SplitTree(Surface).init(alloc, pane);
+    errdefer single.deinit();
+    const idx = self.tab_count;
+    const saved_title = self.tab_titles[source];
+    const saved_focus = self.tab_active_surface[source];
+    self.tab_trees[source] = remainder;
+    var it = remainder.iterator();
+    if (saved_focus == pane) self.tab_active_surface[source] = it.next().?.view;
+    self.tab_trees[idx] = single;
+    self.tab_active_surface[idx] = pane;
+    self.tab_titles[idx] = .{};
+    self.tab_titles[idx].len = @intCast(encodeTabTitle(self.tab_titles[idx].text[0..255], pane, pane.getTitle() orelse ""));
+    self.tab_count += 1;
+    errdefer {
+        self.tab_count -= 1;
+        self.tab_trees[source] = original;
+        self.tab_active_surface[source] = saved_focus;
+        self.tab_titles[source] = saved_title;
+        self.layoutSplits();
+    }
+    self.refreshPaneTitle(source);
+    const remaining_focus = self.tab_active_surface[source];
+    self.onTabTitleChanged(remaining_focus, remaining_focus.getTitle() orelse "");
+    if (target) |t| switch (t.target) {
+        .none => return error.InvalidTabTarget,
+        .pane => |dest| try self.mergeTabIntoPane(idx, t.window, dest.surface, dest.drop.direction),
+        .strip => |slot| if (self == t.window) {
+            self.selectTabIndex(idx);
+            self.moveTabTo(idx, slot);
+        } else try self.transferTab(idx, t.window, slot),
+    } else if (!try self.moveTabToNewWindowAt(pane, position)) return error.InvalidTabTarget;
+    original.deinit();
+    self.updateTabBarVisibility();
+    self.layoutSplits();
+    self.invalidateTabBar();
 }
 
 fn clampTabDrop(point: w32.POINT, work: w32.RECT, margin: i32) w32.POINT {
@@ -3570,6 +3770,7 @@ fn cleanupAllSurfaces(self: *Window) void {
 /// Surfaces are already cleaned up by close() before DestroyWindow.
 fn onDestroy(self: *Window) void {
     const app = self.app;
+    self.stopSplitAnimation();
     self.endTabDrag(false);
     for (app.windows.items) |source| {
         if (source.preview_rect != null and source.preview_owner == self.hwnd)
@@ -3702,6 +3903,10 @@ pub fn windowWndProc(
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_TIMER => {
+            if (wparam == split_animation_timer) {
+                window.stepSplitAnimation();
+                return 0;
+            }
             if (wparam == TAB_HOVER_TIMER) {
                 _ = w32.KillTimer(hwnd, TAB_HOVER_TIMER);
                 if (window.drag_hover_tab) |idx| if (window.drag_active and idx < window.tab_count and
@@ -3720,6 +3925,9 @@ pub fn windowWndProc(
         },
 
         w32.WM_CTLCOLORSTATIC => {
+            if (window.snap_overlay) |overlay| if (@intFromPtr(overlay) == @as(usize, @bitCast(lparam))) {
+                if (GetSysColorBrush(13)) |brush| return @bitCast(@intFromPtr(brush));
+            };
             if (window.split_preview) |preview| if (@intFromPtr(preview) == @as(usize, @bitCast(lparam))) {
                 if (GetSysColorBrush(13)) |brush| return @bitCast(@intFromPtr(brush)); // COLOR_HIGHLIGHT
             };
@@ -3761,6 +3969,7 @@ pub fn windowWndProc(
             return 0;
         },
         w32.WM_SIZE => {
+            window.stopSplitAnimation();
             // Minimizing does not hide child surface HWNDs, so tell the core
             // to stop rendering the active tab while minimized. Return early:
             // the client rect is 0x0 while minimized, so re-laying-out would
@@ -3800,6 +4009,7 @@ pub fn windowWndProc(
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_MOVE => {
+            window.stopSplitAnimation();
             // Top-level move: child surface HWNDs do NOT receive WM_MOVE
             // (their position relative to the parent is unchanged), but the
             // scrollbar is a screen-positioned popup that must follow its
@@ -3890,6 +4100,25 @@ pub fn windowWndProc(
         w32.WM_LBUTTONDOWN => {
             const x: i32 = @as(i16, @truncate(lparam & 0xFFFF));
             const y: i32 = @as(i16, @truncate((lparam >> 16) & 0xFFFF));
+            if (window.tab_count > 0 and y >= window.tabBarHeight()) {
+                var it = window.tab_trees[window.active_tab].iterator();
+                while (it.next()) |entry| {
+                    if (containsPoint(entry.view.pane_header, x, y)) {
+                        if (entry.view.hwnd) |pane| _ = w32.SetFocus(pane);
+                        if (!window.is_quick_terminal) {
+                            window.drag_pane = entry.view;
+                            window.drag_tab = @intCast(window.active_tab);
+                            window.drag_previous_tab = window.active_tab;
+                            window.drag_start = .{ .x = x, .y = y };
+                            window.drag_x = x;
+                            window.drag_anchor = 0;
+                            _ = w32.SetCapture(hwnd);
+                            if (GetCapture() != hwnd) window.cancelTabDrag();
+                        }
+                        return 0;
+                    }
+                }
+            }
             if (window.hitTestDivider(x, y)) |hit| {
                 window.startDividerDrag(hit.handle, hit.layout);
                 return 0;
@@ -3957,7 +4186,7 @@ pub fn windowWndProc(
                         const target = window.dropTarget(screen);
                         window.showDropTarget(target);
                         const on_strip = y >= 0 and y < window.tabBarHeight() and x >= 0 and x < window.tab_buttons[0].left;
-                        window.drag_on_strip = on_strip;
+                        window.drag_on_strip = on_strip and window.drag_pane == null;
                         const hover = if (on_strip) window.tabAt(x, y) else null;
                         window.setDragHover(if (hover == @as(usize, @intCast(window.drag_tab))) null else hover);
                         const over_pane = if (target) |t| t.target == .pane else false;

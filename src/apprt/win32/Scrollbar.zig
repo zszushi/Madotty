@@ -430,13 +430,25 @@ pub const Scrollbar = struct {
         const r = thumbRect(self.state.total, self.state.offset, self.state.len, h, min_h);
 
         const thumb_alpha = self.thumbAlpha();
-        const thumb_color = packBGRA(self.fg, thumb_alpha);
-
-        var y: i32 = r.y;
-        while (y < r.y + r.h and y < h) : (y += 1) {
+        if (thumb_alpha == 0) return;
+        const icons = @import("Icons.zig");
+        const width = @min(w, self.dpiScaled(if (self.hover or self.dragging) 6 else 4));
+        const left = @divTrunc(w - width, 2);
+        const padding = @min(self.dpiScaled(2), @divTrunc(r.h, 4));
+        const height = r.h - 2 * padding;
+        const rgb = packBGRA(self.fg, 255) & 0xffffff;
+        var y: i32 = 0;
+        while (y < r.h and r.y + y < h) : (y += 1) {
+            const row = pixels + @as(usize, @intCast((r.y + y) * w));
+            // Transparent layered-window pixels pass mouse input through.
+            // Preserve the original thumb's grab width around the visible pill.
+            if (self.mode == .overlay) @memset(row[0..@intCast(w)], 0x01000000);
+            if (y < padding or y >= padding + height) continue;
             var x: i32 = 0;
-            while (x < w) : (x += 1) {
-                pixels[@intCast(y * w + x)] = thumb_color;
+            while (x < width) : (x += 1) {
+                const coverage = icons.pillCoverage(x, y - padding, width, height);
+                const alpha: u8 = @intCast((@as(u32, coverage) * thumb_alpha + 127) / 255);
+                if (alpha != 0) row[@intCast(left + x)] = icons.overPixel(track_fill, rgb, alpha);
             }
         }
     }

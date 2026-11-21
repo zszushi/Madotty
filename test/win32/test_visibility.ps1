@@ -57,6 +57,57 @@ public class VisibilityTest {
             rect.right - rect.left + 30, rect.bottom - rect.top + 20, 0x16))
             throw new Exception("Targeted resize failed");
     }
+    delegate void WinEvent(IntPtr hook, uint evt, IntPtr hwnd, int obj, int child, uint thread, uint time);
+    [DllImport("user32.dll")] static extern IntPtr SetWinEventHook(uint first, uint last, IntPtr module, WinEvent callback, uint pid, uint thread, uint flags);
+    [DllImport("user32.dll")] static extern bool UnhookWinEvent(IntPtr hook);
+    [DllImport("user32.dll")] static extern bool PeekMessageW(IntPtr msg, IntPtr hwnd, uint first, uint last, uint flags);
+    [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr hwnd, out RECT rect);
+    [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr hwnd);
+
+    public static void ClickTab(IntPtr top, int index, IntPtr outgoing, IntPtr incoming) {
+        Check(top); Check(outgoing); Check(incoming);
+        RECT rect;
+        if (!GetClientRect(top, out rect)) throw new Exception("No test window bounds");
+        int dpi = (int)GetDpiForWindow(top);
+        int tabWidth = (rect.right - 2 * (int)Math.Round(32 * dpi / 96.0)) / 2;
+        IntPtr pos = new IntPtr(((16 * dpi / 96) << 16) | (tabWidth * index + tabWidth / 2));
+        var events = new List<uint>();
+        WinEvent handler = delegate(IntPtr h, uint evt, IntPtr target, int obj, int child, uint thread, uint time) {
+            if (obj == 0 && child == 0 && (target == outgoing || target == incoming)) events.Add(evt);
+        };
+        IntPtr hook = SetWinEventHook(0x8002, 0x8003, IntPtr.Zero, handler, (uint)ProcessId, 0, 0);
+        if (hook == IntPtr.Zero) throw new Exception("Cannot watch tab visibility events");
+        IntPtr msg = Marshal.AllocHGlobal(64);
+        try {
+            if (!PostMessage(top, 0x201, new IntPtr(1), pos) || !PostMessage(top, 0x202, IntPtr.Zero, pos))
+                throw new Exception("Tab click failed");
+            var timer = System.Diagnostics.Stopwatch.StartNew();
+            do {
+                PeekMessageW(msg, IntPtr.Zero, 0, 0, 0);
+                System.Threading.Thread.Sleep(5);
+            } while (timer.ElapsedMilliseconds < (outgoing == incoming ? 300 : 2000) &&
+                     (outgoing == incoming || events.Count < 2));
+            if (outgoing == incoming ? events.Count != 0 :
+                events.Count < 2 || events[0] != 0x8002 || events[1] != 0x8003 || !IsWindowVisible(incoming) || IsWindowVisible(outgoing))
+                throw new Exception("Unexpected tab visibility order: " + String.Join(",", events));
+        } finally {
+            UnhookWinEvent(hook); GC.KeepAlive(handler); Marshal.FreeHGlobal(msg);
+        }
+    }
+    [StructLayout(LayoutKind.Sequential)] struct POINT { public int x,y; }
+    [DllImport("user32.dll")] static extern bool ScreenToClient(IntPtr h, ref POINT p);
+    public static void DragPaneOutside(IntPtr top, IntPtr pane) {
+        RECT body, window;
+        if (!GetWindowRect(Check(pane), out body) || !GetWindowRect(Check(top), out window))
+            throw new Exception("Could not locate pane");
+        var source = new POINT { x = body.left + 28, y = body.top - 10 };
+        var dest = new POINT { x = window.right + 40, y = window.top + 80 };
+        if (!ScreenToClient(top, ref source) || !ScreenToClient(top, ref dest)) throw new Exception("Invalid test coordinates");
+        var a = new IntPtr((source.y << 16) | (source.x & 65535));
+        var b = new IntPtr((dest.y << 16) | (dest.x & 65535));
+        if (!PostMessage(top, 0x201, new IntPtr(1), a) || !PostMessage(top, 0x200, new IntPtr(1), b) ||
+            !PostMessage(top, 0x202, IntPtr.Zero, b)) throw new Exception("Pane drag failed");
+    }
     public static void Key(IntPtr h, int key) {
         if (Class(Check(h)) != "GhosttyTerminal") throw new Exception("Expected a test-owned surface");
         if (!PostMessage(h, 0x0100, new IntPtr(key), new IntPtr(1)) ||
@@ -196,6 +247,10 @@ try {
     $second = @(Children | Where-Object { $_ -ne $first })[0]
     $secondSurface = [VisibilityTest]::Find($window, $true)[0]
     Query-States @{ $first = 2; $second = 1 } 'inactive tab remains occluded'
+    [VisibilityTest]::ClickTab($window, 1, $secondSurface, $secondSurface)
+    [VisibilityTest]::ClickTab($window, 0, $secondSurface, $firstSurface)
+    [VisibilityTest]::ClickTab($window, 1, $firstSurface, $secondSurface)
+    Write-Output 'PASS=clicking an active tab keeps its HWND visible, switching shows the next HWND first'
     [VisibilityTest]::Key($secondSurface, 0x77) # F8: split
     Wait-For { @(Children).Count -eq 3 -and @([VisibilityTest]::Find($window, $true)).Count -eq 2 } 'split creation'
     $third = @(Children | Where-Object { $_ -ne $first -and $_ -ne $second })[0]
@@ -243,6 +298,13 @@ try {
     Query-States @{ $fourth = 2 } 'animated quick terminal hide publishes not visible'
     [VisibilityTest]::Resize($quick)
     Query-States @{ $fourth = 2 } 'hidden quick terminal layout stays occluded'
+    [VisibilityTest]::DragPaneOutside($window, $thirdSurface)
+    Wait-For { @([VisibilityTest]::Find([IntPtr]::Zero, $true)).Count -eq 2 } 'pane header tears off one pane'
+    $detached = @([VisibilityTest]::Find([IntPtr]::Zero, $true) | Where-Object { $_ -ne $window })[0]
+    Assert-True (@([VisibilityTest]::Find($detached, $true)) -contains $thirdSurface) 'detached pane retains its terminal HWND'
+    Assert-True (@([VisibilityTest]::Find($window, $true)) -contains $secondSurface) 'sibling stays in original window'
+    Query-States @{ $third = 1; $second = 1 } 'both original sessions respond after pane transfer'
+
 } finally {
     [IO.File]::WriteAllText((Join-Path $taskDir 'exit'), 'exit')
     if (-not $proc.WaitForExit(5000)) {

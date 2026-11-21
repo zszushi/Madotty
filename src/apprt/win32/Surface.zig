@@ -51,6 +51,7 @@ parent_window: *Window = undefined,
 /// Progress reported by this pane, accessed only on the Win32 thread.
 progress: Progress = .{},
 tab_shell: ?Profiles.Shell = null,
+pane_header: w32.RECT = std.mem.zeroes(w32.RECT),
 profile_id: ?u64 = null,
 plain_profile: bool = false,
 launch_exe: ?u64 = null,
@@ -192,6 +193,9 @@ palette_brush: ?w32.HBRUSH = null,
 palette_active: bool = false,
 /// Currently selected item in the filtered palette list.
 palette_selected: u16 = 0,
+palette_hover_y: ?i32 = null,
+palette_first: i32 = 0,
+palette_wheel_remainder: i32 = 0,
 /// Number of items currently in the filtered list.
 palette_count: u16 = 0,
 /// Indices into palette_entries for the current filter.
@@ -1706,13 +1710,26 @@ const PaletteEntry = struct {
 /// palette (bounds the fixed-size palette_filtered index array).
 pub const MAX_USER_PALETTE_ENTRIES = 64;
 
+fn availablePaletteAction(action: input.Binding.Action) bool {
+    return switch (action) {
+        .show_gtk_inspector, .show_on_screen_keyboard, .toggle_secure_input, .undo, .redo, .inspector => false,
+        else => true,
+    };
+}
+
+test "win32 palette omits unsupported default actions" {
+    try std.testing.expect(!availablePaletteAction(.show_gtk_inspector));
+    try std.testing.expect(!availablePaletteAction(.{ .inspector = .toggle }));
+    try std.testing.expect(availablePaletteAction(.new_tab));
+}
+
 const shared_palette = entries: {
     @setEvalBranchQuota(1_000_000);
-    var entries: [input.command.defaults.len]struct { ja: []const u8, native: bool } = undefined;
+    var entries: [input.command.defaults.len]struct { ja: []const u8, omit: bool } = undefined;
     for (input.command.defaults, 0..) |cmd, i| {
         entries[i] = .{
             .ja = lang.japanese(cmd.title),
-            .native = for (palette_entries) |native| {
+            .omit = !availablePaletteAction(cmd.action) or for (palette_entries) |native| {
                 if (native.action.equal(cmd.action)) break true;
             } else false,
         };
@@ -1842,7 +1859,7 @@ fn ensureCommandPalette(self: *Surface) void {
         w32.WS_EX_TOOLWINDOW,
         App.TERMINAL_CLASS_NAME,
         std.unicode.utf8ToUtf16LeStringLiteral(""),
-        w32.WS_POPUP | w32.WS_BORDER,
+        w32.WS_POPUP | w32.WS_BORDER | w32.WS_CLIPCHILDREN,
         0,
         0,
         pal_w,
@@ -1852,6 +1869,10 @@ fn ensureCommandPalette(self: *Surface) void {
         self.app.hinstance,
         null,
     ) orelse return;
+
+    // Windows 11 DWM rounds the popup without clipping the edit control.
+    const rounded: u32 = 2; // DWMWCP_ROUND
+    _ = w32.DwmSetWindowAttribute(popup, w32.DWMWA_WINDOW_CORNER_PREFERENCE, @ptrCast(&rounded), @sizeOf(u32));
 
     // Apply dark theme
     const dark_mode: u32 = 1;
@@ -1938,7 +1959,7 @@ fn filterPaletteEntries(self: *Surface, filter: []const u8) void {
     const user_len = @min(user.len, commands.builtin_count + MAX_USER_PALETTE_ENTRIES);
     for (user[0..user_len], 0..) |entry, i| {
         const builtin = i < commands.builtin_count;
-        if (builtin and shared_palette[i].native) continue;
+        if (builtin and shared_palette[i].omit) continue;
         if (filter.len == 0 or std.ascii.findIgnoreCase(entry.title, filter) != null or
             (builtin and ja and std.mem.indexOf(u8, shared_palette[i].ja, filter) != null))
         {
@@ -1948,6 +1969,9 @@ fn filterPaletteEntries(self: *Surface, filter: []const u8) void {
     }
     self.palette_count = count;
     self.palette_selected = 0;
+    self.palette_hover_y = null;
+    self.palette_first = 0;
+    self.palette_wheel_remainder = 0;
     // Trigger repaint of the list area
     if (self.palette_hwnd) |popup| {
         _ = w32.InvalidateRect(popup, null, 1);
@@ -1967,6 +1991,86 @@ pub fn handlePaletteChange(self: *Surface) void {
     self.filterPaletteEntries(utf8_buf[0..utf8_len]);
 }
 
+fn palettePage(self: *const Surface) i32 {
+    const hwnd = self.palette_hwnd orelse return 0;
+    var rect: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &rect) == 0) return 0;
+    const top: i32 = @intFromFloat(@round(PALETTE_LIST_TOP * self.scale));
+    const height: i32 = @intFromFloat(@round(PALETTE_ITEM_HEIGHT * self.scale));
+    return @max(0, @divTrunc(rect.bottom - top, height));
+}
+
+fn revealPaletteSelection(self: *Surface) void {
+    const page = self.palettePage();
+    if (page > 0) self.palette_first = std.math.clamp(self.palette_first, @max(0, @as(i32, self.palette_selected) - page + 1), self.palette_selected);
+}
+
+extern "user32" fn SystemParametersInfoW(u32, u32, *u32, u32) callconv(.winapi) i32;
+
+fn paletteWheelOffset(first: i32, remainder: *i32, delta: i16, rows: i32, count: i32, page: i32) i32 {
+    remainder.* += delta;
+    const steps = @divTrunc(remainder.*, w32.WHEEL_DELTA);
+    remainder.* = @rem(remainder.*, w32.WHEEL_DELTA);
+    return std.math.clamp(first - steps * rows, 0, @max(0, count - page));
+}
+
+pub fn scrollPalette(self: *Surface, wparam: usize) void {
+    const page = self.palettePage();
+    if (page <= 0) return;
+    var lines: u32 = 3;
+    _ = SystemParametersInfoW(0x0068, 0, &lines, 0); // SPI_GETWHEELSCROLLLINES
+    const first = paletteWheelOffset(self.palette_first, &self.palette_wheel_remainder, @bitCast(@as(u16, @truncate(wparam >> 16))), @intCast(@min(lines, @as(u32, @intCast(page)))), self.palette_count, page);
+    if (first != self.palette_first) {
+        self.palette_first = first;
+        self.palette_selected = @intCast(std.math.clamp(@as(i32, self.palette_selected), first, @min(first + page, self.palette_count) - 1));
+        _ = w32.InvalidateRect(self.palette_hwnd.?, null, 0);
+    }
+}
+
+pub fn hoverPalette(self: *Surface, y: ?i32) void {
+    const popup = self.palette_hwnd orelse return;
+    const previous = if (self.palette_hover_y) |old| self.paletteRowAt(old) else null;
+    if (y != null and self.palette_hover_y == null) {
+        var tracking: w32.TRACKMOUSEEVENT = .{ .cbSize = @sizeOf(w32.TRACKMOUSEEVENT), .dwFlags = w32.TME_LEAVE, .hwndTrack = popup, .dwHoverTime = 0 };
+        _ = w32.TrackMouseEvent(&tracking);
+    }
+    self.palette_hover_y = y;
+    const next = if (y) |pos| self.paletteRowAt(pos) else null;
+    if (previous != next) {
+        self.invalidatePaletteRow(previous);
+        self.invalidatePaletteRow(next);
+    }
+}
+
+fn invalidatePaletteRow(self: *Surface, index: ?u16) void {
+    const row = index orelse return;
+    const popup = self.palette_hwnd orelse return;
+    var rect: w32.RECT = undefined;
+    if (w32.GetClientRect(popup, &rect) == 0) return;
+    const height: i32 = @intFromFloat(@round(PALETTE_ITEM_HEIGHT * self.scale));
+    const top: i32 = @intFromFloat(@round(PALETTE_LIST_TOP * self.scale));
+    rect.top = top + (@as(i32, row) - self.palette_first) * height;
+    rect.bottom = rect.top + height;
+    _ = w32.InvalidateRect(popup, &rect, 0);
+}
+
+pub fn paletteRowAt(self: *const Surface, y: i32) ?u16 {
+    const top: i32 = @intFromFloat(@round(PALETTE_LIST_TOP * self.scale));
+    const height: i32 = @intFromFloat(@round(PALETTE_ITEM_HEIGHT * self.scale));
+    if (y < top) return null;
+    const row = @divTrunc(y - top, height);
+    if (row >= self.palettePage() or row + self.palette_first >= self.palette_count) return null;
+    return @intCast(row + self.palette_first);
+}
+
+test "win32 palette wheel accumulates partial steps and clamps at both ends" {
+    var rem: i32 = 0;
+    try std.testing.expectEqual(@as(i32, 0), paletteWheelOffset(0, &rem, -60, 3, 14, 8));
+    try std.testing.expectEqual(@as(i32, 3), paletteWheelOffset(0, &rem, -60, 3, 14, 8));
+    try std.testing.expectEqual(@as(i32, 6), paletteWheelOffset(3, &rem, -240, 3, 14, 8));
+    try std.testing.expectEqual(@as(i32, 0), paletteWheelOffset(6, &rem, 240, 8, 14, 8));
+}
+
 /// Handle key events in the command palette. Returns true if handled.
 pub fn handlePaletteKey(self: *Surface, vk: u16) bool {
     switch (vk) {
@@ -1979,8 +2083,10 @@ pub fn handlePaletteKey(self: *Surface, vk: u16) bool {
             return true;
         },
         w32.VK_UP => {
+            self.hoverPalette(null);
             if (self.palette_selected > 0) {
                 self.palette_selected -= 1;
+                self.revealPaletteSelection();
                 if (self.palette_hwnd) |popup| {
                     _ = w32.InvalidateRect(popup, null, 1);
                 }
@@ -1988,8 +2094,10 @@ pub fn handlePaletteKey(self: *Surface, vk: u16) bool {
             return true;
         },
         w32.VK_DOWN => {
+            self.hoverPalette(null);
             if (self.palette_count > 0 and self.palette_selected < self.palette_count - 1) {
                 self.palette_selected += 1;
+                self.revealPaletteSelection();
                 if (self.palette_hwnd) |popup| {
                     _ = w32.InvalidateRect(popup, null, 1);
                 }
@@ -2017,21 +2125,42 @@ pub fn executePaletteSelection(self: *Surface) void {
     };
 }
 
+pub const palette_field_color = w32.RGB(32, 32, 32);
+
+fn fillPaletteRect(self: *const Surface, dc: w32.HDC, rect: w32.RECT, radius: i32, color: u32) void {
+    if (self.app.tab_icon_renderer != null and @import("Icons.zig").fillRounded(dc, rect, 0, radius, color)) return;
+    const brush = w32.GetStockObject(w32.DC_BRUSH) orelse return;
+    _ = w32.SetDCBrushColor(dc, color);
+    _ = w32.FillRect(dc, &rect, @ptrCast(brush));
+}
+
 /// Paint the command palette list area.
 pub fn paintPalette(self: *Surface, hwnd: w32.HWND) void {
     var ps: w32.PAINTSTRUCT = undefined;
-    const hdc = w32.BeginPaint(hwnd, &ps) orelse return;
+    const screen = w32.BeginPaint(hwnd, &ps) orelse return;
     defer _ = w32.EndPaint(hwnd, &ps);
 
-    var client_rect: w32.RECT = undefined;
-    if (w32.GetClientRect(hwnd, &client_rect) == 0) return;
+    var client: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &client) == 0 or client.right <= 0 or client.bottom <= 0) return;
+    const dirty = ps.rcPaint;
+    if (dirty.right <= dirty.left or dirty.bottom <= dirty.top) return;
+    const buffer = w32.CreateCompatibleDC(screen) orelse return self.drawPalette(screen, client, dirty);
+    defer _ = w32.DeleteDC(buffer);
+    const bitmap = w32.CreateCompatibleBitmap(screen, client.right, client.bottom) orelse return self.drawPalette(screen, client, dirty);
+    defer _ = w32.DeleteObject(bitmap);
+    const old = w32.SelectObject(buffer, bitmap) orelse return self.drawPalette(screen, client, dirty);
+    defer _ = w32.SelectObject(buffer, old);
+    self.drawPalette(buffer, client, dirty);
+    _ = w32.BitBlt(screen, dirty.left, dirty.top, dirty.right - dirty.left, dirty.bottom - dirty.top, buffer, dirty.left, dirty.top, w32.SRCCOPY);
+}
 
+fn drawPalette(self: *Surface, hdc: w32.HDC, client_rect: w32.RECT, dirty: w32.RECT) void {
     // Fill background. Reuse the cached brush set up by setCommandPaletteActive
     // — falling back to a one-shot brush only if it's somehow missing.
     if (self.palette_brush) |b| {
-        _ = w32.FillRect(hdc, &client_rect, b);
+        _ = w32.FillRect(hdc, &dirty, b);
     } else if (w32.CreateSolidBrush(w32.RGB(30, 30, 30))) |b| {
-        _ = w32.FillRect(hdc, &client_rect, b);
+        _ = w32.FillRect(hdc, &dirty, b);
         _ = w32.DeleteObject(b);
     }
 
@@ -2050,38 +2179,32 @@ pub fn paintPalette(self: *Surface, hwnd: w32.HWND) void {
 
     const item_height: i32 = @intFromFloat(@round(PALETTE_ITEM_HEIGHT * s));
     const list_top: i32 = @intFromFloat(@round(PALETTE_LIST_TOP * s));
+    const field_inset: i32 = @intFromFloat(@round(4 * s));
+    const field: w32.RECT = .{ .left = field_inset, .right = client_rect.right - field_inset, .top = field_inset, .bottom = list_top - field_inset };
+    self.fillPaletteRect(hdc, field, field_inset, w32.RGB(62, 62, 65));
+    const inside = w32.RECT{ .left = field.left + 1, .top = field.top + 1, .right = field.right - 1, .bottom = field.bottom - 1 };
+    self.fillPaletteRect(hdc, inside, @max(1, field_inset - 1), palette_field_color);
     const max_visible = @divTrunc(client_rect.bottom - list_top, item_height);
     if (max_visible <= 0) return; // popup too small to render any items
 
-    // Calculate scroll offset to keep selected item visible
-    var scroll_offset: i32 = 0;
-    if (self.palette_selected >= max_visible) {
-        scroll_offset = self.palette_selected - @as(u16, @intCast(max_visible)) + 1;
-    }
-
-    var i: u16 = 0;
+    self.palette_first = std.math.clamp(self.palette_first, 0, @max(0, @as(i32, self.palette_count) - max_visible));
+    const hover = if (self.palette_hover_y) |y| self.paletteRowAt(y) else null;
+    var i: u16 = @intCast(self.palette_first);
     while (i < self.palette_count) : (i += 1) {
-        const visual_idx = @as(i32, i) - scroll_offset;
-        if (visual_idx < 0) continue;
+        const visual_idx = @as(i32, i) - self.palette_first;
         if (visual_idx >= max_visible) break;
 
         const y = list_top + visual_idx * item_height;
+        if (y + item_height <= dirty.top or y >= dirty.bottom) continue;
         const entry_idx = self.palette_filtered[i];
         const entry_name = self.paletteEntryName(entry_idx);
         const entry_action = self.paletteEntryAction(entry_idx);
 
         // Draw selection highlight
-        if (i == self.palette_selected) {
-            if (w32.CreateSolidBrush(w32.RGB(60, 60, 80))) |sel_brush| {
-                const sel_rect = w32.RECT{
-                    .left = 0,
-                    .top = y,
-                    .right = client_rect.right,
-                    .bottom = y + item_height,
-                };
-                _ = w32.FillRect(hdc, &sel_rect, sel_brush);
-                _ = w32.DeleteObject(sel_brush);
-            }
+        if (i == self.palette_selected or hover == i) {
+            const pad: i32 = @intFromFloat(@round(4 * s));
+            const sel_rect: w32.RECT = .{ .left = pad, .right = client_rect.right - pad, .top = y + 1, .bottom = y + item_height - 1 };
+            self.fillPaletteRect(hdc, sel_rect, pad, if (i == self.palette_selected) w32.RGB(56, 57, 61) else w32.RGB(47, 48, 51));
         }
 
         // Draw action name

@@ -446,6 +446,15 @@ fn runMessageLoop(self: *App) !void {
             }
         }
 
+        if (msg.message == w32.WM_MOUSEWHEEL and msg.hwnd != null) {
+            if (self.popupSurface(msg.hwnd.?)) |surface| {
+                if (surface.palette_active and surface.palette_edit == msg.hwnd) {
+                    surface.scrollPalette(msg.wParam);
+                    continue :loop;
+                }
+            }
+        }
+
         // Intercept keystrokes destined for popup edit controls so
         // Enter/Escape/Arrow keys can be handled by our code.
         if (msg.message == w32.WM_KEYDOWN and msg.hwnd != null) {
@@ -1321,11 +1330,11 @@ pub fn performAction(
         .secure_input, // macOS EnableSecureEventInput
         .undo, // macOS NSUndoManager
         .redo, // macOS NSUndoManager
-        .show_gtk_inspector, // GTK-only
         .show_on_screen_keyboard, // GTK/mobile
-        .inspector, // Not yet implemented (debug overlay)
         .render_inspector, // Not yet implemented (debug overlay)
         => return true,
+
+        .show_gtk_inspector, .inspector => return false,
 
         .renderer_health => {
             // Surface a warning when the GPU renderer degrades so a frozen
@@ -2484,6 +2493,7 @@ fn surfaceWndProc(
         },
 
         w32.WM_ERASEBKGND => {
+            if (is_palette_popup) return 1; // The buffered paint includes the background.
             // Preserve the last OpenGL frame until the renderer presents
             // the resized one. A GDI fill here can blank visible glyphs
             // while the replacement frame is still being rendered.
@@ -2624,16 +2634,10 @@ fn surfaceWndProc(
 
         w32.WM_LBUTTONDOWN => {
             if (is_palette_popup) {
-                const y: i32 = @intCast(@as(i16, @truncate((lparam >> 16) & 0xFFFF)));
-                const sc = surface.scale;
-                const list_top: i32 = @intFromFloat(@round(Surface.PALETTE_LIST_TOP * sc));
-                const item_height: i32 = @intFromFloat(@round(Surface.PALETTE_ITEM_HEIGHT * sc));
-                if (y >= list_top) {
-                    const clicked = @divTrunc(y - list_top, item_height);
-                    if (clicked >= 0 and clicked < surface.palette_count) {
-                        surface.palette_selected = @intCast(clicked);
-                        surface.executePaletteSelection();
-                    }
+                const y: i32 = @as(i16, @truncate(lparam >> 16));
+                if (surface.paletteRowAt(y)) |row| {
+                    surface.palette_selected = row;
+                    surface.executePaletteSelection();
                 }
                 return 0;
             }
@@ -2684,12 +2688,16 @@ fn surfaceWndProc(
         },
 
         w32.WM_MOUSEMOVE => {
-            surface.handleMouseMove(lparam);
+            if (is_palette_popup) surface.hoverPalette(@as(i16, @truncate(lparam >> 16))) else if (is_surface_window) surface.handleMouseMove(lparam);
             return 0;
         },
 
+        w32.WM_MOUSELEAVE => {
+            if (is_palette_popup) surface.hoverPalette(null);
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         w32.WM_MOUSEWHEEL => {
-            surface.handleMouseWheel(wparam, .vertical);
+            if (is_palette_popup) surface.scrollPalette(wparam) else if (is_surface_window) surface.handleMouseWheel(wparam, .vertical);
             return 0;
         },
 
@@ -2746,10 +2754,11 @@ fn surfaceWndProc(
             // Dark mode colors for search/palette edit controls
             const hdc_edit: w32.HDC = @ptrFromInt(wparam);
             _ = w32.SetTextColor(hdc_edit, w32.RGB(220, 220, 220));
-            _ = w32.SetBkColor(hdc_edit, if (is_palette_popup) w32.RGB(30, 30, 30) else w32.RGB(45, 45, 45));
+            _ = w32.SetBkColor(hdc_edit, if (is_palette_popup) Surface.palette_field_color else w32.RGB(45, 45, 45));
             if (is_palette_popup) {
-                if (surface.palette_brush) |brush| {
-                    return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(brush))));
+                if (w32.GetStockObject(w32.DC_BRUSH)) |brush| {
+                    _ = w32.SetDCBrushColor(hdc_edit, Surface.palette_field_color);
+                    return @bitCast(@intFromPtr(brush));
                 }
             }
             if (surface.app.bg_brush) |brush| {
@@ -3061,6 +3070,16 @@ test "detached tab keeps hidden popups and popup destruction preserves terminal"
         if (Native.IsWindow(hwnd) != 0) _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, 0);
     };
 
+    // Deliver mouse messages on the popup's own thread without moving the desktop cursor.
+    surface.scale = 1;
+    surface.palette_count = 20;
+    surface.palette_first = 3;
+    _ = w32.SetWindowPos(palette, null, 0, 0, 500, 450, w32.SWP_NOMOVE | w32.SWP_NOZORDER | w32.SWP_NOACTIVATE);
+    _ = w32.SendMessageW(palette, w32.WM_MOUSEMOVE, 0, (166 << 16) | 80);
+    try testing.expectEqual(@as(?i32, 166), surface.palette_hover_y);
+    try testing.expectEqual(@as(?u16, 7), surface.paletteRowAt(surface.palette_hover_y.?));
+    _ = w32.SendMessageW(palette, w32.WM_MOUSELEAVE, 0, 0);
+    try testing.expect(surface.palette_hover_y == null);
     // Popups persist after dismissal. Exercise the production transfer on
     // hidden real HWNDs, without a renderer, focus changes, or global input.
     try surface.reparentNativeWindows(destination);

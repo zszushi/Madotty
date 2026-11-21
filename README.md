@@ -17,6 +17,7 @@ Once installed, open **Madotty** from the Start menu.
 | Action | How |
 | --- | --- |
 | Split the view | Drag a tab to the left, right, top or bottom edge of another pane. |
+| Move one pane | Drag its header to another pane’s edge, onto the tab bar, or outside the window. |
 | Move a tab to its own window | Drag the tab outside the window. |
 | Close the focused pane | Press `Ctrl+Shift+W`. |
 | Enter or leave fullscreen | Press `Ctrl+Enter`. |

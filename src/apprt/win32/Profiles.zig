@@ -96,7 +96,6 @@ fn shellIcon(alloc: Allocator, executable: [:0]const u8, custom: ?[]const u8, si
 }
 
 pub const Shell = struct {
-    id: u64,
     icon: ?w32.HICON,
     label: ?[]const u8 = null,
 
@@ -134,11 +133,7 @@ pub const ShellIcons = struct {
     handles: std.StringHashMapUnmanaged(?w32.HICON) = .empty,
 
     pub fn lookup(self: *ShellIcons, alloc: Allocator, arena: Allocator, exe: [:0]const u8, profile: ?Profile) !?Shell {
-        const name = std.fs.path.basename(exe);
-        const stem = if (std.ascii.endsWithIgnoreCase(name, ".exe")) name[0 .. name.len - 4] else name;
         const label = shellLabel(exe);
-        if (profile == null and label == null) return null;
-        const kind = try std.ascii.allocLowerString(arena, stem);
         const custom = if (profile) |p| p.icon else null;
         const key = try std.mem.concat(arena, u8, &.{ exe, "\x00", custom orelse "" });
         const entry = try self.handles.getOrPut(alloc, key);
@@ -151,7 +146,8 @@ pub const ShellIcons = struct {
             entry.key_ptr.* = try alloc.dupe(u8, key);
             entry.value_ptr.* = shellIcon(arena, filename, custom, 32);
         }
-        return .{ .id = std.hash.Wyhash.hash(0, kind), .icon = entry.value_ptr.*, .label = label };
+        if (entry.value_ptr.* == null and label == null and profile == null) return null;
+        return .{ .icon = entry.value_ptr.*, .label = label };
     }
 
     pub fn deinit(self: *ShellIcons, alloc: Allocator) void {
@@ -193,7 +189,7 @@ test "tab bar title reads the handoff client process image and preserves unknown
     try std.testing.expectEqualStrings("Windows PowerShell", executableLabel("powershell.exe"));
 }
 
-test "tab bar shell identity follows the executable across launch forms" {
+test "tab bar shell label follows the executable across launch forms" {
     var icons: ShellIcons = .{};
     defer icons.deinit(std.testing.allocator);
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -201,12 +197,30 @@ test "tab bar shell identity follows the executable across launch forms" {
     const a = arena.allocator();
     const plain = (try icons.lookup(std.testing.allocator, a, (try commandExecutable(a, .{ .direct = &.{"cmd.exe"} })).?, null)).?;
     const quoted = (try icons.lookup(std.testing.allocator, a, (try commandExecutable(a, .{ .shell = "\"CMD.EXE\" /d" })).?, null)).?;
-    try std.testing.expectEqual(plain.id, quoted.id);
+    try std.testing.expectEqualStrings(plain.label.?, quoted.label.?);
     const other = (try icons.lookup(std.testing.allocator, a, (try commandExecutable(a, .{ .shell = "pwsh -NoLogo" })).?, null)).?;
-    try std.testing.expect(other.id != plain.id);
     try std.testing.expectEqualStrings("PowerShell", other.label.?);
     try std.testing.expectEqualStrings(lang.text("Command Prompt"), plain.label.?);
     try std.testing.expectEqual(null, try icons.lookup(std.testing.allocator, a, (try commandExecutable(a, .{ .shell = "custom-program" })).?, null));
+}
+
+test "tab bar icons resolve an unrecognized executable without a profile" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var system: [260]u16 = undefined;
+    const len = w32.GetSystemDirectoryW(&system, system.len);
+    try std.testing.expect(len > 0 and len < system.len);
+    const dir = try std.unicode.utf16LeToUtf8Alloc(a, system[0..len]);
+    const source = try fullPath(a, dir, "cmd.exe");
+    try std.Io.Dir.cwd().copyFile(source, tmp.dir, "custom-shell.exe", std.testing.io, .{});
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "custom-shell.exe", a);
+    var icons: ShellIcons = .{};
+    defer icons.deinit(std.testing.allocator);
+    const shell = (try icons.lookup(std.testing.allocator, a, try a.dupeSentinel(u8, path, 0), null)).?;
+    try std.testing.expect(shell.label == null and shell.icon != null);
 }
 
 /// Keep the returned bitmap alive until the native popup menu is destroyed.
@@ -232,10 +246,12 @@ fn loadIcon(alloc: Allocator, path: []const u8, size: i32) ?w32.HICON {
     // Loading an icon is optional. Skip relative paths and app package URIs.
     if (path.len < 3 or path[1] != ':' or !std.fs.path.isAbsolute(path)) return null;
     const extension = std.fs.path.extension(path);
-    if (!std.ascii.eqlIgnoreCase(extension, ".ico") and
+    const png = std.ascii.eqlIgnoreCase(extension, ".png");
+    if (!png and !std.ascii.eqlIgnoreCase(extension, ".ico") and
         !std.ascii.eqlIgnoreCase(extension, ".exe") and
         !std.ascii.eqlIgnoreCase(extension, ".dll")) return null;
     const wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return null;
+    if (png) return @import("Icons.zig").loadPng(wide);
     if (std.ascii.eqlIgnoreCase(extension, ".ico")) {
         const icon = LoadImageW(null, wide, 1, size, size, 0x10) orelse return null;
         return @ptrCast(icon);

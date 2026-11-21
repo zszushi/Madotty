@@ -3,6 +3,20 @@
 All notable changes to the Ghostty Windows fork. Each release line includes
 the underlying upstream commit when known.
 
+## Madotty 1.4.3
+
+- Split panes show their profile icon and title, with rounded frames and consistent spacing. Tabs show profile icons when space permits, including icons for split panes.
+- Drag a pane header to dock it at another pane’s edge, turn it into a tab, or move it to a new window. A short split animation follows the Windows animation setting.
+- The command palette supports wheel scrolling and highlights the row under the pointer. Buffered drawing keeps the list steady when the highlight moves. Unavailable inspector commands are hidden on Windows.
+- Tab switching avoids briefly hiding both terminals. Tab edges blend into translucent backgrounds, and the scrollbar uses a slimmer rounded thumb.
+
+### 日本語
+
+- 分割ペインにプロファイルのアイコンと名前を表示します。角丸の枠と余白を揃え、タブにも幅に応じて各ペインのアイコンを表示します。
+- ペイン名をドラッグして、別のペインの端への分割、タブへの移動、新規ウィンドウへの切り離しができます。分割時のアニメーションは Windows の視覚効果設定に従います。
+- コマンドパレットをホイールでスクロールでき、マウスを重ねた行がハイライトされます。行の切り替え時のちらつきを抑え、Windows で使えないインスペクタ項目を非表示にしました。
+- タブ切り替え時のちらつきと、半透明背景でタブの縁が黒くなる問題を修正しました。スクロールバーは細い角丸形状になりました。
+
 ## Madotty 1.4.2
 
 - Improved scrolling, full-screen redraws and Kitty image throughput on Windows

@@ -867,10 +867,12 @@ pub const EN_KILLFOCUS: u16 = 0x0200;
 pub const ES_AUTOHSCROLL: u32 = 0x0080;
 
 // Window styles for child windows
+pub const WS_CLIPCHILDREN: u32 = 0x02000000;
 pub const WS_CHILD: u32 = 0x40000000;
 pub const WS_VISIBLE_STYLE: u32 = 0x10000000;
 pub const WS_BORDER: u32 = 0x00800000;
 
+pub extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
 pub extern "user32" fn SetFocus(
     hWnd: ?HWND,
 ) callconv(.winapi) ?HWND;
@@ -1146,6 +1148,7 @@ pub extern "imm32" fn ImmSetCompositionWindow(
 /// Supported on Windows 10 build 18985+ (formally documented from Windows 11).
 pub const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
 /// Title-bar fill color (Windows 11 22H2+). COLORREF 0x00BBGGRR.
+pub const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
 pub const DWMWA_CAPTION_COLOR: u32 = 35;
 // Sentinel for DWMWA_CAPTION_COLOR/TEXT_COLOR meaning "use the system default".
 pub const DWMWA_COLOR_DEFAULT: u32 = 0xFFFFFFFF;
