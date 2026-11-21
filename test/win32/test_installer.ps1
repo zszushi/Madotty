@@ -25,7 +25,7 @@ try {
             'dxcompiler.dll', 'dxil.dll', 'LICENSE', 'settings\Madotty.Settings.exe', 'settings\coreclr.dll',
             'settings\Microsoft.UI.Xaml.dll', 'settings\App.xbf', 'settings\resources.pri',
             'settings\ja\Madotty.Settings.resources.dll',
-            'share\terminfo\ghostty.terminfo', 'share\licenses\conpty\LICENSE.txt',
+            'share\terminfo\ghostty.terminfo', 'share\licenses\conpty\LICENSE.txt', 'share\licenses\conpty\NOTICE.md',
             'share\licenses\dxc\LICENSE-LLVM.txt', 'share\licenses\dxc\LICENSE-MS.txt',
             'share\licenses\Microsoft.NETCore.App.Runtime.win-x64\THIRD-PARTY-NOTICES.TXT',
             'share\ghostty\shell-integration\powershell\ghostty-shell-integration.ps1')) {

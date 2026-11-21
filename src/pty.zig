@@ -493,7 +493,7 @@ const WindowsPty = struct {
 
         // Buffer bursts from ConPTY while the read thread parses the last
         // chunk. ReadFile still returns as soon as output is available.
-        if (windows.exp.kernel32.CreatePipe(&pipes.read, &pipes.console.output, null, 128 * 1024) == windows.FALSE) {
+        if (windows.exp.kernel32.CreatePipe(&pipes.read, &pipes.console.output, null, 256 * 1024) == windows.FALSE) {
             return windows.unexpectedError(windows.GetLastError());
         }
         errdefer {

@@ -3,6 +3,16 @@
 All notable changes to the Ghostty Windows fork. Each release line includes
 the underlying upstream commit when known.
 
+## Madotty 1.4.2
+
+- Improved scrolling, full-screen redraws and Kitty image throughput on Windows
+  x64. Applications that wait for a cursor-position reply after each frame
+  also spend less time waiting in our tests.
+- Raised the Windows pseudoconsole pipe capacity from 128 KiB to 256 KiB.
+  The bundled x64 OpenConsole includes optimizations for ASCII text, text
+  attributes and common control sequences. Its source patch and build details
+  are in `pkg/conpty/madotty-x64`.
+
 ## Madotty 1.4.1
 
 First Madotty release for Windows x64, based on the Ghostty 1.4.0 core.

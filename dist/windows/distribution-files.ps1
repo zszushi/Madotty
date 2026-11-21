@@ -58,7 +58,7 @@ foreach ($name in @('dxcompiler.dll', 'dxil.dll')) {
 foreach ($name in @('LICENCE-MIT.txt', 'LICENSE-LLVM.txt', 'LICENSE-MS.txt')) {
     Add-File (Join-Path $DxcDir $name) "share\licenses\dxc\$name"
 }
-foreach ($name in @('share\terminfo\ghostty.terminfo', 'share\licenses\conpty\LICENSE.txt')) {
+foreach ($name in @('share\terminfo\ghostty.terminfo', 'share\licenses\conpty\LICENSE.txt', 'share\licenses\conpty\NOTICE.md')) {
     Add-File (Join-Path $BuildDir $name) $name
 }
 Add-File (Join-Path $PSScriptRoot '..\..\LICENSE') 'LICENSE'

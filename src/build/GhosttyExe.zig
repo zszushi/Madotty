@@ -127,6 +127,12 @@ pub fn install(self: *const Ghostty) void {
             b.path("dist/windows/conpty-LICENSE.txt"),
             "share/licenses/conpty/LICENSE.txt",
         ).step);
+        if (target.result.cpu.arch == .x86_64) {
+            b.getInstallStep().dependOn(&b.addInstallFile(
+                b.path("pkg/conpty/madotty-x64/NOTICE.md"),
+                "share/licenses/conpty/NOTICE.md",
+            ).step);
+        }
     }
 }
 

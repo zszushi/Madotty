@@ -15,7 +15,7 @@ if (-not $OutputDir) { $OutputDir = $PSScriptRoot }
 $BuildDir = (Get-Item -LiteralPath $BuildDir).FullName
 $DxcDir = (Get-Item -LiteralPath $DxcDir).FullName
 $verify = Join-Path $PSScriptRoot 'verify-build.ps1'
-$version = & $verify -BuildDir $BuildDir -ExpectedVersion $ExpectedVersion -RequireFast:$RequireFast
+$version = & $verify -VerifyX64Host -BuildDir $BuildDir -ExpectedVersion $ExpectedVersion -RequireFast:$RequireFast
 $payload = & (Join-Path $PSScriptRoot 'distribution-files.ps1') -BuildDir $BuildDir -DxcDir $DxcDir -NuGetPackages $NuGetPackages -HandoffDir $HandoffDir
 $OutputDir = (New-Item -Type Directory -Path $OutputDir -Force).FullName
 $scratch = (New-Item -Type Directory -Path (Join-Path $OutputDir ('.zip-' + [guid]::NewGuid().ToString('N')))).FullName
@@ -42,7 +42,7 @@ try {
     $expanded = Join-Path $scratch 'extract'
     [IO.Compression.ZipFile]::ExtractToDirectory($archivePath, $expanded)
     $portable = Join-Path $expanded 'ghostty'
-    & $verify -BuildDir $portable -Portable -ExpectedVersion $version | Out-Null
+    & $verify -VerifyX64Host -BuildDir $portable -Portable -ExpectedVersion $version | Out-Null
     foreach ($path in $payload.Keys) {
         $file = Get-Item -LiteralPath (Join-Path $portable $path)
         if ($file.Length -ne (Get-Item -LiteralPath $payload[$path]).Length) {

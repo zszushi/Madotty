@@ -1,0 +1,257 @@
+--- a/src/inc/til/rle.h
++++ b/src/inc/til/rle.h
+@@ -622,6 +622,20 @@
+         {
+             explicit rle_scanner(It begin, It end) noexcept :
+                 it(std::move(begin)), end(std::move(end)) {}
++
++            // Seed the ordinary forward scan at the run containing index.
++            // This is only used for indices in the second half of the row.
++            // The run array may contain zero-length entries.
++            void start_from_back(size_type index, size_type length) noexcept
++            {
++                it = end;
++                total = length;
++                while (total > index)
++                {
++                    --it;
++                    total -= it->length;
++                }
++            }
+ 
+             std::pair<It, size_type> scan(size_type index) noexcept
+             {
+@@ -867,6 +881,10 @@
+             // TODO GH#10135: Ensure replacements contains no runs with .length == 0.
+ 
+             rle_scanner scanner{ _runs.begin(), _runs.end() };
++            if (start_index > _total_length / 2)
++            {
++                scanner.start_from_back(start_index, _total_length);
++            }
+             auto [begin, begin_pos] = scanner.scan(start_index);
+             auto [end, end_pos] = scanner.scan(end_index);
+ 
+--- a/src/host/screenInfo.cpp
++++ b/src/host/screenInfo.cpp
+@@ -2394,7 +2394,7 @@
+ Viewport SCREEN_INFORMATION::GetVirtualViewport() const noexcept
+ {
+     const auto newTop = _virtualBottom - _viewport.Height() + 1;
+-    return Viewport::FromDimensions({ _viewport.Left(), newTop }, _viewport.Dimensions());
++    return Viewport::FromInclusive({ _viewport.Left(), newTop, _viewport.RightInclusive(), _virtualBottom });
+ }
+ 
+ // Returns the section of the text buffer that's addressable by VT sequences.
+--- a/src/buffer/out/Row.cpp
++++ b/src/buffer/out/Row.cpp
+@@ -651,6 +651,30 @@
+     const auto end = it + std::min<size_t>(chars.size(), colLimit - colBeg);
+     size_t ch = chBeg;
+ 
++#if defined(_M_X64)
++    // Eight one-column UTF-16 code units have consecutive offsets. Fall
++    // back at the beginning of a mixed block so grapheme handling receives
++    // exactly the same preceding ASCII context as the scalar path.
++    if (end - it >= 8)
++    {
++        const auto highBits = _mm_set1_epi16(-128);
++        auto offsets = _mm_add_epi16(_mm_set1_epi16(static_cast<short>(ch)), _mm_setr_epi16(0, 1, 2, 3, 4, 5, 6, 7));
++        do
++        {
++            const auto units = _mm_loadu_si128(reinterpret_cast<const __m128i*>(std::to_address(it)));
++            if (_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_and_si128(units, highBits), _mm_setzero_si128())) != 0xffff)
++            {
++                break;
++            }
++            _mm_storeu_si128(reinterpret_cast<__m128i*>(row._charOffsets.data() + colEnd), offsets);
++            offsets = _mm_add_epi16(offsets, _mm_set1_epi16(8));
++            colEnd += 8;
++            ch += 8;
++            it += 8;
++        } while (end - it >= 8);
++    }
++#endif
++
+     while (it != end)
+     {
+         if (*it >= 0x80) [[unlikely]]
+--- a/src/terminal/parser/stateMachine.cpp
++++ b/src/terminal/parser/stateMachine.cpp
+@@ -9,6 +9,8 @@
+ #include "ascii.hpp"
+ 
+ using namespace Microsoft::Console::VirtualTerminal;
++
++TRACELOGGING_DECLARE_PROVIDER(g_hConsoleVirtTermParserEventTraceProvider);
+ 
+ //Takes ownership of the pEngine.
+ StateMachine::StateMachine(std::unique_ptr<IStateMachineEngine> engine, const bool isEngineForInput) noexcept :
+@@ -510,8 +512,6 @@
+         if (_parameters.empty())
+         {
+             _parameters.push_back({});
+-            const auto rangeStart = gsl::narrow_cast<BYTE>(_subParameters.size());
+-            _subParameterRanges.push_back({ rangeStart, rangeStart });
+         }
+ 
+         // On a delimiter, increase the number of params we've seen.
+@@ -532,8 +532,6 @@
+                 _parameters.push_back({});
+                 _subParameterCounter = 0;
+                 _subParameterLimitOverflowed = false;
+-                const auto rangeStart = gsl::narrow_cast<BYTE>(_subParameters.size());
+-                _subParameterRanges.push_back({ rangeStart, rangeStart });
+             }
+         }
+         else
+@@ -565,8 +563,6 @@
+         if (_parameters.empty())
+         {
+             _parameters.push_back({});
+-            const auto rangeStart = gsl::narrow_cast<BYTE>(_subParameters.size());
+-            _subParameterRanges.push_back({ rangeStart, rangeStart });
+         }
+ 
+         // On a delimiter, increase the number of sub params we've seen.
+@@ -584,6 +580,15 @@
+             }
+             else
+             {
++                // Missing ranges denote parameters without subparameters. Fill
++                // in the gaps only when the first ':' for a later parameter
++                // arrives. Earlier ranges continue to refer to their original
++                // subparameter indexes.
++                if (_subParameterRanges.size() < _parameters.size())
++                {
++                    const auto start = gsl::narrow_cast<BYTE>(_subParameters.size());
++                    _subParameterRanges.resize(_parameters.size(), { start, start });
++                }
+                 // Otherwise move to next sub-param.
+                 _subParameters.push_back({});
+                 // increment current range's end index.
+@@ -1965,6 +1970,39 @@
+     return success;
+ }
+ 
++// The caller has already checked the first character. Up to four decimal
++// digits fit without saturation. When enough input remains, a short prefix
++// needs just one bounds check, including for ordinary one-to-three-digit
++// parameters followed by a delimiter. Leave the first non-digit unconsumed.
++static __forceinline VTInt parseDecimalParameter(const std::wstring_view text, size_t& pos) noexcept
++{
++    VTInt value = text[pos++] - L'0';
++    if (text.size() - pos >= 3)
++    {
++        for (unsigned n = 0; n < 3; ++n)
++        {
++            const auto digit = static_cast<unsigned>(text[pos] - L'0');
++            if (digit > 9)
++            {
++                return value;
++            }
++            ++pos;
++            value = value * 10 + static_cast<VTInt>(digit);
++        }
++    }
++    while (pos < text.size())
++    {
++        const auto digit = static_cast<unsigned>(text[pos] - L'0');
++        if (digit > 9)
++        {
++            break;
++        }
++        ++pos;
++        value = std::min(value * 10 + static_cast<VTInt>(digit), MAX_PARAMETER_VALUE);
++    }
++    return value;
++}
++
+ // Routine Description:
+ // - Helper for entry to the state machine. Will take an array of characters
+ //     and print as many as it can without encountering a character indicating
+@@ -1996,7 +2034,11 @@
+ #pragma warning(suppress : 26481) // Don't use pointer arithmetic. Use span instead (bounds.1).)
+             const auto beg = string.data() + i;
+             const auto len = string.size() - i;
+-            const auto it = Microsoft::Console::Utils::FindActionableControlCharacter(beg, len);
++            // Individually styled characters frequently have just one printable
++            // ASCII character between controls. Avoid setting up the vector scan.
++            const auto it = beg[0] == AsciiChars::ESC ? beg :
++                            len > 1 && beg[0] >= 0x20 && beg[0] <= 0x7e && beg[1] == AsciiChars::ESC ? beg + 1 :
++                            Microsoft::Console::Utils::FindActionableControlCharacter(beg, len);
+ 
+             _runOffset = i;
+             _runSize = it - beg;
+@@ -2019,6 +2061,71 @@
+ 
+         do
+         {
++            // In ANSI output the consecutive ESC and '[' transition directly
++            // from Ground to CsiEntry. Both ordinary transitions clear the
++            // same parser fields. Preserve the escape sequence trace reset.
++            if (_state == VTStates::Ground && string[i] == AsciiChars::ESC &&
++                string.size() - i >= 2 && string[i + 1] == L'[' &&
++                !_isEngineForInput && _parserMode.test(Mode::Ansi) &&
++                !TraceLoggingProviderEnabled(g_hConsoleVirtTermParserEventTraceProvider, WINEVENT_LEVEL_VERBOSE, TIL_KEYWORD_TRACE))
++            {
++                _trace.ClearSequenceTrace();
++                _EnterCsiEntry();
++                i += 2;
++                _runSize += 2;
++                if (i == string.size())
++                {
++                    _processingLastCharacter = true;
++                    break;
++                }
++            }
++
++            // A CSI numeric list has no dispatch until its final byte. Build the
++            // same parameters in one pass. Leave controls, subparameters and
++            // other non-final characters to the ordinary state machine.
++            // Keep byte-by-byte events when tracing or parsing keyboard input.
++            if (_state == VTStates::CsiEntry && !_isEngineForInput &&
++                _isNumericParamValue(string[i]) &&
++                !TraceLoggingProviderEnabled(g_hConsoleVirtTermParserEventTraceProvider, WINEVENT_LEVEL_VERBOSE, TIL_KEYWORD_TRACE))
++            {
++                const auto start = i;
++                do
++                {
++                    VTParameter parameter;
++                    if (i < string.size() && _isNumericParamValue(string[i]))
++                    {
++                        parameter = parseDecimalParameter(string, i);
++                    }
++                    _parameters.push_back(parameter);
++                    if (i == string.size() || !_isParameterDelimiter(string[i]) ||
++                        _parameters.size() == MAX_PARAMETER_COUNT)
++                    {
++                        break;
++                    }
++                    ++i;
++                } while (true);
++                _EnterCsiParam();
++                _runSize += i - start;
++                if (i == string.size())
++                {
++                    _processingLastCharacter = true;
++                    break;
++                }
++                // The final-byte range bypasses all control and intermediate
++                // events. Preserve the dispatch, cursor, and callback order.
++                const auto final = string[i];
++                if (final >= 0x40 && final <= 0x7e)
++                {
++                    ++i;
++                    ++_runSize;
++                    _processingLastCharacter = i == string.size();
++                    _ActionCsiDispatch(final);
++                    _EnterGround();
++                    _ExecuteCsiCompleteCallback();
++                    continue;
++                }
++            }
++
+             _runSize++;
+             _processingLastCharacter = i + 1 >= string.size();
+             // If we're processing characters individually, send it to the state machine.

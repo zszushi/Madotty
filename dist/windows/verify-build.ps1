@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory = $true)][string]$BuildDir,
     [string]$ExpectedVersion = '',
     [switch]$Portable,
+    [switch]$VerifyX64Host,
     [switch]$RequireFast
 )
 
@@ -32,6 +33,11 @@ foreach ($relativePath in @('share\ghostty\themes', 'share\ghostty\shell-integra
         -not (Get-ChildItem -LiteralPath $directory -Recurse -File | Select-Object -First 1)) {
         throw "Incomplete Windows payload: missing or empty $relativePath"
     }
+}
+
+# Verify the exact x64 host that was tested for this release in both layouts.
+if ($VerifyX64Host -and (Get-FileHash -LiteralPath (Join-Path $binaryDir 'OpenConsole.exe') -Algorithm SHA256).Hash -ne '2C704C8EDEBD7884C1D9E1B13700A5135D52B4AE855E5B727142885CB57E76C3') {
+    throw 'Unexpected x64 OpenConsole payload.'
 }
 
 # The checkout may live at a WSL UNC path. Run only this validation process from

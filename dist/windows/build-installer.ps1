@@ -22,7 +22,7 @@ if (-not $OutputDir) { $OutputDir = Join-Path $PSScriptRoot '..\..\zig-out\insta
 $BuildDir = (Get-Item -LiteralPath $BuildDir).FullName
 $DxcDir = (Get-Item -LiteralPath $DxcDir).FullName
 $wixCommand = (Get-Command $Wix -CommandType Application).Source
-$version = & (Join-Path $PSScriptRoot 'verify-build.ps1') -BuildDir $BuildDir
+$version = & (Join-Path $PSScriptRoot 'verify-build.ps1') -BuildDir $BuildDir -VerifyX64Host
 $msiVersion = [regex]::Match($version, '^\d+\.\d+\.\d+').Value
 # Windows Installer compares only three version components. Rebuilding a
 # preview at the same commit should replace the previously installed preview.

@@ -1,6 +1,6 @@
 .{
     .name = .ghostty,
-    .version = "1.4.1",
+    .version = "1.4.2",
     .paths = .{""},
     .fingerprint = 0x64407a2a0b4147e5,
     .minimum_zig_version = "0.17.0",
@@ -14,7 +14,7 @@
         .conpty = .{ .path = "./pkg/conpty", .lazy = true },
 
         .vulkan_headers = .{
-            .url = "https://codeload.github.com/KhronosGroup/Vulkan-Headers/tar.gz/refs/tags/v1.3.296",
+            .url = "git+https://github.com/KhronosGroup/Vulkan-Headers#29f979ee5aa58b7b005f805ea8df7a855c39ff37",
             .hash = "N-V-__8AANZErwHY3v8T8uMWB-sHccsxarx3U_eUJK7z7bZT",
             .lazy = true,
         },

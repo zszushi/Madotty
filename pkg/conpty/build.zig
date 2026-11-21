@@ -25,6 +25,9 @@ pub fn build(b: *std.Build) void {
     // Declaring the extracted directory as a run output caches the download
     // across builds. Changing the pinned URL/hash in fetch.zig invalidates it.
     b.addNamedLazyPath("dll", package.path(b, b.fmt("runtimes/win-{s}/native/conpty.dll", .{arch})));
-    b.addNamedLazyPath("host", package.path(b, b.fmt("build/native/runtimes/{s}/OpenConsole.exe", .{arch})));
+    b.addNamedLazyPath("host", if (target.result.cpu.arch == .x86_64)
+        b.path("madotty-x64/OpenConsole.exe")
+    else
+        package.path(b, b.fmt("build/native/runtimes/{s}/OpenConsole.exe", .{arch})));
     b.getInstallStep().dependOn(&fetch.step);
 }
