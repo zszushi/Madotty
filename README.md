@@ -21,7 +21,7 @@ Once installed, open **Madotty** from the Start menu.
 | Close the focused pane | Press `Ctrl+Shift+W`. |
 | Enter or leave fullscreen | Press `Ctrl+Enter`. |
 
-To use `Alt+Enter` for fullscreen as well, add this line to `%LOCALAPPDATA%\ghostty\config.ghostty`:
+You can customize keybindings in `%LOCALAPPDATA%\ghostty\config.ghostty`. For example, adding the following line lets you toggle fullscreen with either `Ctrl+Enter` or `Alt+Enter`.
 
 ```ini
 keybind = alt+enter=toggle_fullscreen

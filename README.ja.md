@@ -21,7 +21,7 @@ Madotty は、[Ghostty](https://github.com/ghostty-org/ghostty) の Windows 移�
 | 作業中のペインを閉じる | `Ctrl+Shift+W` |
 | フルスクリーンに切り替える・元に戻す | `Ctrl+Enter` |
 
-`Alt+Enter` でもフルスクリーンを切り替えるには、`%LOCALAPPDATA%\ghostty\config.ghostty` に次の1行を追加します。
+キーバインドは設定ファイル `%LOCALAPPDATA%\ghostty\config.ghostty` で変更できます。たとえば、次の1行を追加すると、`Ctrl+Enter` に加えて `Alt+Enter` でもフルスクリーンを切り替えられます。
 
 ```ini
 keybind = alt+enter=toggle_fullscreen
