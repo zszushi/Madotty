@@ -12,9 +12,20 @@ Download the x64 MSI from the [Releases page](https://github.com/zszushi/Madotty
 
 Once installed, open **Madotty** from the Start menu.
 
-## Tabs and panes
+## Tabs, panes and fullscreen
 
-Drag a tab to the edge of another pane to place the two sessions side by side or one above the other. Drag a tab out of the window to give it its own window. With a pane focused, press `Ctrl+Shift+W` to close it.
+| Action | How |
+| --- | --- |
+| Split the view | Drag a tab to the left, right, top or bottom edge of another pane. |
+| Move a tab to its own window | Drag the tab outside the window. |
+| Close the focused pane | Press `Ctrl+Shift+W`. |
+| Enter or leave fullscreen | Press `Ctrl+Enter`. |
+
+To use `Alt+Enter` for fullscreen as well, add this line to `%LOCALAPPDATA%\ghostty\config.ghostty`:
+
+```ini
+keybind = alt+enter=toggle_fullscreen
+```
 
 ## Appearance
 
